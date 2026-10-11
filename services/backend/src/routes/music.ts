@@ -134,7 +134,7 @@ export interface CoverAccess {
 }
 
 /**
- * Cover-art access for a viewer already authorized on the event (WIR-171):
+ * Cover-art access for a viewer already authorized on the event:
  * header-less image loaders (expo-image, <img>) need the `?tk=` form like
  * audio does. Same mint rule as the audio sha — a token is minted only when the
  * blob layer itself would serve this viewer (protection is decided by the
@@ -440,7 +440,7 @@ export const musicRoutes: FastifyPluginAsync = async (server) => {
     },
   );
 
-  // ── Saved versions (WIR-165) ─────────────────────────────────────────────
+  // ── Saved versions ───────────────────────────────────────────────────────
   // A fan records the version of a track/project they have; the ingester flags
   // the row when a strictly newer event arrives. See savedVersionService.
 
@@ -699,7 +699,7 @@ export const musicRoutes: FastifyPluginAsync = async (server) => {
   );
 
   // POST /music/blobs/transfer -- Move blob ownership from the signer to a
-  // successor pubkey (WIR-172: shared-project key rotation K1 → K2, and
+  // successor pubkey (shared-project key rotation K1 → K2, and
   // converting a personal project to a shared key). A MOVE, not a copy: after
   // it, only K2-authored events decide the blobs' protection, so a removed
   // holder who still has K1 cannot publicise the audio through a public K1

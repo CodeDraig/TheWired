@@ -1,5 +1,5 @@
 /**
- * Backend contract for shared project keys (WIR-172, B1 + B4).
+ * Backend contract for shared project keys (B1 + B4).
  *
  * B1: ["p", <human>, "", "owner"] grants read access like `collaborator` —
  *     the event is signed by the project key, so this is how a holder reads

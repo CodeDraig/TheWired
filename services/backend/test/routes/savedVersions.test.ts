@@ -1,5 +1,5 @@
 /**
- * Saved-version update tracking (WIR-165).
+ * Saved-version update tracking.
  *
  * The bug: the ingester flagged `has_update` for every 31683/33123 event it saw
  * (and the music backfill re-sends every event on each reconnect), so saved

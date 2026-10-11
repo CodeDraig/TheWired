@@ -65,7 +65,7 @@ const ACCESS_ROLES: ReadonlySet<string> = new Set(["owner", "artist", "collabora
  * Does a `p` tag grant protected-content access to `pubkey`? Role-aware: the
  * 4th element distinguishes credits from access grants.
  *
- * Grants: `owner` (a human holder of a shared project key, WIR-172 — the
+ * Grants: `owner` (a human holder of a shared project key — the
  * event is signed by the project key, so the holders can only read their own
  * project as themselves through this grant), `artist` (co-author identity)
  * and the three project MEMBER roles the mobile app writes — `collaborator` (viewer), `contributor` (may add their own

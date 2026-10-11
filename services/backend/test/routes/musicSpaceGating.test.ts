@@ -166,7 +166,7 @@ beforeEach(async () => {
     ],
   });
 
-  // Space-scoped track that ALSO grants a non-member via p-tag (WIR-76): the
+  // Space-scoped track that ALSO grants a non-member via p-tag: the
   // grantee must get the same access as a member on every layer; a featured
   // credit on the same event stays a credit.
   await insertMusicEvent({
@@ -301,7 +301,7 @@ describe("h-only space tracks protect the blob + HLS ladder", () => {
   });
 });
 
-describe("p-tag grants on space-scoped tracks (WIR-76)", () => {
+describe("p-tag grants on space-scoped tracks", () => {
   const url = (path: string) => `${path}/${LUNA.pubkey}/${SLUG}-space-grant`;
   const as = (pk: string | null) => (pk ? { "x-auth-pubkey": pk } : {});
 

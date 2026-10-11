@@ -1,5 +1,5 @@
 /**
- * `music_update` server push (WIR-171, the WIR-165 leftover). A newer
+ * `music_update` server push. A newer
  * version of a saved track/project, ingested from the OWN relay, enqueues one
  * push per fan whose saved row was actually flagged — never the author, never
  * on a backfill re-ingest, never for a fan who turned "music updates" off,
@@ -129,7 +129,7 @@ describe("music_update push through processEvent", () => {
     expect(await rowsFor(LUNA.pubkey)).toHaveLength(1);
   });
 
-  it("a shared project never pushes its `owner` holders, and titles from the artist tag without a kind 0 (WIR-172)", async () => {
+  it("a shared project never pushes its `owner` holders, and titles from the artist tag without a kind 0", async () => {
     const v1 = version(T0);
     for (const fan of [LUNA.pubkey, SAGE.pubkey]) {
       await savedVersionService.save(fan, ADDR, v1.id, v1.created_at);

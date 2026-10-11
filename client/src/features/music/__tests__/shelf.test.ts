@@ -1,5 +1,5 @@
 /**
- * Music channel shelf (WIR-146, soot parity): kind-9 posts into a channel merge
+ * Music channel shelf (soot parity): kind-9 posts into a channel merge
  * with members' releases; attribution attaches instead of duplicating; private
  * releases never show; "All" folds tracks into their project.
  */

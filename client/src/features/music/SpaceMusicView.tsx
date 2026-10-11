@@ -47,7 +47,7 @@ function albumKeyFor(trackKey: TrackSortKey): AlbumSortKey {
 }
 
 /**
- * A space's music channel as a shelf (soot parity, WIR-146): members'
+ * A space's music channel as a shelf (soot parity): members'
  * releases the placement rules put here, merged with kind-9 posts INTO the
  * channel (`a`/`k` for a release, `r` for a provider link) carrying poster
  * attribution and a note. Private releases never show; in "All" a track folds

@@ -2,7 +2,7 @@
  * Saved-version sync: one place that talks to `/music/save-version`,
  * `/music/saved-updates` and `/music/acknowledge-update`, keeps Redux in step,
  * asks relays for versions the ingester saw before the client did, and raises
- * the "updated" notification (WIR-165).
+ * the "updated" notification.
  *
  * Module-level (not per-component) so the whole app shares one throttled
  * fetch instead of every album detail re-fetching on mount.

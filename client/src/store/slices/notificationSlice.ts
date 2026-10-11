@@ -49,7 +49,7 @@ export interface NotificationPreferences {
   dms: boolean;
   newFollowers: boolean;
   chatMessages: boolean;
-  /** A saved track / project got a new version (WIR-165). */
+  /** A saved track / project got a new version. */
   musicUpdates: boolean;
   browserNotifications: boolean;
   sound: boolean;
