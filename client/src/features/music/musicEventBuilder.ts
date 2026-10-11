@@ -78,6 +78,7 @@ interface PlaylistEventParams {
   trackRefs?: string[];
   visibility?: MusicVisibility;
   spaceId?: string;
+  spaceIds?: string[];
   channelId?: string;
 }
 

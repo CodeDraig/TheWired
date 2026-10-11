@@ -1,4 +1,30 @@
-import { createSlice, type PayloadAction } from "@reduxjs/toolkit";
+import { createSlice, current, isDraft, type PayloadAction } from "@reduxjs/toolkit";
+import {
+  applyLibraryIntent,
+  deleteFolderDoc,
+  emptyLibraryRecord,
+  folderDocFromFolder,
+  folderDocWire,
+  foldersView,
+  folderView,
+  canonicalJson,
+  libraryShardWire,
+  libraryView,
+  mergeFolderDocs,
+  mergeLibraryRecords,
+  mergeLibraryShard,
+  moveLibraryKey,
+  rebaseLibraryRecord,
+  sameLibraryShard,
+  stampFolderEdit,
+  type MusicFolder,
+  type MusicFolderDoc,
+  type MusicFolderDocs,
+  type MusicLibraryArrays,
+  type MusicLibraryList,
+  type MusicLibraryRecord,
+} from "@ishtarservices/core";
+import type { MusicLibraryShardWire } from "@ishtarservices/shared-types";
 import type { MusicTrack, MusicAlbum, MusicPlaylist, MusicView, RepeatMode, MusicAnnotation, MusicRevision, TrackInsights, MusicProposal, SavedAlbumVersion, TrackSortKey, AlbumSortKey, SortDir, PlaybackError } from "../../types/music";
 
 /** The requester's record of one listen request they sent. */
@@ -119,6 +145,41 @@ interface MusicState {
    *  the stub's created_at. A stub replaces the release at its address, so an
    *  older copy arriving later is ignored and a detail view follows `to`. */
   movedReleases: Record<string, { to: string; at: number }>;
+
+  /** The listener's folders (view of `librarySync.folderDocs`, unsorted —
+   *  selectFolders sorts). Private unless published as a 30119. */
+  folders: MusicFolder[];
+
+  /** Cross-device sync state (docs/MUSIC_LIBRARY_SYNC.md). The library
+   *  arrays above are the view of `record`; user actions stamp it in the same
+   *  reducer that edits the arrays, remote copies merge into it here. */
+  librarySync: LibrarySyncState;
+}
+
+export interface LibrarySyncState {
+  /** Library + folders read from IndexedDB (sync waits for this). */
+  hydrated: boolean;
+  /** The local read failed — never persist or publish over what we can't see. */
+  readFailed: boolean;
+  record: MusicLibraryRecord;
+  folderDocs: MusicFolderDocs;
+  /** Shards / folders with local edits the relays may not have yet. */
+  dirtyShards: number[];
+  dirtyFolders: string[];
+  /** Bumped by every local edit (drives the debounced publish). */
+  revision: number;
+}
+
+function initialLibrarySync(): LibrarySyncState {
+  return {
+    hydrated: false,
+    readFailed: false,
+    record: emptyLibraryRecord(),
+    folderDocs: {},
+    dirtyShards: [],
+    dirtyFolders: [],
+    revision: 0,
+  };
 }
 
 const initialState: MusicState = {
@@ -218,7 +279,58 @@ const initialState: MusicState = {
 
   heldProjectKeys: {},
   movedReleases: {},
+  folders: [],
+  librarySync: initialLibrarySync(),
 };
+
+const nowSec = (): number => Math.floor(Date.now() / 1000);
+
+/** Core helpers never mutate their input, so they can work on the plain
+ *  (frozen) value behind a draft instead of the proxy. */
+function plain<T>(value: T): T {
+  return isDraft(value) ? (current(value) as T) : value;
+}
+
+/** Prepare callback for a user action: stamp it now. */
+function stamped(id: string) {
+  return { payload: id, meta: { at: nowSec() } };
+}
+type StampedAction = PayloadAction<string, string, { at: number }>;
+
+function markShardsDirty(sync: LibrarySyncState, shards: number[]) {
+  if (shards.length === 0) return;
+  for (const s of shards) if (!sync.dirtyShards.includes(s)) sync.dirtyShards.push(s);
+  sync.revision++;
+}
+
+function markFoldersDirty(sync: LibrarySyncState, ids: string[]) {
+  if (ids.length === 0) return;
+  for (const id of ids) if (!sync.dirtyFolders.includes(id)) sync.dirtyFolders.push(id);
+  sync.revision++;
+}
+
+/** Stamp one explicit user action into the sync record. */
+function stampIntent(state: MusicState, list: MusicLibraryList, key: string, on: boolean, at: number) {
+  const sync = state.librarySync;
+  const edit = applyLibraryIntent(plain(sync.record), list, key, on, at);
+  if (edit.shards.length === 0) return;
+  sync.record = edit.record;
+  markShardsDirty(sync, edit.shards);
+}
+
+/** Library arrays := the record's view (after a merge or hydrate). */
+function arraysFromRecord(state: MusicState) {
+  const view = libraryView(plain(state.librarySync.record));
+  state.library.savedTrackIds = view.savedTrackIds;
+  state.library.savedAlbumIds = view.savedAlbumIds;
+  state.library.favoritedTrackIds = view.favoritedTrackIds;
+  state.library.favoritedAlbumIds = view.favoritedAlbumIds;
+  state.library.followedArtists = view.followedArtists;
+}
+
+function foldersFromDocs(state: MusicState) {
+  state.folders = foldersView(plain(state.librarySync.folderDocs));
+}
 
 /** A release older than (or as old as) a rotation stub at its address. */
 function isSupersededByStub(state: MusicState, item: { addressableId: string; createdAt: number }): boolean {
@@ -521,28 +633,44 @@ export const musicSlice = createSlice({
     setSavedTrackIds(state, action: PayloadAction<string[]>) {
       state.library.savedTrackIds = action.payload;
     },
-    addSavedTrack(state, action: PayloadAction<string>) {
-      if (!state.library.savedTrackIds.includes(action.payload)) {
-        state.library.savedTrackIds = [action.payload, ...state.library.savedTrackIds];
-      }
+    addSavedTrack: {
+      reducer(state, action: StampedAction) {
+        if (!state.library.savedTrackIds.includes(action.payload)) {
+          state.library.savedTrackIds = [action.payload, ...state.library.savedTrackIds];
+        }
+        stampIntent(state, "saved", action.payload, true, action.meta.at);
+      },
+      prepare: stamped,
     },
-    removeSavedTrack(state, action: PayloadAction<string>) {
-      state.library.savedTrackIds = state.library.savedTrackIds.filter(
-        (id) => id !== action.payload,
-      );
+    removeSavedTrack: {
+      reducer(state, action: StampedAction) {
+        state.library.savedTrackIds = state.library.savedTrackIds.filter(
+          (id) => id !== action.payload,
+        );
+        stampIntent(state, "saved", action.payload, false, action.meta.at);
+      },
+      prepare: stamped,
     },
     setSavedAlbumIds(state, action: PayloadAction<string[]>) {
       state.library.savedAlbumIds = action.payload;
     },
-    addSavedAlbum(state, action: PayloadAction<string>) {
-      if (!state.library.savedAlbumIds.includes(action.payload)) {
-        state.library.savedAlbumIds = [action.payload, ...state.library.savedAlbumIds];
-      }
+    addSavedAlbum: {
+      reducer(state, action: StampedAction) {
+        if (!state.library.savedAlbumIds.includes(action.payload)) {
+          state.library.savedAlbumIds = [action.payload, ...state.library.savedAlbumIds];
+        }
+        stampIntent(state, "saved", action.payload, true, action.meta.at);
+      },
+      prepare: stamped,
     },
-    removeSavedAlbum(state, action: PayloadAction<string>) {
-      state.library.savedAlbumIds = state.library.savedAlbumIds.filter(
-        (id) => id !== action.payload,
-      );
+    removeSavedAlbum: {
+      reducer(state, action: StampedAction) {
+        state.library.savedAlbumIds = state.library.savedAlbumIds.filter(
+          (id) => id !== action.payload,
+        );
+        stampIntent(state, "saved", action.payload, false, action.meta.at);
+      },
+      prepare: stamped,
     },
     setFavoritedTrackIds(state, action: PayloadAction<string[]>) {
       state.library.favoritedTrackIds = action.payload;
@@ -550,37 +678,225 @@ export const musicSlice = createSlice({
     setFavoritedAlbumIds(state, action: PayloadAction<string[]>) {
       state.library.favoritedAlbumIds = action.payload;
     },
-    addFavoritedTrack(state, action: PayloadAction<string>) {
-      if (!state.library.favoritedTrackIds.includes(action.payload)) {
-        state.library.favoritedTrackIds = [action.payload, ...state.library.favoritedTrackIds];
-      }
+    addFavoritedTrack: {
+      reducer(state, action: StampedAction) {
+        if (!state.library.favoritedTrackIds.includes(action.payload)) {
+          state.library.favoritedTrackIds = [action.payload, ...state.library.favoritedTrackIds];
+        }
+        stampIntent(state, "favorited", action.payload, true, action.meta.at);
+      },
+      prepare: stamped,
     },
-    removeFavoritedTrack(state, action: PayloadAction<string>) {
-      state.library.favoritedTrackIds = state.library.favoritedTrackIds.filter(
-        (id) => id !== action.payload,
-      );
+    removeFavoritedTrack: {
+      reducer(state, action: StampedAction) {
+        state.library.favoritedTrackIds = state.library.favoritedTrackIds.filter(
+          (id) => id !== action.payload,
+        );
+        stampIntent(state, "favorited", action.payload, false, action.meta.at);
+      },
+      prepare: stamped,
     },
-    addFavoritedAlbum(state, action: PayloadAction<string>) {
-      if (!state.library.favoritedAlbumIds.includes(action.payload)) {
-        state.library.favoritedAlbumIds = [action.payload, ...state.library.favoritedAlbumIds];
-      }
+    addFavoritedAlbum: {
+      reducer(state, action: StampedAction) {
+        if (!state.library.favoritedAlbumIds.includes(action.payload)) {
+          state.library.favoritedAlbumIds = [action.payload, ...state.library.favoritedAlbumIds];
+        }
+        stampIntent(state, "favorited", action.payload, true, action.meta.at);
+      },
+      prepare: stamped,
     },
-    removeFavoritedAlbum(state, action: PayloadAction<string>) {
-      state.library.favoritedAlbumIds = state.library.favoritedAlbumIds.filter(
-        (id) => id !== action.payload,
-      );
+    removeFavoritedAlbum: {
+      reducer(state, action: StampedAction) {
+        state.library.favoritedAlbumIds = state.library.favoritedAlbumIds.filter(
+          (id) => id !== action.payload,
+        );
+        stampIntent(state, "favorited", action.payload, false, action.meta.at);
+      },
+      prepare: stamped,
     },
 
     setFollowedArtists(state, action: PayloadAction<string[]>) {
       state.library.followedArtists = action.payload;
     },
-    addFollowedArtist(state, action: PayloadAction<string>) {
-      pushUnique(state.library.followedArtists, action.payload);
+    addFollowedArtist: {
+      reducer(state, action: StampedAction) {
+        pushUnique(state.library.followedArtists, action.payload);
+        stampIntent(state, "artists", action.payload, true, action.meta.at);
+      },
+      prepare: stamped,
     },
-    removeFollowedArtist(state, action: PayloadAction<string>) {
-      state.library.followedArtists = state.library.followedArtists.filter(
-        (id) => id !== action.payload,
-      );
+    removeFollowedArtist: {
+      reducer(state, action: StampedAction) {
+        state.library.followedArtists = state.library.followedArtists.filter(
+          (id) => id !== action.payload,
+        );
+        stampIntent(state, "artists", action.payload, false, action.meta.at);
+      },
+      prepare: stamped,
+    },
+
+    // ── Library sync (docs/MUSIC_LIBRARY_SYNC.md) ───────────
+    /** The IndexedDB rows, in one action: arrays + record + folders land
+     *  together. Rows written by older builds (no record) are folded in
+     *  ADD-ONLY; a missing record is seeded from the arrays' order. */
+    musicLibraryHydrated(
+      state,
+      action: PayloadAction<{
+        arrays: Partial<MusicLibraryArrays>;
+        record: MusicLibraryRecord | null;
+        /** Unix seconds the row was last written (seed / rebase stamps). */
+        rowUpdatedAt: number;
+        folderDocs: MusicFolderDocs;
+        userPlaylists: string[];
+        recentlyPlayedIds: string[];
+        readFailed: boolean;
+      }>,
+    ) {
+      const p = action.payload;
+      const sync = state.librarySync;
+      const base = p.record ? mergeLibraryRecords(p.record, plain(sync.record)) : plain(sync.record);
+      const rebased = rebaseLibraryRecord(base, p.arrays, p.rowUpdatedAt);
+      sync.record = rebased.record;
+      markShardsDirty(sync, rebased.shards);
+      let docs = plain(sync.folderDocs);
+      for (const [id, doc] of Object.entries(p.folderDocs)) {
+        docs = { ...docs, [id]: docs[id] ? mergeFolderDocs(doc, docs[id]) : doc };
+      }
+      sync.folderDocs = docs;
+      sync.hydrated = true;
+      sync.readFailed = p.readFailed;
+      arraysFromRecord(state);
+      foldersFromDocs(state);
+      state.library.userPlaylists = p.userPlaylists;
+      state.discovery.recentlyPlayedIds = p.recentlyPlayedIds;
+    },
+    /** Relay copies, merged against CURRENT state (so an edit made while
+     *  the fetch was out survives). Never stamps, never bumps the revision. */
+    librarySyncApplied(
+      state,
+      action: PayloadAction<{
+        shards: Array<{ shard: number; wire: MusicLibraryShardWire }>;
+        folders: MusicFolderDoc[];
+      }>,
+    ) {
+      const sync = state.librarySync;
+      if (action.payload.shards.length > 0) {
+        let rec = plain(sync.record);
+        for (const { shard, wire } of action.payload.shards) rec = mergeLibraryShard(rec, shard, wire);
+        sync.record = rec;
+        arraysFromRecord(state);
+      }
+      if (action.payload.folders.length > 0) {
+        let docs = plain(sync.folderDocs);
+        for (const doc of action.payload.folders) {
+          docs = { ...docs, [doc.id]: docs[doc.id] ? mergeFolderDocs(docs[doc.id], doc) : doc };
+        }
+        sync.folderDocs = docs;
+        foldersFromDocs(state);
+      }
+    },
+    /** The relay's copy is behind for these — publish them. */
+    librarySyncMarkDirty(state, action: PayloadAction<{ shards: number[]; folders: string[] }>) {
+      markShardsDirty(state.librarySync, action.payload.shards);
+      markFoldersDirty(state.librarySync, action.payload.folders);
+    },
+    /** Published (and acknowledged by the app relay): clear dirty flags for
+     *  the documents whose local copy still equals what was sent. */
+    librarySyncPublished(
+      state,
+      action: PayloadAction<{
+        shards: Array<{ shard: number; wire: MusicLibraryShardWire }>;
+        folders: Array<{ id: string; doc: MusicFolderDoc }>;
+      }>,
+    ) {
+      const sync = state.librarySync;
+      const rec = plain(sync.record);
+      for (const { shard, wire } of action.payload.shards) {
+        // The published copy may be pruned (higher floor): fold it back in.
+        const merged = mergeLibraryShard(rec, shard, wire);
+        sync.record = merged;
+        if (sameLibraryShard(libraryShardWire(merged, shard), wire)) {
+          sync.dirtyShards = sync.dirtyShards.filter((s) => s !== shard);
+        }
+      }
+      let docs = plain(sync.folderDocs);
+      for (const { id, doc: sent } of action.payload.folders) {
+        const local = docs[id];
+        if (!local) continue;
+        // The sent copy may be pruned (higher floor): fold it back in.
+        const merged = mergeFolderDocs(local, sent);
+        docs = { ...docs, [id]: merged };
+        if (canonicalJson(folderDocWire(merged)) === canonicalJson(folderDocWire(sent))) {
+          sync.dirtyFolders = sync.dirtyFolders.filter((f) => f !== id);
+        }
+      }
+      sync.folderDocs = docs;
+    },
+    /** A shared project's key rotated: its saved/favorited entry follows the
+     *  release to the new address and keeps its place. */
+    libraryReleaseMoved: {
+      reducer(state, action: PayloadAction<{ from: string; to: string }, string, { at: number }>) {
+        const sync = state.librarySync;
+        const edit = moveLibraryKey(plain(sync.record), action.payload.from, action.payload.to, action.meta.at);
+        if (edit.shards.length === 0) return;
+        sync.record = edit.record;
+        markShardsDirty(sync, edit.shards);
+        arraysFromRecord(state);
+      },
+      prepare: (payload: { from: string; to: string }) => ({ payload, meta: { at: nowSec() } }),
+    },
+
+    // ── Folders ─────────────────────────────────────────────
+    folderCreated: {
+      reducer(state, action: PayloadAction<MusicFolder, string, { at: number }>) {
+        const folder = action.payload;
+        const sync = state.librarySync;
+        if (sync.folderDocs[folder.id]) return;
+        sync.folderDocs = { ...plain(sync.folderDocs), [folder.id]: folderDocFromFolder(folder, action.meta.at) };
+        markFoldersDirty(sync, [folder.id]);
+        foldersFromDocs(state);
+      },
+      prepare: (folder: MusicFolder) => ({ payload: folder, meta: { at: nowSec() } }),
+    },
+    /** One user edit of a folder: `next` is the folder after the edit
+     *  (computed with the pure helpers in @ishtarservices/core). */
+    folderEdited: {
+      reducer(state, action: PayloadAction<{ id: string; next: MusicFolder }, string, { at: number }>) {
+        const sync = state.librarySync;
+        const doc = plain(sync.folderDocs)[action.payload.id];
+        if (!doc) return;
+        const before = folderView(doc);
+        if (!before) return;
+        const edited = stampFolderEdit(doc, before, action.payload.next, action.meta.at);
+        if (edited === doc) return;
+        sync.folderDocs = { ...plain(sync.folderDocs), [doc.id]: edited };
+        markFoldersDirty(sync, [doc.id]);
+        foldersFromDocs(state);
+      },
+      prepare: (payload: { id: string; next: MusicFolder }) => ({ payload, meta: { at: nowSec() } }),
+    },
+    folderDeleted: {
+      reducer(state, action: StampedAction) {
+        const sync = state.librarySync;
+        const doc = plain(sync.folderDocs)[action.payload];
+        if (!doc) return;
+        sync.folderDocs = { ...plain(sync.folderDocs), [doc.id]: deleteFolderDoc(doc, action.meta.at) };
+        markFoldersDirty(sync, [doc.id]);
+        foldersFromDocs(state);
+      },
+      prepare: stamped,
+    },
+    /** Adoption of the account's own older playlists / duplicate fold-in:
+     *  deterministic docs, merged like relay copies, published. */
+    folderDocsAdopted(state, action: PayloadAction<{ docs: MusicFolderDoc[] }>) {
+      const sync = state.librarySync;
+      let docs = plain(sync.folderDocs);
+      for (const doc of action.payload.docs) {
+        docs = { ...docs, [doc.id]: docs[doc.id] ? mergeFolderDocs(docs[doc.id], doc) : doc };
+      }
+      sync.folderDocs = docs;
+      markFoldersDirty(sync, action.payload.docs.map((d) => d.id));
+      foldersFromDocs(state);
     },
     setUserPlaylists(state, action: PayloadAction<string[]>) {
       state.library.userPlaylists = action.payload;
@@ -951,6 +1267,15 @@ export const {
   setFollowedArtists,
   addFollowedArtist,
   removeFollowedArtist,
+  musicLibraryHydrated,
+  librarySyncApplied,
+  librarySyncMarkDirty,
+  librarySyncPublished,
+  libraryReleaseMoved,
+  folderCreated,
+  folderEdited,
+  folderDeleted,
+  folderDocsAdopted,
   setUserPlaylists,
   addUserPlaylist,
   removeUserPlaylist,

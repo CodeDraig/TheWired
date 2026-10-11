@@ -1,6 +1,6 @@
 import { useNavigate, useLocation } from "react-router-dom";
 import { cn } from "@/lib/utils";
-import { Home, Clock, Heart, Users, Disc3, Music, ListMusic, FolderUp, Compass, BarChart3, Inbox } from "lucide-react";
+import { Home, Clock, Heart, Users, Disc3, Music, Folder, FolderUp, Compass, BarChart3, Inbox } from "lucide-react";
 import { useAppDispatch, useAppSelector } from "@/store/hooks";
 import { setMusicView } from "@/store/slices/musicSlice";
 import type { MusicView } from "@/types/music";
@@ -21,7 +21,7 @@ const navItems: NavItem[] = [
   { view: "artists", label: "Artists", icon: Users },
   { view: "albums", label: "Projects", icon: Disc3 },
   { view: "songs", label: "Songs", icon: Music },
-  { view: "playlists", label: "Playlists", icon: ListMusic },
+  { view: "folders", label: "Folders", icon: Folder },
   { view: "insights" as MusicView, label: "Insights", icon: BarChart3, requiresAuth: true },
   { view: "listen-requests", label: "Listen Requests", icon: Inbox, requiresAuth: true },
 ];
@@ -54,7 +54,7 @@ export function MusicSidebar() {
             activeView === item.view ||
             (item.view === "albums" && (activeView === "album-detail" || activeView === "project-history")) ||
             (item.view === "artists" && activeView === "artist-detail") ||
-            (item.view === "playlists" && activeView === "playlist-detail");
+            (item.view === "folders" && (activeView === "folder-detail" || activeView === "playlists"));
           return (
             <button
               key={item.view}

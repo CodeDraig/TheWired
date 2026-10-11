@@ -275,13 +275,13 @@ export function ActionsTab({
             onClick={onFavoriteToggle}
             active={favorited}
           />
-          <ActionButton icon={<ListPlus size={14} />} label="Add to Playlist" onClick={onAddToPlaylist} />
+          <ActionButton icon={<ListPlus size={14} />} label="Add to Folder" onClick={onAddToPlaylist} />
         </>
       )}
 
-      {/* ── Playlist (owner) ── */}
+      {/* ── Folders (owner) ── */}
       {isOwner && (
-        <ActionButton icon={<ListPlus size={14} />} label="Add to Playlist" onClick={onAddToPlaylist} />
+        <ActionButton icon={<ListPlus size={14} />} label="Add to Folder" onClick={onAddToPlaylist} />
       )}
 
       {/* ── Share ── */}

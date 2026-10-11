@@ -50,6 +50,17 @@ export async function getUserState<T = unknown>(
   return stored?.data as T | undefined;
 }
 
+/** Load a piece of user state with the time it was last written (ms). */
+export async function getUserStateWithTime<T = unknown>(
+  key: string,
+): Promise<{ data: T; cachedAt: number } | undefined> {
+  const storageKey = accountKey(key);
+  const db = await getDB();
+  const stored = await db.get("user_state", storageKey);
+  if (!stored) return undefined;
+  return { data: stored.data as T, cachedAt: typeof stored._cachedAt === "number" ? stored._cachedAt : 0 };
+}
+
 /** Delete user state */
 export async function deleteUserState(key: string): Promise<void> {
   const storageKey = accountKey(key);

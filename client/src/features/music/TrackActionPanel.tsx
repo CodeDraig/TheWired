@@ -30,7 +30,7 @@ import { HistoryTab } from "./panel/HistoryTab";
 
 import { ReplaceAudioModal } from "./ReplaceAudioModal";
 import { MoveTrackModal } from "./MoveTrackModal";
-import { AddToPlaylistModal } from "./AddToPlaylistModal";
+import { AddToFolderModal } from "./AddToFolderModal";
 import { RecipientPickerModal } from "@/components/sharing/RecipientPickerModal";
 import { SpacePickerModal } from "@/components/sharing/SpacePickerModal";
 import { MusicPostModal } from "./MusicPostModal";
@@ -542,11 +542,11 @@ export function TrackActionPanel({
         />
       )}
       {playlistOpen && (
-        <AddToPlaylistModal
+        <AddToFolderModal
           open={playlistOpen}
           onClose={() => setPlaylistOpen(false)}
           onBack={() => setPlaylistOpen(false)}
-          trackAddrId={track.addressableId}
+          itemAddrId={track.addressableId}
         />
       )}
       {dmPickerOpen && (

@@ -281,7 +281,7 @@ export function MusicSegment({ query }: { query: string }) {
   const publicPlaylists = useMemo(
     () =>
       Object.values(playlists)
-        .filter((p) => p.visibility === "public" && p.trackRefs.length > 0)
+        .filter((p) => p.visibility === "public" && !p.deleted && p.trackRefs.length > 0)
         .sort((a, b) => b.createdAt - a.createdAt)
         .slice(0, ALBUM_LIMIT),
     [playlists],

@@ -1,3 +1,4 @@
+import { hasFolderLabel } from "@ishtarservices/core";
 import type { NostrEvent } from "@/types/nostr";
 import type { MusicPlaylist, MusicVisibility } from "@/types/music";
 
@@ -31,5 +32,13 @@ export function parsePlaylistEvent(event: NostrEvent): MusicPlaylist {
     trackRefs,
     createdAt: event.created_at,
     visibility: parseVisibility(event),
+    ...(event.tags.some((t) => t[0] === "h" && t[1])
+      ? { spaceIds: [...new Set(event.tags.filter((t) => t[0] === "h" && t[1]).map((t) => t[1]))] }
+      : {}),
+    ...(event.tags.find((t) => t[0] === "channel")?.[1]
+      ? { channelId: event.tags.find((t) => t[0] === "channel")![1] }
+      : {}),
+    ...(event.tags.some((t) => t[0] === "deleted" && t[1] === "true") ? { deleted: true } : {}),
+    ...(hasFolderLabel(event.tags) ? { fromFolder: true } : {}),
   };
 }

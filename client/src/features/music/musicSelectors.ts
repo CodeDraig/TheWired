@@ -1,4 +1,6 @@
 import { createSelector } from "@reduxjs/toolkit";
+import { sortFolders, type FolderMemberLike } from "@ishtarservices/core";
+import { getTrackImage } from "./trackImage";
 import type { RootState } from "@/store";
 import type { ArtistEntry, MusicMember, MusicVisibility } from "@/types/music";
 
@@ -162,13 +164,6 @@ export const selectFollowedArtists = createSelector(
   (music) => music.library.followedArtists,
 );
 
-export const selectUserPlaylists = createSelector(
-  selectMusicState,
-  (music) =>
-    music.library.userPlaylists
-      .map((id) => music.playlists[id])
-      .filter(Boolean),
-);
 
 /** Every track the user owns — INCLUDING `catalog:none` clips, so My Music is
  *  the one place on desktop to find an unlisted clip and re-list it. */
@@ -361,3 +356,26 @@ export const selectProfileAlbums = (pubkey: string) =>
       })
       .sort((a, b) => b.createdAt - a.createdAt);
   });
+
+// ── Folders (synced shelves; docs/MUSIC_LIBRARY_SYNC.md) ──────────────
+
+/** Pinned first, then most recently touched. */
+export const selectFolders = createSelector(selectMusicState, (music) => sortFolders(music.folders));
+
+/** What the folder summary helpers need from the catalog. */
+export const selectFolderMembers = createSelector(selectMusicState, (music) => {
+  const out: Record<string, FolderMemberLike> = {};
+  for (const folder of music.folders) {
+    for (const id of folder.itemIds) {
+      if (out[id]) continue;
+      const track = music.tracks[id];
+      if (track) {
+        out[id] = { addressableId: id, kind: "track", artwork: getTrackImage(track, music.albums) ?? null };
+        continue;
+      }
+      const album = music.albums[id];
+      if (album) out[id] = { addressableId: id, kind: "album", artwork: album.imageUrl ?? null };
+    }
+  }
+  return out;
+});

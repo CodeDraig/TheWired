@@ -37,6 +37,7 @@ import { HistoryTab } from "./panel/HistoryTab";
 import { RecipientPickerModal } from "@/components/sharing/RecipientPickerModal";
 import { SpacePickerModal } from "@/components/sharing/SpacePickerModal";
 import { MusicPostModal } from "./MusicPostModal";
+import { AddToFolderModal } from "./AddToFolderModal";
 
 // ── Shared UI primitives (same as ActionsTab) ──
 
@@ -144,6 +145,7 @@ export function AlbumActionPanel({ album, open, onClose, onEdit }: AlbumActionPa
   const [dmPickerOpen, setDmPickerOpen] = useState(false);
   const [spacePickerOpen, setSpacePickerOpen] = useState(false);
   const [postModalOpen, setPostModalOpen] = useState(false);
+  const [folderOpen, setFolderOpen] = useState(false);
 
   const [playNextFlash, triggerPlayNext] = useFlash();
   const [queueFlash, triggerQueue] = useFlash();
@@ -153,7 +155,7 @@ export function AlbumActionPanel({ album, open, onClose, onEdit }: AlbumActionPa
   const [showcaseFlash, triggerShowcase] = useFlash();
   const [repostFlash, triggerRepost] = useFlash();
 
-  const anyModalOpen = dmPickerOpen || spacePickerOpen || postModalOpen;
+  const anyModalOpen = dmPickerOpen || spacePickerOpen || postModalOpen || folderOpen;
 
   const panelRef = useRef<HTMLDivElement>(null);
 
@@ -411,6 +413,19 @@ export function AlbumActionPanel({ album, open, onClose, onEdit }: AlbumActionPa
                     </>
                   )}
 
+                  {/* ── Folders (private shelves, on every device) ── */}
+                  {!isLocal && (
+                    <>
+                      <SectionDivider />
+                      <SectionLabel>Folders</SectionLabel>
+                      <ActionButton
+                        icon={<ListPlus size={14} />}
+                        label="Add to Folder"
+                        onClick={() => setFolderOpen(true)}
+                      />
+                    </>
+                  )}
+
                   {/* ── Share ── */}
                   {!isLocal && (
                     <>
@@ -553,6 +568,14 @@ export function AlbumActionPanel({ album, open, onClose, onEdit }: AlbumActionPa
           onBack={() => setSpacePickerOpen(false)}
           onSelect={handleShareToSpace}
           channelTypes={["chat", "notes", "music"]}
+        />
+      )}
+      {folderOpen && (
+        <AddToFolderModal
+          open={folderOpen}
+          onClose={() => setFolderOpen(false)}
+          onBack={() => setFolderOpen(false)}
+          itemAddrId={album.addressableId}
         />
       )}
       {postModalOpen && (

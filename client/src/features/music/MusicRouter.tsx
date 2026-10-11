@@ -5,7 +5,8 @@ import { MusicHome } from "./views/MusicHome";
 import { SongList } from "./views/SongList";
 import { AlbumGrid } from "./views/AlbumGrid";
 import { ArtistList } from "./views/ArtistList";
-import { PlaylistList } from "./views/PlaylistList";
+import { FolderList } from "./views/FolderList";
+import { FolderDetail } from "./views/FolderDetail";
 import { ArtistDetail } from "./views/ArtistDetail";
 import { AlbumDetail } from "./views/AlbumDetail";
 import { PlaylistDetail } from "./views/PlaylistDetail";
@@ -27,7 +28,9 @@ const VIEW_COMPONENTS: Record<MusicView, React.ComponentType> = {
   artists: ArtistList,
   albums: AlbumGrid,
   songs: SongList,
-  playlists: PlaylistList,
+  playlists: FolderList,
+  folders: FolderList,
+  "folder-detail": FolderDetail,
   "my-uploads": MyUploads,
   explore: ExploreMusic,
   "for-you": ExploreMusic,

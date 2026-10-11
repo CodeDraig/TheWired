@@ -109,6 +109,14 @@ export interface MusicPlaylist {
   trackRefs: string[]; // ordered addressable IDs of tracks
   createdAt: number;
   visibility: MusicVisibility;
+  /** `h` tags of a space-scoped playlist (kept so a republish keeps them). */
+  spaceIds?: string[];
+  channelId?: string;
+  /** Retracted (`["deleted","true"]`): the newest copy says it's gone. */
+  deleted?: boolean;
+  /** Published from a folder by a sync-aware client (`["l","music_folder"]`):
+   *  the folder doc is the truth, the playlist is its public copy. */
+  fromFolder?: boolean;
 }
 
 export type MusicView =
@@ -119,6 +127,8 @@ export type MusicView =
   | "albums"
   | "songs"
   | "playlists"
+  | "folders"
+  | "folder-detail"
   | "my-uploads"
   | "artist-detail"
   | "album-detail"

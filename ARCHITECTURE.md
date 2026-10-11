@@ -148,14 +148,14 @@
 | NWC Notification | 23196/23197 | NIP-47 | Regular | Push notifications (nip04 legacy / nip44_v2) |
 | Remote Signer | 24133 | NIP-46 | Regular | Bunker request/response (NIP-44 encrypted) |
 | Mute List | 10000 | NIP-51 | Replaceable | `p`/`t`/`word`/`e` tags for spam filtering |
-| Bookmarks | 10003 | NIP-51 | Replaceable | Saved events (tracks, articles, videos) |
+| Bookmarks | 10003 | NIP-51 | Replaceable | Saved notes and articles (music is NOT stored here — see §5.1) |
 | User Groups | 10009 | NIP-51 | Replaceable | NIP-29 group memberships |
 | Relay List | 10002 | NIP-65 | Replaceable | `r` tags with read/write markers |
 | Blossom Server List | 10063 | NIP-B7 | Replaceable | `server` tags for file storage |
-| Follow Sets | 30000 | NIP-51 | Addressable | Categorized follow groups ("favorite-artists") |
-| Bookmark Sets | 30003 | NIP-51 | Addressable | Categorized bookmarks ("liked-tracks") |
+| Follow Sets | 30000 | NIP-51 | Addressable | Categorized follow groups |
+| Bookmark Sets | 30003 | NIP-51 | Addressable | Categorized bookmarks |
 | Curation Sets | 30005 | NIP-51 | Addressable | Video playlists |
-| App-specific Data | 30078 | NIP-78 | Addressable | Client settings, preferences; `wired:layout:<groupId>` channel layout + `wired:relays:<groupId>` relay-set overlays for decentralized spaces |
+| App-specific Data | 30078 | NIP-78 | Addressable | Client settings, preferences; `wired:layout:<groupId>` channel layout + `wired:relays:<groupId>` relay-set overlays for decentralized spaces; the synced music library (`thewired:music_library:<0-7>`) and folders (`thewired:music_folder:<id>`), see §5.1 |
 | NIP-29 Group Meta | 39000 | NIP-29 | Addressable | Group name, picture, about, access flags |
 | NIP-29 Group Admins | 39001 | NIP-29 | Addressable | Admin list with roles |
 | NIP-29 Group Members | 39002 | NIP-29 | Addressable | Member pubkey list |
@@ -178,7 +178,7 @@ Three verified-unused addressable kinds are allocated:
 |------|------|-----------------|-------------|
 | **31683** | Music Track | `<artist-prefix>:<slug>` | Individual track metadata |
 | **33123** | Music Album | `<artist-prefix>:<album-slug>` | Album grouping of tracks |
-| **30119** | Music Playlist | `<owner-prefix>:<playlist-slug>` | User-created playlists |
+| **30119** | Music Playlist | `<folder-id>` (older clients: a title slug) | A published folder |
 
 #### Kind 31683 -- Music Track Event
 
@@ -258,19 +258,24 @@ Three verified-unused addressable kinds are allocated:
 {
   "kind": 30119,
   "pubkey": "<user-pubkey>",
-  "content": "<NIP-44 encrypted JSON array of private track references, or empty>",
+  "content": "<description, plaintext>",
   "tags": [
-    ["d", "user123:late-night-vibes"],
+    ["d", "<folder-id>"],
     ["title", "Late Night Vibes"],
-    ["description", "My favorite tracks for coding at night"],
     ["image", "https://cdn.thewired.app/playlists/pl123.jpg"],
-    // Public tracks
-    ["a", "31683:<artist1-pubkey>:neon-wave:electric-dreams", "<relay-hint>"],
-    ["a", "31683:<artist2-pubkey>:retrowave:sunset-cruise", "<relay-hint>"]
-    // Private tracks encrypted in .content via NIP-44
+    ["a", "31683:<artist1-pubkey>:electric-dreams"],
+    ["a", "31683:<artist2-pubkey>:sunset-cruise"],
+    // Written from a folder by a sync-aware client (the folder doc is the
+    // truth; this playlist is its public copy):
+    ["l", "music_folder", "thewired"]
+    // Retracted: ["deleted", "true"] with no `a` tags.
   ]
 }
 ```
+
+A playlist is the **published state of a folder** (§5.1): projects publish as
+their tracklists, and the playlist is replaced at the same address on every
+update.
 
 ### Spaces-to-Kind Routing Table
 
@@ -734,38 +739,34 @@ Backend (relayIngester)
 
 ## 5. Music Library Architecture
 
-### 5.1 User Library via NIP-51
+### 5.1 User Library + Folders, synced between the account's devices
 
-**Saved Tracks** -- kind:10003 Bookmarks:
+Normative contract: `docs/MUSIC_LIBRARY_SYNC.md`. Shared code:
+`@ishtarservices/core` (`nostr/stamps.ts`, `nostr/musicLibrarySync.ts`,
+`nostr/musicFolderSync.ts`, `music/folders.ts`), used by desktop and mobile.
 
-```jsonc
-{
-  "kind": 10003,
-  "content": "<NIP-44 encrypted private bookmarks>",
-  "tags": [
-    ["a", "31683:<artist-pubkey>:neon-wave:electric-dreams", "<relay-hint>"],
-    ["a", "31683:<artist-pubkey>:retrowave:sunset-cruise", "<relay-hint>"]
-  ]
-}
-```
-
-Private tracks use NIP-44 self-encryption in `.content`.
-
-**Artist Following** -- kind:30000 Follow Sets:
-
-```jsonc
-{
-  "kind": 30000,
-  "tags": [
-    ["d", "favorite-artists"],
-    ["title", "Favorite Artists"],
-    ["p", "<artist1-pubkey>", "<relay-hint>"],
-    ["p", "<artist2-pubkey>", "<relay-hint>"]
-  ]
-}
-```
-
-Uses dedicated follow sets (not kind:3) to separate music follows from social graph.
+- **What:** saved tracks + projects, favorites, followed artists, and
+  folders (private shelves; a published folder is a kind 30119 playlist).
+  Recently played stays on each device.
+- **Where:** NIP-78 kind 30078, content NIP-44-encrypted to self — 8 library
+  shards (`thewired:music_library:<0-7>`, sharded by artist pubkey) and one
+  doc per folder (`thewired:music_folder:<id>`, labelled
+  `["l","music_folder","thewired"]`). Nothing is mirrored into public tags:
+  a library is attention data. Music is deliberately NOT in kind 10003
+  (that list is note/article bookmarks, has no per-item stamps, is capped).
+- **Merge:** every membership is a signed unix-seconds stamp (+added /
+  −removed); per key the larger |stamp| wins, a tie goes to the add — so
+  devices converge whatever order they merge copies in. Folders add
+  last-writer-wins name / pin / published state / order.
+- **Safety:** only explicit user actions stamp removals; merges happen in
+  the reducer; nothing is published before the app relay answered; a copy
+  that can't be decrypted is never published over; `duplicate:` OKs retry.
+- **Desktop:** `features/music/librarySync.ts` (driver), the `librarySync`
+  state in `musicSlice`, `views/FolderList.tsx` / `FolderDetail.tsx`,
+  `AddToFolderModal.tsx`. The IndexedDB `music_library` row carries the
+  record next to the arrays; folders live in `music_folders`.
+- **Backend:** none needed. `app.saved_album_versions` stays the
+  "update available" mirror of saved items, per pubkey.
 
 ### 5.2 Zap Integration for Track Monetization
 
@@ -1427,9 +1428,9 @@ SAT balance: NIP-47 `get_balance` every 60 seconds.
 - 9 view pages in `features/music/views/`: MusicHome (trending/recent discovery), SongList, AlbumGrid, ArtistList, PlaylistList, ArtistDetail, AlbumDetail, PlaylistDetail, RecentlyAdded
 - Display components: `TrackCard` (grid card with play overlay), `AlbumCard` (grid card), `TrackRow` (table row with hover play icon)
 - Memoized selectors (`musicSelectors.ts`) via `createSelector` for all music data access
-- Library hook (`useLibrary.ts`): save/unsave tracks, follow/unfollow artists -- local Redux state (NIP-51 publish deferred)
+- Library hook (`useLibrary.ts`): save/unsave tracks, follow/unfollow artists -- stamped into the synced record (§5.1)
 - Search: `useMusicSearch.ts` (debounced, abort controller, parallel track+album queries) + `SearchInput.tsx` in TopBar
-- Upload: `UploadTrackModal.tsx`, `CreateAlbumModal.tsx`, `CreatePlaylistModal.tsx` with file upload → event publish
+- Upload: `UploadTrackModal.tsx`, `CreateAlbumModal.tsx` with file upload → event publish; folders (`FolderNameModal.tsx`, `AddToFolderModal.tsx`) replace the old playlist modals
 - Space channel: `SpaceMusicView.tsx` for `#music` channel in spaces, registered in `ChannelPanel` and `ChannelList`
 - Client API module (`lib/api/music.ts`): `uploadAudio()`, `uploadCoverArt()`, `getTrendingTracks()`, `getTrendingAlbums()`, `searchMusic()`
 
