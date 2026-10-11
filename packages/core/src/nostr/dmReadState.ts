@@ -18,6 +18,7 @@ import type {
 } from "@ishtarservices/shared-types";
 import { DM_READ_STATE_D_TAG as D_TAG } from "@ishtarservices/shared-types";
 import type { Nip44Codec } from "../crypto/nip44";
+import { mergeStampMaps } from "./stamps";
 
 export const DM_READ_STATE_D_TAG = D_TAG;
 export const TOMBSTONE_TTL_SECONDS = 30 * 24 * 3600;
@@ -75,24 +76,11 @@ export function normalizeDMReadState(input: unknown): DMReadStateRecordV2 {
   return rec;
 }
 
-function mergeFlags(
+// Flag stamps are the shared signed-stamp primitive (./stamps).
+const mergeFlags: (
   a: Record<string, DMFlagStamp>,
   b: Record<string, DMFlagStamp>,
-): Record<string, DMFlagStamp> {
-  const out: Record<string, DMFlagStamp> = { ...a };
-  for (const [k, vb] of Object.entries(b)) {
-    const va = out[k];
-    if (va === undefined) {
-      out[k] = vb;
-      continue;
-    }
-    const ta = Math.abs(va);
-    const tb = Math.abs(vb);
-    if (tb > ta) out[k] = vb;
-    else if (tb === ta && vb > 0 && va < 0) out[k] = vb;
-  }
-  return out;
-}
+) => Record<string, DMFlagStamp> = mergeStampMaps;
 
 /** Commutative, idempotent merge of two records. */
 export function mergeDMReadState(a: DMReadStateRecord | null | undefined, b: DMReadStateRecord | null | undefined): DMReadStateRecordV2 {
