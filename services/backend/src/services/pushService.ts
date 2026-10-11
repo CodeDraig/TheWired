@@ -7,10 +7,25 @@ import {
 } from "../db/schema/notifications.js";
 import { eq, and, lt } from "drizzle-orm";
 import { nanoid } from "../lib/id.js";
+import { getRedis } from "../lib/redis.js";
 
 /** More devices than anyone plausibly owns — the cap only bounds junk-token
  *  registration (Expo throttles senders that push to dead tokens). */
 export const MAX_DEVICES_PER_PUBKEY = 20;
+
+/** How long the last Expo delivery error for an account is remembered —
+ *  long enough for a tester to open You → Notifications the next day. */
+export const DELIVERY_ERROR_TTL_SEC = 7 * 24 * 3600;
+const deliveryErrorKey = (pubkey: string) => `notif:lasterr:${pubkey}`;
+
+export interface DeliveryError {
+  /** unix ms */
+  at: number;
+  /** Expo's `details.error` (DeviceNotRegistered, InvalidCredentials, …) or
+   *  a transport failure. */
+  error: string;
+  message?: string;
+}
 
 export interface RegisterDeviceParams {
   pubkey: string;
@@ -102,6 +117,28 @@ export const pushService = {
   /** Provider said the token is dead (DeviceNotRegistered / 410). */
   async deleteToken(token: string): Promise<void> {
     await db.delete(pushDevices).where(eq(pushDevices.token, token));
+  },
+
+  /** The dispatcher's last Expo failure for this account, so the app can
+   *  show WHY a push did not arrive (an APNs credential problem is otherwise
+   *  visible only in the server log). Cleared by the next successful send. */
+  async recordDeliveryError(pubkey: string, error: string, message?: string): Promise<void> {
+    const value: DeliveryError = { at: Date.now(), error, ...(message ? { message: message.slice(0, 200) } : {}) };
+    await getRedis().set(deliveryErrorKey(pubkey), JSON.stringify(value), "EX", DELIVERY_ERROR_TTL_SEC);
+  },
+
+  async clearDeliveryError(pubkey: string): Promise<void> {
+    await getRedis().del(deliveryErrorKey(pubkey));
+  },
+
+  async lastDeliveryError(pubkey: string): Promise<DeliveryError | null> {
+    const raw = await getRedis().get(deliveryErrorKey(pubkey));
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as DeliveryError;
+    } catch {
+      return null;
+    }
   },
 
   /** Housekeeping: devices not seen for `days`. */
