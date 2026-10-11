@@ -309,7 +309,7 @@ export const discoveryService = {
   },
 
   /**
-   * The honest "from spaces" rail (WIR-171): public releases that were SHARED
+   * The honest "from spaces" rail: public releases that were SHARED
    * into a listed space's music channel (a kind-9 shelf post carrying `a` +
    * `channel`, docs/nips/NIP-XX-Music-Events.md "Kind-9 shelf post"). The join
    * is share → space, never author → space, so "via <space>" is literally

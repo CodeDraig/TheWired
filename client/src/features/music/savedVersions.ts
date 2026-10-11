@@ -1,5 +1,5 @@
 /**
- * Pure rules for the "Update Available" state of saved music (WIR-165).
+ * Pure rules for the "Update Available" state of saved music.
  *
  * The backend row is a hint, not the truth: the ingester may lag the relays
  * the client reads, and the client may lag the ingester. So an update is

@@ -1,4 +1,4 @@
--- Saved-version update tracking (WIR-165).
+-- Saved-version update tracking.
 --
 -- `has_update` used to be set for EVERY ingested 31683/33123 event for the
 -- address, with no comparison against the fan's saved version — and the music

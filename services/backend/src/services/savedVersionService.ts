@@ -1,5 +1,5 @@
 /**
- * Saved-version update tracking for music (WIR-165).
+ * Saved-version update tracking for music.
  *
  * A fan "saves" the version of a track/project they have; the ingester flags
  * the row when a strictly newer event for that address arrives. The rules that

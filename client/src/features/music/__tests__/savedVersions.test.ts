@@ -1,5 +1,5 @@
 /**
- * "Update Available" derivation + notification gating (WIR-165).
+ * "Update Available" derivation + notification gating.
  *
  * The bug this pins: the banner showed for every re-delivered event and never
  * cleared. The client now derives the state from saved-vs-newest-known and the

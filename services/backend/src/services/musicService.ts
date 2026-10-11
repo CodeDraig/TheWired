@@ -213,7 +213,7 @@ export const musicService = {
   },
 
   /**
-   * Move the signer's ownership of `shas` to `to` (WIR-172 rotation). Per sha:
+   * Move the signer's ownership of `shas` to `to` (key rotation). Per sha:
    * the signer's blob_owners row becomes `to`'s (kept if `to` already has one),
    * and music_uploads rows the signer holds for that sha are re-attributed.
    * Shas the signer does not own are skipped, so a replay changes nothing.

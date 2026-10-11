@@ -1,6 +1,6 @@
 /**
  * GET /discovery/spaces/music?source=shares — the share-based "from spaces"
- * rail (WIR-171). A row exists only because a member put the release on a
+ * rail. A row exists only because a member put the release on a
  * listed space's music-channel shelf (kind-9 with `a` + `channel`), so
  * "via <space>" is literally true. The publicness gate stays on the release
  * itself. Guest-readable like the rest of explore.

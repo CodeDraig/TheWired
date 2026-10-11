@@ -21,7 +21,7 @@
 use crate::nostr::event::Event;
 
 /// p-tag roles (4th element) that unlock protected content. `owner` is a human
-/// holder of a shared project key (WIR-172: the event is signed by the project
+/// holder of a shared project key (the event is signed by the project
 /// key, so this is how holders read their own gated project as themselves).
 /// `featured` and any unknown role are credits, not grants; a role-less p tag
 /// keeps granting for events that predate roles. Keep in sync with

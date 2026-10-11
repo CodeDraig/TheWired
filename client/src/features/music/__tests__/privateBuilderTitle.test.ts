@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 
 // The relay refuses music events without a cleartext `title` tag (audit
 // #115). The NIP-44 private builders keep the real title encrypted, so they
-// must still emit a placeholder or every private upload is rejected (WIR-158).
+// must still emit a placeholder or every private upload is rejected.
 vi.mock("@/lib/nostr/nip44", () => ({
   nip44Encrypt: vi.fn(async (_pk: string, plaintext: string) => `enc:${plaintext.length}`),
 }));
