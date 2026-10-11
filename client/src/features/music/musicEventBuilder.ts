@@ -284,7 +284,7 @@ export async function buildPrivateTrackEvent(
     ["d", params.slug],
     // The relay requires a cleartext title on every music event (audit #115);
     // the real title lives in the encrypted metadata, so this is a placeholder
-    // that parsers never surface for anyone who can decrypt (WIR-158).
+    // that parsers never surface for anyone who can decrypt.
     ["title", PRIVATE_TRACK_TITLE],
     ["visibility", "private"],
   ];

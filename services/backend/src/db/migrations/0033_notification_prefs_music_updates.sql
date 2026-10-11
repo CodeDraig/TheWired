@@ -1,4 +1,4 @@
--- "Music updates" push preference (WIR-165 leftover / WIR-171).
+-- "Music updates" push preference.
 --
 -- The ingester now enqueues a `music_update` push for every fan whose saved
 -- version of a track/project was flagged by a newer event. Both clients already

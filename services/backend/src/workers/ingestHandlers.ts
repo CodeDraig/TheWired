@@ -697,8 +697,8 @@ async function syncMusicSearchDocs(event: NostrEvent, kind: 31683 | 33123) {
 }
 
 /**
- * Flag fans whose saved version of this track/project is older than `event`
- * (WIR-165). Runs for public AND non-public events: a private project still
+ * Flag fans whose saved version of this track/project is older than `event`.
+ * Runs for public AND non-public events: a private project still
  * updates for the collaborators it is addressed to — but only for them, since
  * nobody else can fetch it. Never throws; a flagging failure must not stop
  * indexing.
@@ -716,7 +716,7 @@ async function flagSavedVersions(event: NostrEvent) {
 }
 
 /**
- * One `music_update` push per fan whose saved row was just flagged (WIR-171).
+ * One `music_update` push per fan whose saved row was just flagged.
  * Only ever reached from the own relay (decideAction gates 31683/33123), and
  * only for rows flagUpdates actually moved — a backfill re-ingest flags
  * nobody, so it pushes to nobody. The author never gets one for their own
@@ -724,7 +724,7 @@ async function flagSavedVersions(event: NostrEvent) {
  * the fans it is addressed to (the audience flagUpdates was given).
  */
 async function pushSavedVersionUpdates(event: NostrEvent, fans: string[]) {
-  // A shared project (WIR-172) is signed by its project key and names its
+  // A shared project is signed by its project key and names its
   // human holders ["p", x, "", "owner"]; they edited it, so they are not
   // fans to notify. Excluding is safe even when the tag is spoofed: naming
   // someone `owner` only mutes pushes about THIS event for them.

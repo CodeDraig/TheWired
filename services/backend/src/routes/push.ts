@@ -2,6 +2,16 @@ import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { pushService } from "../services/pushService.js";
 import { validate, nonEmptyString } from "../lib/validation.js";
+import { getRedis } from "../lib/redis.js";
+import { enqueueNotification } from "../services/notificationEnqueue.js";
+
+/** One test push per account per window — it goes through the real queue. */
+export const TEST_PUSH_WINDOW_SEC = 60;
+export const TEST_PUSH = {
+  title: "soot",
+  body: "test push — if you can read this on the lock screen, pushes reach this phone",
+  url: "soot://you/notifications",
+} as const;
 
 // ── Web Push (desktop) ──
 const subscribeBody = z.object({
@@ -75,6 +85,62 @@ export const pushRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(400).send({ error: "Too many devices", code: "TOO_MANY_DEVICES" });
     }
     return { data: { id: result.id } };
+  });
+
+  /** GET /push/devices — what the server holds for the caller: the devices
+   *  it would push to and the last Expo delivery failure. The app's
+   *  You → Notifications screen reads this so "pushes don't arrive" shows
+   *  WHICH hop is broken (no token registered vs. the push service refusing). */
+  server.get("/devices", async (request, reply) => {
+    const pubkey = (request as any).pubkey;
+    if (!pubkey) return reply.status(401).send({ error: "Unauthorized", code: "UNAUTHORIZED" });
+    const [devices, lastError] = await Promise.all([
+      pushService.devicesFor(pubkey),
+      pushService.lastDeliveryError(pubkey),
+    ]);
+    return {
+      data: {
+        devices: devices.map((d) => ({
+          id: d.id,
+          provider: d.provider,
+          platform: d.platform,
+          /** Enough to recognise the token in the app, never the whole thing. */
+          tokenSuffix: d.token.slice(-8),
+          appVersion: d.appVersion,
+          lastSeenAt: d.lastSeenAt.toISOString(),
+        })),
+        lastError,
+      },
+    };
+  });
+
+  /** POST /push/test — queue one push to the caller's own devices through
+   *  the ordinary dispatcher (type "test"). A tester taps it on the phone and
+   *  either the lock screen lights up within a dispatcher tick or GET
+   *  /push/devices says why not. */
+  server.post("/test", async (request, reply) => {
+    const pubkey = (request as any).pubkey;
+    if (!pubkey) return reply.status(401).send({ error: "Unauthorized", code: "UNAUTHORIZED" });
+    const devices = await pushService.devicesFor(pubkey);
+    if (devices.length === 0) {
+      return reply.status(409).send({ error: "No device registered for this account", code: "NO_DEVICES" });
+    }
+    const fresh = await getRedis().set(`notif:test:${pubkey}`, "1", "EX", TEST_PUSH_WINDOW_SEC, "NX");
+    if (fresh !== "OK") {
+      return reply.status(429).send({ error: "One test push per minute", code: "RATE_LIMITED" });
+    }
+    const queued = await enqueueNotification({
+      pubkey,
+      type: "test",
+      title: TEST_PUSH.title,
+      body: TEST_PUSH.body,
+      url: TEST_PUSH.url,
+      collapseKey: `test:${pubkey}`,
+    });
+    if (!queued) {
+      return reply.status(409).send({ error: "Notifications are switched off for this account", code: "PREFS_DISABLED" });
+    }
+    return { data: { queued: true, devices: devices.length } };
   });
 
   /** DELETE /push/devices — drop this device's token (own pubkey only). */

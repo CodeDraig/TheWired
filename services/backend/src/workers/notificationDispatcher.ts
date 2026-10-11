@@ -245,23 +245,32 @@ export async function dispatchOnce(deps: DispatchDeps): Promise<DispatchStats> {
       try {
         const tickets = await deps.sender.send(messages);
         const redis = getRedis();
+        let anyOk = false;
         for (let i = 0; i < tickets.length; i++) {
           const ticket = tickets[i];
           const token = expoDevices[i].token;
           if (ticket.status === "ok") {
+            anyOk = true;
             if (ticket.id) {
               await redis.lpush(TICKETS_KEY, JSON.stringify({ id: ticket.id, token, at: now() }));
             }
           } else if (ticket.details?.error === DEVICE_NOT_REGISTERED) {
             await pushService.deleteToken(token);
+            await pushService.recordDeliveryError(pubkey, DEVICE_NOT_REGISTERED, ticket.message);
             stats.pruned++;
           } else {
+            // Remembered per account so You → Notifications can show it: an
+            // InvalidCredentials ticket (no APNs key on the Expo project) is
+            // otherwise visible only here, in the server log.
             console.error(`[notifications] expo ticket error for ${pubkey}: ${ticket.message}`);
+            await pushService.recordDeliveryError(pubkey, ticket.details?.error ?? "ticket_error", ticket.message);
             allSent = false;
           }
         }
+        if (anyOk) await pushService.clearDeliveryError(pubkey);
       } catch (err) {
         console.error("[notifications] expo send failed:", (err as Error).message);
+        await pushService.recordDeliveryError(pubkey, "send_failed", (err as Error).message).catch(() => {});
         allSent = false;
       }
     }

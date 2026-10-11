@@ -66,7 +66,7 @@ export function MoveTrackModal({ track, onClose, onBack }: MoveTrackModalProps) 
       // Moving rebuilds the track and both projects with the cleartext
       // builders. For a private (NIP-44) track or project that would publish
       // the decrypted metadata and drop every collaborator grant, so refuse
-      // until a private-aware move exists (WIR-161 follow-up).
+      // until a private-aware move exists.
       const sourceAlbumVis = track.albumRef ? albums[track.albumRef]?.visibility : undefined;
       const targetAlbumVis = targetAlbumId ? albums[targetAlbumId]?.visibility : undefined;
       if ([track.visibility, sourceAlbumVis, targetAlbumVis].includes("private")) {

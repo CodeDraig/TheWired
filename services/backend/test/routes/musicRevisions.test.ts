@@ -3,7 +3,7 @@
  * same 404 shapes as GET /music/resolve/track (docs/MUSIC_VISIBILITY.md).
  * Before this gate, a private or space-scoped track's whole revision history
  * (full `eventJson`, including old audio URLs) was served to anyone holding
- * the slug (WIR-3).
+ * the slug.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import type { FastifyInstance } from "fastify";

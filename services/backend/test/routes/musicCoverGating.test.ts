@@ -1,5 +1,5 @@
 /**
- * Cover art of private / space-scoped releases (WIR-171, WIR-122 leftover).
+ * Cover art of private / space-scoped releases.
  *
  * A cover uploaded through POST /music/upload/cover lands in the backend's
  * own blob store with the uploader recorded as owner, so the moment the
