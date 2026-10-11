@@ -277,3 +277,28 @@ describe("pollReceiptsOnce", () => {
     expect(await pushService.devicesFor(LUNA.pubkey)).toHaveLength(1);
   });
 });
+
+describe("last delivery error (You → Notifications diagnostics)", () => {
+  it("remembers a non-fatal ticket error per account and clears it on the next ok send", async () => {
+    await device();
+    await seed();
+    const failing = fakeSender(() => ({ status: "error", message: "no APNs key", details: { error: "InvalidCredentials" } }));
+    await dispatchOnce({ sender: failing.sender });
+    expect(await pushService.lastDeliveryError(LUNA.pubkey)).toMatchObject({ error: "InvalidCredentials", message: "no APNs key" });
+
+    // The row is retried; a working sender clears the remembered error.
+    const working = fakeSender();
+    await dispatchOnce({ sender: working.sender });
+    expect(await pushService.lastDeliveryError(LUNA.pubkey)).toBeNull();
+  });
+
+  it("a dead token is pruned AND remembered, so the phone can re-register", async () => {
+    await device();
+    await seed();
+    const dead = fakeSender(() => ({ status: "error", message: "gone", details: { error: "DeviceNotRegistered" } }));
+    await dispatchOnce({ sender: dead.sender });
+    expect(await pushService.devicesFor(LUNA.pubkey)).toHaveLength(0);
+    expect(await pushService.lastDeliveryError(LUNA.pubkey)).toMatchObject({ error: "DeviceNotRegistered" });
+    await pushService.clearDeliveryError(LUNA.pubkey);
+  });
+});

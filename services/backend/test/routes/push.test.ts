@@ -18,6 +18,8 @@ import { LUNA, MARCUS } from "../helpers/testUsers.js";
 import { db } from "../../src/db/connection.js";
 import { pushDevices } from "../../src/db/schema/notifications.js";
 import { pushService, MAX_DEVICES_PER_PUBKEY } from "../../src/services/pushService.js";
+import { notificationQueue } from "../../src/db/schema/notifications.js";
+import { TEST_PUSH } from "../../src/routes/push.js";
 import { getRedis } from "../../src/lib/redis.js";
 
 let server: FastifyInstance;
@@ -159,5 +161,56 @@ describe("pushService housekeeping", () => {
     await register(LUNA.pubkey);
     await pushService.deleteToken(TOKEN);
     expect(await pushService.devicesFor(LUNA.pubkey)).toHaveLength(0);
+  });
+});
+
+describe("GET /push/devices (diagnostics)", () => {
+  it("lists the caller's devices with a token suffix and the last delivery error", async () => {
+    const anon = await server.inject({ method: "GET", url: "/push/devices" });
+    expect(anon.statusCode).toBe(401);
+
+    const empty = await server.inject({ method: "GET", url: "/push/devices", headers: { "x-auth-pubkey": LUNA.pubkey } });
+    expect(empty.statusCode).toBe(200);
+    expect(empty.json().data).toEqual({ devices: [], lastError: null });
+
+    await register(LUNA.pubkey);
+    await pushService.recordDeliveryError(LUNA.pubkey, "InvalidCredentials", "no APNs key");
+    const res = await server.inject({ method: "GET", url: "/push/devices", headers: { "x-auth-pubkey": LUNA.pubkey } });
+    const data = res.json().data;
+    expect(data.devices).toHaveLength(1);
+    expect(data.devices[0].tokenSuffix).toBe(TOKEN.slice(-8));
+    expect(data.devices[0]).not.toHaveProperty("token");
+    expect(data.lastError).toMatchObject({ error: "InvalidCredentials", message: "no APNs key" });
+
+    // Another account sees nothing of it.
+    const other = await server.inject({ method: "GET", url: "/push/devices", headers: { "x-auth-pubkey": MARCUS.pubkey } });
+    expect(other.json().data).toEqual({ devices: [], lastError: null });
+
+    await pushService.clearDeliveryError(LUNA.pubkey);
+    expect(await pushService.lastDeliveryError(LUNA.pubkey)).toBeNull();
+  });
+});
+
+describe("POST /push/test", () => {
+  it("queues one test push to the caller's own devices, once a minute", async () => {
+    await getRedis().del(`notif:test:${LUNA.pubkey}`);
+    const anon = await server.inject({ method: "POST", url: "/push/test", payload: {} });
+    expect(anon.statusCode).toBe(401);
+
+    const noDevice = await server.inject({ method: "POST", url: "/push/test", headers: { "x-auth-pubkey": LUNA.pubkey }, payload: {} });
+    expect(noDevice.statusCode).toBe(409);
+    expect(noDevice.json().code).toBe("NO_DEVICES");
+
+    await register(LUNA.pubkey);
+    const ok = await server.inject({ method: "POST", url: "/push/test", headers: { "x-auth-pubkey": LUNA.pubkey }, payload: {} });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().data).toEqual({ queued: true, devices: 1 });
+    const rows = await db.select().from(notificationQueue).where(eq(notificationQueue.pubkey, LUNA.pubkey));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ type: "test", title: TEST_PUSH.title, body: TEST_PUSH.body, url: TEST_PUSH.url, sent: false });
+
+    const again = await server.inject({ method: "POST", url: "/push/test", headers: { "x-auth-pubkey": LUNA.pubkey }, payload: {} });
+    expect(again.statusCode).toBe(429);
+    await getRedis().del(`notif:test:${LUNA.pubkey}`);
   });
 });
