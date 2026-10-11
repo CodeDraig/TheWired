@@ -54,7 +54,7 @@ export function MusicSidebar() {
             activeView === item.view ||
             (item.view === "albums" && (activeView === "album-detail" || activeView === "project-history")) ||
             (item.view === "artists" && activeView === "artist-detail") ||
-            (item.view === "folders" && (activeView === "folder-detail" || activeView === "playlists"));
+            (item.view === "folders" && (activeView === "folder-detail" || activeView === "published-folder"));
           return (
             <button
               key={item.view}

@@ -135,7 +135,7 @@ interface ActionsTabProps {
   onAddToQueue: () => void;
   onSaveToggle: () => void;
   onFavoriteToggle: () => void;
-  onAddToPlaylist: () => void;
+  onAddToFolder: () => void;
   onCopyLink: () => void;
   onSendToDM: () => void;
   onShareToSpace: () => void;
@@ -183,7 +183,7 @@ export function ActionsTab({
   onAddToQueue,
   onSaveToggle,
   onFavoriteToggle,
-  onAddToPlaylist,
+  onAddToFolder,
   onCopyLink,
   onSendToDM,
   onShareToSpace,
@@ -275,13 +275,13 @@ export function ActionsTab({
             onClick={onFavoriteToggle}
             active={favorited}
           />
-          <ActionButton icon={<ListPlus size={14} />} label="Add to Folder" onClick={onAddToPlaylist} />
+          <ActionButton icon={<ListPlus size={14} />} label="Add to Folder" onClick={onAddToFolder} />
         </>
       )}
 
       {/* ── Folders (owner) ── */}
       {isOwner && (
-        <ActionButton icon={<ListPlus size={14} />} label="Add to Folder" onClick={onAddToPlaylist} />
+        <ActionButton icon={<ListPlus size={14} />} label="Add to Folder" onClick={onAddToFolder} />
       )}
 
       {/* ── Share ── */}

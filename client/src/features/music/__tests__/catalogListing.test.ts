@@ -162,7 +162,7 @@ function storeWithLunasTracks(viewer: string | null, savedTrackIds: string[] = [
         }),
       },
       tracksByArtist: { [lunaVega.pubkey]: [listedId, clipId] },
-      library: { savedTrackIds, savedAlbumIds: [], favoritedTrackIds: [], favoritedAlbumIds: [], userPlaylists: [] },
+      library: { savedTrackIds, savedAlbumIds: [], favoritedTrackIds: [], favoritedAlbumIds: [] },
     } as any,
   });
 }

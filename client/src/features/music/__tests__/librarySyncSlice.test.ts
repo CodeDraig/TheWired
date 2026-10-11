@@ -45,7 +45,6 @@ function hydrated(arrays = {}, record = null as ReturnType<typeof emptyLibraryRe
       record,
       rowUpdatedAt: 1000,
       folderDocs: {},
-      userPlaylists: [],
       recentlyPlayedIds: ["31683:x:recent"],
       readFailed: false,
     }),

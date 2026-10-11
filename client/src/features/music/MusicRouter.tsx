@@ -9,7 +9,7 @@ import { FolderList } from "./views/FolderList";
 import { FolderDetail } from "./views/FolderDetail";
 import { ArtistDetail } from "./views/ArtistDetail";
 import { AlbumDetail } from "./views/AlbumDetail";
-import { PlaylistDetail } from "./views/PlaylistDetail";
+import { PublishedFolderDetail } from "./views/PublishedFolderDetail";
 import { RecentlyAdded } from "./views/RecentlyAdded";
 import { FavoritesList } from "./views/FavoritesList";
 import { MyUploads } from "./views/MyUploads";
@@ -28,7 +28,6 @@ const VIEW_COMPONENTS: Record<MusicView, React.ComponentType> = {
   artists: ArtistList,
   albums: AlbumGrid,
   songs: SongList,
-  playlists: FolderList,
   folders: FolderList,
   "folder-detail": FolderDetail,
   "my-uploads": MyUploads,
@@ -36,7 +35,7 @@ const VIEW_COMPONENTS: Record<MusicView, React.ComponentType> = {
   "for-you": ExploreMusic,
   "artist-detail": ArtistDetail,
   "album-detail": AlbumDetail,
-  "playlist-detail": PlaylistDetail,
+  "published-folder": PublishedFolderDetail,
   search: SearchResults,
   "project-history": ProjectHistory,
   // TODO: Re-enable proposals/changes system later

@@ -144,7 +144,7 @@ export function FolderDetail() {
               className={pill}
               title={
                 folder.publishedAs
-                  ? "Replaces the published playlist"
+                  ? "Replaces the published copy"
                   : hasProjects
                     ? "Projects publish as their tracks — anyone can see it"
                     : "Anyone can see it"
@@ -174,7 +174,7 @@ export function FolderDetail() {
                 className="flex items-center gap-1.5 rounded-full border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm text-red-400 transition-colors hover:bg-red-500/20"
               >
                 <Trash2 size={14} />
-                {folder.publishedAs ? "Delete + take down playlist" : "Delete folder"}
+                {folder.publishedAs ? "Delete + unpublish" : "Delete folder"}
               </button>
             ) : (
               <button
@@ -186,7 +186,11 @@ export function FolderDetail() {
               </button>
             )}
           </div>
-          {confirmDelete && <p className="mt-2 text-xs text-soft">The music stays in your library.</p>}
+          {confirmDelete && (
+            <p className="mt-2 text-xs text-soft">
+              The music stays in your library{folder.publishedAs ? "; the published copy comes down" : ""}.
+            </p>
+          )}
           {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
         </div>
       </div>

@@ -55,7 +55,6 @@ interface MusicState {
     favoritedTrackIds: string[];
     favoritedAlbumIds: string[];
     followedArtists: string[];
-    userPlaylists: string[];
   };
 
   player: {
@@ -203,7 +202,6 @@ const initialState: MusicState = {
     favoritedTrackIds: [],
     favoritedAlbumIds: [],
     followedArtists: [],
-    userPlaylists: [],
   },
 
   player: {
@@ -584,7 +582,6 @@ export const musicSlice = createSlice({
     removePlaylist(state, action: PayloadAction<string>) {
       const id = action.payload;
       delete state.playlists[id];
-      state.library.userPlaylists = state.library.userPlaylists.filter((p) => p !== id);
     },
 
     // ── Indexing ────────────────────────────────────────────
@@ -747,7 +744,6 @@ export const musicSlice = createSlice({
         /** Unix seconds the row was last written (seed / rebase stamps). */
         rowUpdatedAt: number;
         folderDocs: MusicFolderDocs;
-        userPlaylists: string[];
         recentlyPlayedIds: string[];
         readFailed: boolean;
       }>,
@@ -767,7 +763,6 @@ export const musicSlice = createSlice({
       sync.readFailed = p.readFailed;
       arraysFromRecord(state);
       foldersFromDocs(state);
-      state.library.userPlaylists = p.userPlaylists;
       state.discovery.recentlyPlayedIds = p.recentlyPlayedIds;
     },
     /** Relay copies, merged against CURRENT state (so an edit made while
@@ -898,18 +893,6 @@ export const musicSlice = createSlice({
       markFoldersDirty(sync, action.payload.docs.map((d) => d.id));
       foldersFromDocs(state);
     },
-    setUserPlaylists(state, action: PayloadAction<string[]>) {
-      state.library.userPlaylists = action.payload;
-    },
-    addUserPlaylist(state, action: PayloadAction<string>) {
-      pushUnique(state.library.userPlaylists, action.payload);
-    },
-    removeUserPlaylist(state, action: PayloadAction<string>) {
-      state.library.userPlaylists = state.library.userPlaylists.filter(
-        (id) => id !== action.payload,
-      );
-    },
-
     // ── Player transport ────────────────────────────────────
     setCurrentTrack(
       state,
@@ -1276,9 +1259,6 @@ export const {
   folderEdited,
   folderDeleted,
   folderDocsAdopted,
-  setUserPlaylists,
-  addUserPlaylist,
-  removeUserPlaylist,
   setCurrentTrack,
   setQueue,
   nextTrack,

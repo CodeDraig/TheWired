@@ -112,7 +112,6 @@ beforeEach(() => {
       record: null,
       rowUpdatedAt: 100,
       folderDocs: {},
-      userPlaylists: [],
       recentlyPlayedIds: [],
       readFailed: false,
     }),

@@ -46,7 +46,6 @@ const musicViewLabels: Record<MusicView, string> = {
   artists: "Artists",
   albums: "Projects",
   songs: "Songs",
-  playlists: "Folders",
   folders: "Folders",
   "folder-detail": "Folder",
   "my-uploads": "My Music",
@@ -57,7 +56,7 @@ const musicViewLabels: Record<MusicView, string> = {
   "listen-requests": "Listen Requests",
   "artist-detail": "Artist",
   "album-detail": "Project",
-  "playlist-detail": "Playlist",
+  "published-folder": "Folder",
   "for-you": "For You",
 };
 
@@ -163,7 +162,7 @@ export function TopBar({
         title =
           artistProfile.display_name || artistProfile.name || "Artist";
       }
-      if (musicView === "playlist-detail" && musicDetailId) {
+      if (musicView === "published-folder" && musicDetailId) {
         const playlist = playlists[musicDetailId];
         if (playlist) title = playlist.title;
       }

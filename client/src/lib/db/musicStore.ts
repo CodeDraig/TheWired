@@ -12,7 +12,8 @@ export interface MusicLibraryState {
   favoritedTrackIds: string[];
   favoritedAlbumIds: string[];
   followedArtists: string[];
-  userPlaylists: string[];
+  /** Written by builds before folders; ignored now. */
+  userPlaylists?: string[];
   recentlyPlayedIds: string[];
   /** Cross-device sync record (docs/MUSIC_LIBRARY_SYNC.md). Written in the
    *  same row as the arrays so the two can never drift apart. Absent in rows
@@ -50,15 +51,13 @@ export async function saveMusicLibrary(library: MusicLibraryState): Promise<void
 export async function persistMusicLibraryFrom(state: RootState): Promise<void> {
   const music = state.music;
   if (!music.librarySync.hydrated || music.librarySync.readFailed) return;
-  const { savedTrackIds, savedAlbumIds, favoritedTrackIds, favoritedAlbumIds, followedArtists, userPlaylists } =
-    music.library;
+  const { savedTrackIds, savedAlbumIds, favoritedTrackIds, favoritedAlbumIds, followedArtists } = music.library;
   await saveMusicLibrary({
     savedTrackIds,
     savedAlbumIds,
     favoritedTrackIds,
     favoritedAlbumIds,
     followedArtists,
-    userPlaylists,
     recentlyPlayedIds: music.discovery.recentlyPlayedIds,
     sync: { v: 1, record: music.librarySync.record },
     updatedAt: Date.now(),

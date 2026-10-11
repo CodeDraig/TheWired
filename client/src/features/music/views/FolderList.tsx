@@ -31,7 +31,7 @@ export function FolderList() {
           <span>New folder</span>
         </button>
       </div>
-      <p className="mb-3 text-xs text-soft">Private · on your devices. Publish one to share it as a playlist.</p>
+      <p className="mb-3 text-xs text-soft">Private · on your devices. Publish one to share it with anyone.</p>
 
       {folders.length === 0 ? (
         <div className="flex flex-1 items-center justify-center pt-20">
