@@ -8,6 +8,7 @@ import { TrackRow } from "../TrackRow";
 import { useAudioPlayer } from "../useAudioPlayer";
 import { usePlaybackBarSpacing } from "@/hooks/usePlaybackBarSpacing";
 import { createFolder } from "../folderActions";
+import { FolderCover } from "../FolderCover";
 
 /** A folder someone published (a kind-30119 on the wire). The music section
  *  has one word for a shelf — folder: yours open as editable folders, anyone
@@ -54,13 +55,7 @@ export function PublishedFolderDetail() {
         <button onClick={() => dispatch(goBack())} className="self-start rounded p-1 text-soft hover:text-heading" aria-label="Back">
           <ArrowLeft size={20} />
         </button>
-        {published.imageUrl ? (
-          <img src={published.imageUrl} alt="" className="h-36 w-36 rounded-lg object-cover shadow-lg" />
-        ) : (
-          <div className="flex h-36 w-36 items-center justify-center rounded-lg bg-card">
-            <Folder size={48} className="text-muted" />
-          </div>
-        )}
+        <FolderCover uri={published.imageUrl ?? null} className="h-36 w-36 shrink-0 rounded-lg shadow-lg" iconSize={48} />
         <div className="flex-1">
           <p className="text-xs uppercase tracking-wider text-soft">Folder · by {by}</p>
           <h1 className="text-2xl font-bold text-heading">{published.title}</h1>

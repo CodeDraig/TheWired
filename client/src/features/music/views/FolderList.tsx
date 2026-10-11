@@ -1,11 +1,12 @@
 import { useState } from "react";
-import { Folder, Pin, Plus, Globe } from "lucide-react";
+import { Pin, Plus, Globe } from "lucide-react";
 import { folderCoverSeeds, folderStatusLine } from "@ishtarservices/core";
 import { useAppDispatch, useAppSelector } from "@/store/hooks";
 import { usePlaybackBarSpacing } from "@/hooks/usePlaybackBarSpacing";
 import { setActiveDetailId } from "@/store/slices/musicSlice";
 import { selectFolderMembers, selectFolders } from "../musicSelectors";
 import { FolderNameModal } from "../FolderNameModal";
+import { FolderCover } from "../FolderCover";
 import { createFolder } from "../folderActions";
 
 /** Your folders: private shelves that follow you between devices; a
@@ -47,13 +48,7 @@ export function FolderList() {
                 onClick={() => open(folder.id)}
                 className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors hover:bg-surface"
               >
-                {cover ? (
-                  <img src={cover} alt="" className="h-10 w-10 rounded object-cover" />
-                ) : (
-                  <div className="flex h-10 w-10 items-center justify-center rounded bg-card">
-                    <Folder size={18} className="text-muted" />
-                  </div>
-                )}
+                <FolderCover uri={cover} className="h-10 w-10 shrink-0 rounded" />
                 <div className="min-w-0 flex-1 text-left">
                   <p className="flex items-center gap-1.5 truncate text-sm text-heading">
                     {folder.pinned && <Pin size={12} className="shrink-0 text-muted" aria-label="Pinned" />}

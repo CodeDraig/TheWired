@@ -6,7 +6,6 @@ import {
   ChevronsUp,
   Disc3,
   EyeOff,
-  Folder,
   Globe,
   Link2,
   Pencil,
@@ -26,6 +25,7 @@ import { useAudioPlayer } from "../useAudioPlayer";
 import { selectFolderMembers } from "../musicSelectors";
 import { buildMusicLink } from "../musicLinks";
 import { FolderNameModal } from "../FolderNameModal";
+import { FolderCover } from "../FolderCover";
 import {
   deleteFolderById,
   flattenToTracks,
@@ -101,13 +101,7 @@ export function FolderDetail() {
         <button onClick={() => dispatch(goBack())} className="self-start rounded p-1 text-soft hover:text-heading" aria-label="Back">
           <ArrowLeft size={20} />
         </button>
-        {cover ? (
-          <img src={cover} alt="" className="h-36 w-36 rounded-lg object-cover shadow-lg" />
-        ) : (
-          <div className="flex h-36 w-36 items-center justify-center rounded-lg bg-card">
-            <Folder size={48} className="text-muted" />
-          </div>
-        )}
+        <FolderCover uri={cover} className="h-36 w-36 shrink-0 rounded-lg shadow-lg" iconSize={48} />
         <div className="min-w-0 flex-1">
           <p className="text-xs uppercase tracking-wider text-soft">
             Folder · {folder.publishedAs ? "published" : "private"}
