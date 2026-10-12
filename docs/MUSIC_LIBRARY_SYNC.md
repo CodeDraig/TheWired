@@ -101,13 +101,25 @@ idempotent: merge any copies in any order and every device converges.
 
 - Publishing writes a kind-30119 playlist at `30119:<pk>:<folderId>` with the
   folder label tag. Track refs only (projects flatten to their tracks).
-- Publish the folder doc **before** the 30119.
+- Publish the folder doc **before** the 30119, and send the 30119 only once
+  the app relay accepted the doc. If either step fails, put the folder's
+  published state back (a new stamp) and tell the user.
+- Deleting a published folder retracts the 30119 **first**. If the
+  retraction fails the folder stays (and the user is told), so a public copy
+  is never left with no folder to take it down from. Unpublish works the
+  same way and keeps the folder.
 - A labelled own 30119 is never adopted and never edits a folder.
 - An own 30119 **without** the label (written by an older client) is adopted
   once: folder id = its `d`, every stamp = its `created_at`, order = its
   `a`-tag order. Skip it if a folder with that id exists (even deleted) or a
   live folder already links its address. Only the newest copy per address
   counts; a retracted newest copy (`["deleted","true"]`) is never adopted.
+  Adoption reads only the client's own `{kinds:[30119], authors:[me]}` REQ,
+  after the app relay's EOSE — never a copy another view loaded.
+- An unlabelled retraction (an older client deleting the playlist) that
+  arrives after adoption deletes the adopted folder at the retraction's
+  `created_at`, if no folder stamp is newer. Same result on every device; a
+  later edit still wins. A labelled retraction (unpublish) keeps the folder.
 - Two live folders linking one address: keep the older (`createdAt`, then
   id), fold the other's items into it, delete the other.
 
@@ -121,14 +133,25 @@ idempotent: merge any copies in any order and every device converges.
    a fetch was out is never lost.
 3. **Absent ≠ empty.** Publish a document only after the app relay sent EOSE
    for the REQ. A copy that fails to decrypt or has a higher `v` is never
-   published over. A failed local read blocks persisting and publishing.
-4. **Stored means stored.** `created_at = max(now, newest seen + 1)`. An OK
-   whose message starts with `duplicate:` means a newer copy won: refetch,
-   merge, retry.
+   published over. A failed decrypt may be a signer that timed out: retry it
+   at 2 s, 10 s and 30 s, then treat the copy as closed for the session
+   (parse and version failures are final at once). A failed local read
+   blocks persisting and publishing.
+4. **Stored means stored.** `created_at = max(now, newest seen + 1)`, where
+   "seen" only counts copies whose signature verified (verify every copy,
+   even one whose id was already decoded). An OK whose message starts with
+   `duplicate:` means a newer copy won: refetch, merge, retry. A signer that
+   can't do NIP-44 turns sync off for the session; any other signing or relay
+   failure keeps the document dirty and retries with backoff. Never publish
+   a document the signer signed as another account.
 5. **Converge.** Merge every relay's copy; publish when the app relay's copy
    differs from the merge.
-6. **Backstop.** Skip (and log) a publish that would remove more than 250 live
-   entries from one document at once.
+6. **Backstop.** Skip (and log once) a shard publish that would drop more than
+   250 live entries with no stamp at all — what a bug that lost part of the
+   record would send. Explicit removals are tombstones and never count, so a
+   bulk unsave still goes out. The block lifts by itself once the record no
+   longer drops them.
 7. Fetch at login (full), then incrementally with `since` (minus 120 s), on
    foreground/focus, and live via a subscription to the account's own shards
-   and `#l` folder docs. Debounce publishes (~2 s); flush on background/exit.
+   and `#l` folder docs. Debounce publishes (~2 s); flush on background/exit,
+   and before an account switch (while the old account's signer is active).
