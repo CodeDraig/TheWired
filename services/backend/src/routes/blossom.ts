@@ -10,41 +10,12 @@ import { config } from "../config.js";
 import { nanoid } from "../lib/id.js";
 import { verifyBlossomAuth } from "../middleware/blossomAuth.js";
 import { getProtectedRefsForBlob, authorizeProtectedRefs } from "../services/blobAccess.js";
-import { verifyMediaToken } from "../lib/mediaToken.js";
+import { verifyMediaTokenDetailed } from "../lib/mediaToken.js";
+import { parseRange } from "../lib/httpRange.js";
 
 const BLOB_DIR = resolve(process.cwd(), config.blobDir);
 const MAX_BLOB_SIZE = config.maxBlobSize;
 const SHA256_REGEX = /^([0-9a-f]{64})(?:\.\w+)?$/;
-
-/** Parse an HTTP `Range: bytes=start-end` header against a known size.
- *  Returns null (absent/unparseable → serve full), "unsatisfiable" (→416),
- *  or an inclusive { start, end }. Single-range only. */
-function parseRange(
-  header: string | undefined,
-  size: number,
-): { start: number; end: number } | "unsatisfiable" | null {
-  if (!header) return null;
-  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
-  if (!m) return null;
-  const [, startStr, endStr] = m;
-  if (startStr === "" && endStr === "") return null;
-  let start: number;
-  let end: number;
-  if (startStr === "") {
-    const n = parseInt(endStr, 10);
-    if (!n) return "unsatisfiable";
-    start = Math.max(0, size - n);
-    end = size - 1;
-  } else {
-    start = parseInt(startStr, 10);
-    end = endStr === "" ? size - 1 : parseInt(endStr, 10);
-  }
-  if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= size) {
-    return "unsatisfiable";
-  }
-  if (end >= size) end = size - 1;
-  return { start, end };
-}
 
 export async function blossomRoutes(server: FastifyInstance) {
   // Blossom PUT /upload sends raw binary bodies with arbitrary content types.
@@ -72,10 +43,19 @@ export async function blossomRoutes(server: FastifyInstance) {
     const protectedRefs = await getProtectedRefsForBlob(sha256);
     if (protectedRefs.length > 0) {
       const tk = (request.query as { tk?: string }).tk;
-      if (!verifyMediaToken(sha256, tk)) {
+      const verdict = verifyMediaTokenDetailed(sha256, tk);
+      if (verdict !== "valid") {
         const authPubkey = (request as any).pubkey as string | undefined;
         const allowed = await authorizeProtectedRefs(protectedRefs, authPubkey);
-        if (!allowed) return reply.status(404).send();
+        if (!allowed) {
+          // A well-formed token whose only fault is its age gets an explicit
+          // 401 so the client re-mints via /music/access instead of treating
+          // the track as gone. Garbage / foreign tokens stay 404 (hide existence).
+          if (verdict === "expired") {
+            return reply.status(401).header("Cache-Control", "no-store").send({ error: "token_expired" });
+          }
+          return reply.status(404).send();
+        }
       }
     }
 

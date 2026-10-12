@@ -12,6 +12,7 @@ import { config } from "../../src/config.js";
 import { nanoid } from "../../src/lib/id.js";
 import { clearBlobAccessCache } from "../../src/services/blobAccess.js";
 import { LUNA, MARCUS, JAYDEE } from "../helpers/testUsers.js";
+import { mintMediaToken } from "../../src/lib/mediaToken.js";
 
 let server: FastifyInstance;
 const BLOB_DIR = resolve(process.cwd(), config.blobDir);
@@ -197,6 +198,28 @@ describe("blob GET token gating", () => {
     expect(res.headers["content-range"]).toBe("bytes 0-9/1024");
     expect(res.headers["content-length"]).toBe("10");
   });
+
+  it("answers an EXPIRED token with 401 token_expired so the client can re-mint", async () => {
+    const { token } = mintMediaToken(SHA_PRIV, -1);
+    const res = await server.inject({ method: "GET", url: `/${SHA_PRIV}?tk=${token}` });
+    expect(res.statusCode).toBe(401);
+    expect(res.json()).toEqual({ error: "token_expired" });
+    expect(res.headers["cache-control"]).toContain("no-store");
+  });
+
+  it("still serves an authorized NIP-98 caller whose token happens to be expired", async () => {
+    const { token } = mintMediaToken(SHA_PRIV, -1);
+    const res = await server.inject({
+      method: "GET", url: `/${SHA_PRIV}?tk=${token}`, headers: { "x-auth-pubkey": LUNA.pubkey },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it("serves a PUBLIC blob regardless of a stale token (no token needed)", async () => {
+    const { token } = mintMediaToken(SHA_PUB, -1);
+    const res = await server.inject({ method: "GET", url: `/${SHA_PUB}?tk=${token}` });
+    expect(res.statusCode).toBe(200);
+  });
 });
 
 describe("HLS token gating", () => {
@@ -214,7 +237,10 @@ describe("HLS token gating", () => {
     const tk = await tokenFor(SLUG_PRIV);
     const res = await server.inject({ method: "GET", url: `/hls/${SHA_PRIV}/master.m3u8?tk=${tk}` });
     expect(res.statusCode).toBe(200);
-    expect(res.headers["cache-control"]).toContain("no-store");
+    // Private, but cacheable by the client for a session — NOT no-store, which
+    // forced AVPlayer to re-download on every back-seek.
+    expect(res.headers["cache-control"]).toBe("private, max-age=3600");
+    expect(res.headers["content-length"]).toBe(String(Buffer.byteLength(res.payload)));
     expect(res.payload).toContain(`128k/index.m3u8?tk=${tk}`);
   });
 
@@ -230,11 +256,91 @@ describe("HLS token gating", () => {
 
   it("serves a segment with a valid token, denies it without", async () => {
     const tk = await tokenFor(SLUG_PRIV);
-    expect(
-      (await server.inject({ method: "GET", url: `/hls/${SHA_PRIV}/128k/seg_00000.m4s?tk=${tk}` })).statusCode,
-    ).toBe(200);
+    const res = await server.inject({ method: "GET", url: `/hls/${SHA_PRIV}/128k/seg_00000.m4s?tk=${tk}` });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["cache-control"]).toBe("private, max-age=3600");
+    expect(res.headers["content-length"]).toBe("8");
+    expect(res.headers.etag).toBe(`"${SHA_PRIV}-seg_00000.m4s"`);
+    expect(res.headers["accept-ranges"]).toBe("bytes");
     expect(
       (await server.inject({ method: "GET", url: `/hls/${SHA_PRIV}/128k/seg_00000.m4s` })).statusCode,
     ).toBe(404);
+  });
+
+  it("honors a single Range on a tokened segment with 206 + Content-Range", async () => {
+    const tk = await tokenFor(SLUG_PRIV);
+    const res = await server.inject({
+      method: "GET", url: `/hls/${SHA_PRIV}/128k/seg_00000.m4s?tk=${tk}`, headers: { range: "bytes=2-5" },
+    });
+    expect(res.statusCode).toBe(206);
+    expect(res.headers["content-range"]).toBe("bytes 2-5/8");
+    expect(res.headers["content-length"]).toBe("4");
+    expect(res.rawPayload.length).toBe(4);
+    expect(res.headers.etag).toBe(`"${SHA_PRIV}-seg_00000.m4s"`);
+  });
+
+  it("serves an open-ended and a suffix Range", async () => {
+    const tk = await tokenFor(SLUG_PRIV);
+    const open = await server.inject({
+      method: "GET", url: `/hls/${SHA_PRIV}/128k/seg_00000.m4s?tk=${tk}`, headers: { range: "bytes=6-" },
+    });
+    expect(open.statusCode).toBe(206);
+    expect(open.headers["content-range"]).toBe("bytes 6-7/8");
+    expect(open.rawPayload.length).toBe(2);
+    const suffix = await server.inject({
+      method: "GET", url: `/hls/${SHA_PRIV}/128k/seg_00000.m4s?tk=${tk}`, headers: { range: "bytes=-3" },
+    });
+    expect(suffix.statusCode).toBe(206);
+    expect(suffix.headers["content-range"]).toBe("bytes 5-7/8");
+  });
+
+  it("answers an unsatisfiable Range with 416", async () => {
+    const tk = await tokenFor(SLUG_PRIV);
+    const res = await server.inject({
+      method: "GET", url: `/hls/${SHA_PRIV}/128k/seg_00000.m4s?tk=${tk}`, headers: { range: "bytes=8-20" },
+    });
+    expect(res.statusCode).toBe(416);
+    expect(res.headers["content-range"]).toBe("bytes */8");
+  });
+
+  it("answers HEAD on a tokened segment with headers only", async () => {
+    const tk = await tokenFor(SLUG_PRIV);
+    const res = await server.inject({ method: "HEAD", url: `/hls/${SHA_PRIV}/128k/init.mp4?tk=${tk}` });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-length"]).toBe("8");
+    expect(res.headers.etag).toBe(`"${SHA_PRIV}-init.mp4"`);
+    expect(res.headers["content-type"]).toBe("video/mp4");
+    expect(res.rawPayload.length).toBe(0);
+    const ranged = await server.inject({
+      method: "HEAD", url: `/hls/${SHA_PRIV}/128k/init.mp4?tk=${tk}`, headers: { range: "bytes=0-3" },
+    });
+    expect(ranged.statusCode).toBe(206);
+    expect(ranged.headers["content-length"]).toBe("4");
+    expect(ranged.rawPayload.length).toBe(0);
+  });
+
+  it("denies HEAD without a token just like GET", async () => {
+    expect(
+      (await server.inject({ method: "HEAD", url: `/hls/${SHA_PRIV}/128k/seg_00000.m4s` })).statusCode,
+    ).toBe(404);
+  });
+
+  it("answers an EXPIRED token with 401 token_expired on every HLS path", async () => {
+    const { token } = mintMediaToken(SHA_PRIV, -1);
+    for (const path of ["master.m3u8", "128k/index.m3u8", "128k/seg_00000.m4s", "128k/init.mp4"]) {
+      const res = await server.inject({ method: "GET", url: `/hls/${SHA_PRIV}/${path}?tk=${token}` });
+      expect(res.statusCode, path).toBe(401);
+      expect(res.json(), path).toEqual({ error: "token_expired" });
+      expect(res.headers["cache-control"], path).toContain("no-store");
+    }
+  });
+
+  it("keeps 404 for a garbage token and for a stale token on an unknown sha", async () => {
+    const garbage = await server.inject({ method: "GET", url: `/hls/${SHA_PRIV}/128k/seg_00000.m4s?tk=1.deadbeef` });
+    expect(garbage.statusCode).toBe(404);
+    // An expired token signed for ANOTHER sha is simply invalid here.
+    const { token } = mintMediaToken(SHA_PUB, -1);
+    const foreign = await server.inject({ method: "GET", url: `/hls/${SHA_PRIV}/128k/seg_00000.m4s?tk=${token}` });
+    expect(foreign.statusCode).toBe(404);
   });
 });

@@ -15,8 +15,10 @@ import { config } from "../config.js";
 
 const DEV_FALLBACK_SECRET = "dev-insecure-media-token-secret-do-not-use-in-prod";
 
-/** Default lifetime: 6h — long enough to outlast a track and all its HLS segments. */
-export const DEFAULT_MEDIA_TOKEN_TTL_SEC = 6 * 60 * 60;
+/** Default lifetime: 24h — a listening session that spans a day (backgrounded
+ *  phone, resumed playlist) keeps working without a re-mint; the HLS routes
+ *  answer an expired token with 401 `token_expired` so clients can re-mint. */
+export const DEFAULT_MEDIA_TOKEN_TTL_SEC = 24 * 60 * 60;
 
 function getSecret(): string {
   if (config.mediaTokenSecret) return config.mediaTokenSecret;
@@ -41,15 +43,29 @@ export function mintMediaToken(
   return { token: `${exp}.${sign(sha256, exp)}`, exp };
 }
 
-/** Verify a token for a given sha. True iff signature matches and it is unexpired. */
-export function verifyMediaToken(sha256: string, token: string | undefined | null): boolean {
-  if (!token) return false;
+/** Outcome of a token check: `valid`, `expired` (well-formed and correctly
+ *  signed, but past its `exp`), or `invalid` (malformed, wrong sha, bad HMAC). */
+export type MediaTokenVerdict = "valid" | "expired" | "invalid";
+
+/** Verify a token for a given sha, distinguishing an EXPIRED token (signature
+ *  intact — the client just needs a fresh one) from a bogus one. */
+export function verifyMediaTokenDetailed(
+  sha256: string,
+  token: string | undefined | null,
+): MediaTokenVerdict {
+  if (!token) return "invalid";
   const dot = token.indexOf(".");
-  if (dot <= 0) return false;
+  if (dot <= 0) return "invalid";
   const exp = Number(token.slice(0, dot));
-  if (!Number.isInteger(exp) || exp <= Math.floor(Date.now() / 1000)) return false;
+  if (!Number.isInteger(exp)) return "invalid";
   const sig = Buffer.from(token.slice(dot + 1), "hex");
   const expected = Buffer.from(sign(sha256, exp), "hex");
-  if (sig.length === 0 || sig.length !== expected.length) return false;
-  return timingSafeEqual(sig, expected);
+  if (sig.length === 0 || sig.length !== expected.length) return "invalid";
+  if (!timingSafeEqual(sig, expected)) return "invalid";
+  return exp > Math.floor(Date.now() / 1000) ? "valid" : "expired";
+}
+
+/** Verify a token for a given sha. True iff signature matches and it is unexpired. */
+export function verifyMediaToken(sha256: string, token: string | undefined | null): boolean {
+  return verifyMediaTokenDetailed(sha256, token) === "valid";
 }

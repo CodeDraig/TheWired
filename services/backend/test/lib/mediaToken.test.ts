@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { mintMediaToken, verifyMediaToken } from "../../src/lib/mediaToken.js";
+import {
+  DEFAULT_MEDIA_TOKEN_TTL_SEC,
+  mintMediaToken,
+  verifyMediaToken,
+  verifyMediaTokenDetailed,
+} from "../../src/lib/mediaToken.js";
 
 const SHA_A = "a".repeat(64);
 const SHA_B = "b".repeat(64);
@@ -48,5 +53,40 @@ describe("mediaToken", () => {
   it("returns an exp in the future for a positive ttl", () => {
     const { exp } = mintMediaToken(SHA_A, 3600);
     expect(exp).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  });
+
+  it("defaults to a 24h lifetime", () => {
+    expect(DEFAULT_MEDIA_TOKEN_TTL_SEC).toBe(24 * 60 * 60);
+    const { exp } = mintMediaToken(SHA_A);
+    expect(exp).toBeGreaterThan(Math.floor(Date.now() / 1000) + 23 * 60 * 60);
+  });
+});
+
+describe("verifyMediaTokenDetailed", () => {
+  it("reports a fresh token as valid", () => {
+    const { token } = mintMediaToken(SHA_A);
+    expect(verifyMediaTokenDetailed(SHA_A, token)).toBe("valid");
+  });
+
+  it("reports a correctly signed but stale token as expired (not invalid)", () => {
+    const { token } = mintMediaToken(SHA_A, -1);
+    expect(verifyMediaTokenDetailed(SHA_A, token)).toBe("expired");
+    expect(verifyMediaToken(SHA_A, token)).toBe(false);
+  });
+
+  it("reports a stale token for the WRONG sha as invalid — expiry never leaks a foreign token", () => {
+    const { token } = mintMediaToken(SHA_A, -1);
+    expect(verifyMediaTokenDetailed(SHA_B, token)).toBe("invalid");
+  });
+
+  it("reports tampered / malformed tokens as invalid", () => {
+    const { token, exp } = mintMediaToken(SHA_A);
+    const [, sig] = token.split(".");
+    expect(verifyMediaTokenDetailed(SHA_A, `${exp - 99999}.${sig}`)).toBe("invalid");
+    expect(verifyMediaTokenDetailed(SHA_A, `${exp}.${"f".repeat(64)}`)).toBe("invalid");
+    expect(verifyMediaTokenDetailed(SHA_A, undefined)).toBe("invalid");
+    expect(verifyMediaTokenDetailed(SHA_A, "")).toBe("invalid");
+    expect(verifyMediaTokenDetailed(SHA_A, "garbage")).toBe("invalid");
+    expect(verifyMediaTokenDetailed(SHA_A, "notanumber.deadbeef")).toBe("invalid");
   });
 });
