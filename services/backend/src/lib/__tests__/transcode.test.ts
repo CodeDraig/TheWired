@@ -20,7 +20,7 @@ vi.mock("node:child_process", async () => {
 });
 
 import { execFile } from "node:child_process";
-import { transcodeAudio } from "../transcode.js";
+import { FFMPEG_TIMEOUT_MS, transcodeAudio } from "../transcode.js";
 
 const execFileMock = execFile as unknown as ReturnType<typeof vi.fn>;
 
@@ -92,6 +92,15 @@ describe("transcodeAudio", () => {
     // VOD playlist type (not event/live)
     expect(args).toContain("-hls_playlist_type");
     expect(args).toContain("vod");
+    // Every segment decodable on its own (matches EXT-X-INDEPENDENT-SEGMENTS
+    // in the master) — once per rendition output
+    expect(args.filter((a) => a === "-hls_flags")).toHaveLength(2);
+    expect(args.filter((a) => a === "independent_segments")).toHaveLength(2);
+    // A hung ffmpeg fails the job instead of blocking the serial queue
+    const opts = call[2] as { timeout?: number; killSignal?: string };
+    expect(opts.timeout).toBe(FFMPEG_TIMEOUT_MS);
+    expect(FFMPEG_TIMEOUT_MS).toBe(10 * 60 * 1000);
+    expect(opts.killSignal).toBe("SIGKILL");
     // Segment filenames land in the right directories
     expect(joined).toContain(`hls/${sha}/128k/seg_%05d.m4s`);
     expect(joined).toContain(`hls/${sha}/256k/seg_%05d.m4s`);
@@ -110,6 +119,19 @@ describe("transcodeAudio", () => {
     expect(master).toContain("256k/index.m3u8");
     // AAC-LC signature — what hls.js / native expect for mp4a audio streams
     expect(master).toContain("mp4a.40.2");
+    // Independent segments declared once, before the first STREAM-INF
+    const lines = master.trim().split("\n");
+    expect(lines.filter((l) => l === "#EXT-X-INDEPENDENT-SEGMENTS")).toHaveLength(1);
+    expect(lines.indexOf("#EXT-X-INDEPENDENT-SEGMENTS")).toBeLessThan(
+      lines.findIndex((l) => l.startsWith("#EXT-X-STREAM-INF")),
+    );
+    // Every rendition advertises both peak and average bandwidth
+    const streamInf = lines.filter((l) => l.startsWith("#EXT-X-STREAM-INF"));
+    expect(streamInf).toHaveLength(2);
+    for (const l of streamInf) {
+      expect(l).toMatch(/BANDWIDTH=\d+/);
+      expect(l).toMatch(/AVERAGE-BANDWIDTH=\d+/);
+    }
   });
 
   it("cleans up the HLS output dir when ffmpeg fails", async () => {
