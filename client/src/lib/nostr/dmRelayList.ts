@@ -1,9 +1,13 @@
 import type { NostrEvent } from "../../types/nostr";
-import { normalizeRelayUrl } from "./nip65";
+import { normalizeRelayUrl } from "./relayUrl";
 import { isSafeRelayUrl } from "../security/ssrfGuard";
 import { relayManager } from "./relayManager";
 import { BOOTSTRAP_RELAYS, APP_RELAY } from "./constants";
 import { store } from "../../store";
+
+/** APP_RELAY in the normalized form parseDMRelayList emits, so a list that
+ *  already names it dedupes against it. */
+const APP_RELAY_URL = normalizeRelayUrl(APP_RELAY) ?? APP_RELAY;
 
 /** Parse a kind:10050 DM relay list event into relay URLs */
 export function parseDMRelayList(event: NostrEvent): string[] {
@@ -21,24 +25,29 @@ export function parseDMRelayList(event: NostrEvent): string[] {
     // lib/security/ssrfGuard.ts. The one exemption is our own configured
     // platform relay (APP_RELAY): a dev build points it at loopback, and a
     // peer listing exactly that URL dials nothing we don't already dial.
-    if (url === (normalizeRelayUrl(APP_RELAY) ?? APP_RELAY) || isSafeRelayUrl(url)) urls.push(url);
+    if (url === APP_RELAY_URL || isSafeRelayUrl(url)) urls.push(url);
   }
   return urls;
 }
 
+/** How long a fetched DM relay list is trusted before it is re-fetched, so a
+ *  peer's updated kind:10050 is picked up without a relaunch. */
+const DM_RELAY_CACHE_TTL_MS = 10 * 60 * 1000;
+
 /** In-memory cache of fetched DM relay lists */
-const dmRelayCache = new Map<string, string[]>();
+const dmRelayCache = new Map<string, { relays: string[]; at: number }>();
 
 /** In-flight fetch promises to deduplicate concurrent requests */
 const pendingFetches = new Map<string, Promise<string[]>>();
 
 /**
  * Fetch a pubkey's kind:10050 DM relay list from bootstrap relays.
- * Results are cached in memory. Concurrent fetches for the same pubkey are deduped.
+ * Results are cached in memory for DM_RELAY_CACHE_TTL_MS. Concurrent fetches
+ * for the same pubkey are deduped.
  */
 export function fetchDMRelayList(pubkey: string): Promise<string[]> {
   const cached = dmRelayCache.get(pubkey);
-  if (cached) return Promise.resolve(cached);
+  if (cached && Date.now() - cached.at < DM_RELAY_CACHE_TTL_MS) return Promise.resolve(cached.relays);
 
   const pending = pendingFetches.get(pubkey);
   if (pending) return pending;
@@ -60,7 +69,7 @@ export function fetchDMRelayList(pubkey: string): Promise<string[]> {
         resolved = true;
         relayManager.closeSubscription(subId);
         const relays = bestEvent ? parseDMRelayList(bestEvent) : [];
-        dmRelayCache.set(pubkey, relays);
+        dmRelayCache.set(pubkey, { relays, at: Date.now() });
         pendingFetches.delete(pubkey);
         resolve(relays);
       },
@@ -72,7 +81,7 @@ export function fetchDMRelayList(pubkey: string): Promise<string[]> {
       resolved = true;
       relayManager.closeSubscription(subId);
       const relays = bestEvent ? parseDMRelayList(bestEvent) : [];
-      dmRelayCache.set(pubkey, relays);
+      dmRelayCache.set(pubkey, { relays, at: Date.now() });
       pendingFetches.delete(pubkey);
       resolve(relays);
     }, 8000);
@@ -85,7 +94,7 @@ export function fetchDMRelayList(pubkey: string): Promise<string[]> {
 /**
  * Get the relay URLs to publish a gift wrap to a recipient.
  * Fetches their kind:10050, connects to those relays, and waits briefly for connections.
- * Returns the relay URLs if found, or undefined to fall back to all write relays.
+ * Returns those relays plus APP_RELAY if found, or undefined to fall back to all write relays.
  */
 export async function getDMRelaysForPublish(
   recipientPubkey: string,
@@ -103,7 +112,10 @@ export async function getDMRelaysForPublish(
     relays.map((url) => relayManager.waitForConnection(url, 3000)),
   );
 
-  return relays;
+  // The platform relay always gets a copy, even when the recipient's list
+  // omits it: our push pipeline only ingests wraps from it, and it is the relay
+  // that AUTH-gates wraps to their recipient (docs/DM_WIRE_CONTRACT.md §7, §8).
+  return [...new Set([...relays, APP_RELAY_URL])];
 }
 
 /** Get the current user's own DM relay list from Redux state. Empty when the
