@@ -14,6 +14,9 @@ func TestDefaultLimits(t *testing.T) {
 	if DefaultLimits.SearchPerMin != 10 {
 		t.Errorf("expected SearchPerMin=10, got %d", DefaultLimits.SearchPerMin)
 	}
+	if DefaultLimits.MediaPerMin != 300 {
+		t.Errorf("expected MediaPerMin=300, got %d", DefaultLimits.MediaPerMin)
+	}
 }
 
 func TestNewLimiter_InvalidURL(t *testing.T) {

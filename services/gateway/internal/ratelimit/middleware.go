@@ -30,11 +30,34 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+// mediaPrefixes are the play-time lookups that get the dedicated "media"
+// bucket: HLS variant discovery and capability-token minting. Both are GETs the
+// player fires once per track as a queue starts.
+var mediaPrefixes = []string{
+	"/api/music/variants/",
+	"/api/music/access/",
+}
+
+func isMediaPath(method, path string) bool {
+	if method != http.MethodGet && method != http.MethodHead {
+		return false
+	}
+	for _, p := range mediaPrefixes {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // classify picks the rate-limit category for a (method, path). Search wins; then
-// the read overrides; then write methods; else read.
+// the media lookups; then the read overrides; then write methods; else read.
 func classify(method, path string) string {
 	if strings.Contains(path, "/search") {
 		return "search"
+	}
+	if isMediaPath(method, path) {
+		return "media"
 	}
 	if readOverrides[method+" "+path] {
 		return "read"

@@ -18,6 +18,10 @@ type Config struct {
 	RateLimitRead   int // per-pubkey reads per minute
 	RateLimitWrite  int // per-pubkey writes per minute
 	RateLimitSearch int // per-pubkey searches per minute
+	// Play-time media lookups (/api/music/variants/*, /api/music/access/*):
+	// a queue of tracks fires these in bursts, so they get their own bucket
+	// instead of competing with the /spaces/* refetches in the read budget.
+	RateLimitMedia int
 	// POST /api/reports, per hour: guests by IP, signed-in callers by pubkey.
 	RateLimitReportAnon int
 	RateLimitReport     int
@@ -59,6 +63,7 @@ func Load() *Config {
 		RateLimitRead:   getEnvInt("RATE_LIMIT_READ_PER_MIN", 100),
 		RateLimitWrite:  getEnvInt("RATE_LIMIT_WRITE_PER_MIN", 30),
 		RateLimitSearch: getEnvInt("RATE_LIMIT_SEARCH_PER_MIN", 10),
+		RateLimitMedia:  getEnvInt("RATE_LIMIT_MEDIA_PER_MIN", 300),
 
 		RateLimitReportAnon: getEnvInt("RATE_LIMIT_REPORT_ANON_PER_HOUR", 5),
 		RateLimitReport:     getEnvInt("RATE_LIMIT_REPORT_PER_HOUR", 30),

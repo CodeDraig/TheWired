@@ -25,6 +25,7 @@ func main() {
 		ReadPerMin:        cfg.RateLimitRead,
 		WritePerMin:       cfg.RateLimitWrite,
 		SearchPerMin:      cfg.RateLimitSearch,
+		MediaPerMin:       cfg.RateLimitMedia,
 		ReportAnonPerHour: cfg.RateLimitReportAnon,
 		ReportPerHour:     cfg.RateLimitReport,
 	}
