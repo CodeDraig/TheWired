@@ -17,6 +17,8 @@ import type { DMMessage as DMMessageType } from "@/store/slices/dmSlice";
 
 const URL_RE = /https?:\/\/\S+/;
 
+const RECEIPT_TITLE = { sent: "Sent", delivered: "Delivered", read: "Read" } as const;
+
 interface DMMessageProps {
   message: DMMessageType;
   partnerPubkey: string;
@@ -104,11 +106,13 @@ export const DMMessage = memo(function DMMessage({
   // Advisory edit window (docs/DM_WIRE_CONTRACT.md §2): 24 h, UI only.
   const canEdit = isMe && !message.isDeleted &&
     (Math.floor(Date.now() / 1000) - message.createdAt) <= DM_EDIT_WINDOW_SECONDS;
-  const readCount = message.readBy?.length ?? 0;
-  const deliveredCount = message.deliveredTo?.length ?? 0;
+  // An own row only exists once a relay took the wrap (sendDM throws first;
+  // history rows are our self-wraps), so "sent" is the floor, never blank.
+  const receipt: "sent" | "delivered" | "read" =
+    (message.readBy?.length ?? 0) > 0 ? "read" : (message.deliveredTo?.length ?? 0) > 0 ? "delivered" : "sent";
   // Receipt / sync glyphs render even inside a grouped run (the time does not),
   // otherwise a read mark on the last message of a run is invisible.
-  const hasStatusGlyph = isMe && (!!message.syncWarning || readCount > 0 || deliveredCount > 0);
+  const hasStatusGlyph = isMe;
 
   // Deleted message placeholder
   if (message.isDeleted) {
@@ -231,13 +235,13 @@ export const DMMessage = memo(function DMMessage({
                 <AlertTriangle size={10} />
               </span>
             )}
-            {isMe && !message.syncWarning && (readCount > 0 || deliveredCount > 0) && (
+            {isMe && !message.syncWarning && (
               <span
-                title={readCount > 0 ? "Read" : "Delivered"}
-                className={`inline-flex items-center ${readCount > 0 ? "text-primary" : ""}`}
-                data-testid={readCount > 0 ? "dm-read" : "dm-delivered"}
+                title={RECEIPT_TITLE[receipt]}
+                className={`inline-flex items-center ${receipt === "read" ? "text-primary" : ""}`}
+                data-testid={`dm-${receipt}`}
               >
-                {readCount > 0 ? <CheckCheck size={11} /> : <Check size={11} />}
+                {receipt === "sent" ? <Check size={11} /> : <CheckCheck size={11} />}
               </span>
             )}
           </div>
