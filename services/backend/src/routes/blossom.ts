@@ -12,10 +12,20 @@ import { verifyBlossomAuth } from "../middleware/blossomAuth.js";
 import { getProtectedRefsForBlob, authorizeProtectedRefs } from "../services/blobAccess.js";
 import { verifyMediaTokenDetailed } from "../lib/mediaToken.js";
 import { parseRange } from "../lib/httpRange.js";
+import {
+  coverVariantPath,
+  ensureCoverVariants,
+  isCoverSourceType,
+  negotiateCoverFormat,
+  pickCoverWidth,
+  removeCoverVariants,
+} from "../lib/coverVariants.js";
 
 const BLOB_DIR = resolve(process.cwd(), config.blobDir);
 const MAX_BLOB_SIZE = config.maxBlobSize;
 const SHA256_REGEX = /^([0-9a-f]{64})(?:\.\w+)?$/;
+/** How long a sized request waits for a lazy render before taking the original. */
+const LAZY_VARIANT_WAIT_MS = 2000;
 
 export async function blossomRoutes(server: FastifyInstance) {
   // Blossom PUT /upload sends raw binary bodies with arbitrary content types.
@@ -67,11 +77,43 @@ export async function blossomRoutes(server: FastifyInstance) {
       return reply.status(404).header("X-Reason", "Blob not found on disk").send();
     }
 
+    const isProtected = protectedRefs.length > 0;
     const contentType = blob.type ?? "application/octet-stream";
     // Protected content must never be cached by a shared cache; public blobs are immutable.
-    const cacheControl = protectedRefs.length > 0
-      ? "private, no-store"
-      : "public, max-age=31536000, immutable";
+    let cacheControl = isProtected ? "private, no-store" : "public, max-age=31536000, immutable";
+
+    // Sized cover art: `?w=` picks a resized variant (same gate as above, so
+    // `?w=256&tk=…` works). A cover that predates variants is rendered on its
+    // first sized request; if that takes longer than the wait, this response is
+    // the original, cacheable only briefly so the sized URL doesn't pin it.
+    const width = isCoverSourceType(blob.type) ? pickCoverWidth((request.query as { w?: unknown }).w) : null;
+    if (width) {
+      const format = negotiateCoverFormat(request.headers.accept);
+      const variantPath = coverVariantPath(BLOB_DIR, sha256, width, format);
+      const variantSize = async () => stat(variantPath).then((s) => s.size, () => null);
+      let size = await variantSize();
+      if (size === null) {
+        const rendered = await Promise.race([
+          ensureCoverVariants(sha256, filePath, BLOB_DIR),
+          new Promise<false>((r) => setTimeout(() => r(false), LAZY_VARIANT_WAIT_MS).unref()),
+        ]);
+        if (rendered) size = await variantSize();
+      }
+      const vary = reply.getHeader("vary");
+      reply.header("Vary", vary ? `${String(vary)}, Accept` : "Accept");
+      if (size !== null) {
+        const etag = `"${sha256}-${width}.${format}"`;
+        reply
+          .header("Cache-Control", isProtected ? "private, max-age=3600" : "public, max-age=31536000, immutable")
+          .header("ETag", etag);
+        if (request.headers["if-none-match"] === etag) return reply.status(304).send();
+        return reply
+          .header("Content-Type", `image/${format}`)
+          .header("Content-Length", size)
+          .send(createReadStream(variantPath));
+      }
+      cacheControl = isProtected ? "private, max-age=60" : "public, max-age=60";
+    }
 
     // Range support (seeking on large audio) — applied AFTER the access check above.
     const range = parseRange(request.headers.range, blob.size);
@@ -137,6 +179,7 @@ export async function blossomRoutes(server: FastifyInstance) {
       const [blob] = await db.select().from(blobs).where(eq(blobs.sha256, sha256)).limit(1);
       if (blob) {
         await unlink(join(BLOB_DIR, sha256)).catch(() => {});
+        await removeCoverVariants(BLOB_DIR, sha256);
         await db.delete(blobs).where(eq(blobs.sha256, sha256));
       }
     }

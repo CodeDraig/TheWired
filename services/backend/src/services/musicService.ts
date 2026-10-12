@@ -17,6 +17,7 @@ import { suspensionService } from "./suspensionService.js";
 import { clearBlobAccessCache } from "./blobAccess.js";
 import { canonicalAudioType } from "../lib/audioMime.js";
 import { probeDurationSec } from "../lib/transcode.js";
+import { ensureCoverVariants, removeCoverVariants } from "../lib/coverVariants.js";
 
 const BLOB_DIR = resolve(process.cwd(), config.blobDir);
 const MAX_AUDIO_SIZE = config.maxBlobSize;
@@ -208,6 +209,10 @@ export const musicService = {
     // Insert into blobs table (covers now tracked in DB)
     await db.insert(blobs).values({ sha256, size, type: file.mimetype, uploaded }).onConflictDoNothing();
     await db.insert(blobOwners).values({ sha256, pubkey }).onConflictDoNothing();
+
+    // Resized copies for `GET /<sha>?w=`; the original stays as uploaded. A
+    // failed render doesn't fail the upload — sized requests fall back to it.
+    await ensureCoverVariants(sha256, storagePath, BLOB_DIR);
 
     return { url, sha256 };
   },
@@ -821,6 +826,7 @@ export const musicService = {
             // Purge derived HLS output too — other owners' events can't reference
             // derivatives once the source blob is gone.
             await rm(join(BLOB_DIR, "hls", sha256), { recursive: true, force: true }).catch(() => {});
+            await removeCoverVariants(BLOB_DIR, sha256);
             await db.delete(blobs).where(eq(blobs.sha256, sha256));
           }
         }
@@ -850,6 +856,7 @@ export const musicService = {
               .where(eq(blobOwners.sha256, sha256)).limit(1);
             if (remaining.length === 0) {
               await unlink(join(BLOB_DIR, sha256)).catch(() => {});
+              await removeCoverVariants(BLOB_DIR, sha256);
               await db.delete(blobs).where(eq(blobs.sha256, sha256));
             }
           }
