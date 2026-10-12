@@ -627,9 +627,6 @@ export const musicSlice = createSlice({
     },
 
     // ── Library ─────────────────────────────────────────────
-    setSavedTrackIds(state, action: PayloadAction<string[]>) {
-      state.library.savedTrackIds = action.payload;
-    },
     addSavedTrack: {
       reducer(state, action: StampedAction) {
         if (!state.library.savedTrackIds.includes(action.payload)) {
@@ -648,9 +645,6 @@ export const musicSlice = createSlice({
       },
       prepare: stamped,
     },
-    setSavedAlbumIds(state, action: PayloadAction<string[]>) {
-      state.library.savedAlbumIds = action.payload;
-    },
     addSavedAlbum: {
       reducer(state, action: StampedAction) {
         if (!state.library.savedAlbumIds.includes(action.payload)) {
@@ -668,12 +662,6 @@ export const musicSlice = createSlice({
         stampIntent(state, "saved", action.payload, false, action.meta.at);
       },
       prepare: stamped,
-    },
-    setFavoritedTrackIds(state, action: PayloadAction<string[]>) {
-      state.library.favoritedTrackIds = action.payload;
-    },
-    setFavoritedAlbumIds(state, action: PayloadAction<string[]>) {
-      state.library.favoritedAlbumIds = action.payload;
     },
     addFavoritedTrack: {
       reducer(state, action: StampedAction) {
@@ -712,9 +700,6 @@ export const musicSlice = createSlice({
       prepare: stamped,
     },
 
-    setFollowedArtists(state, action: PayloadAction<string[]>) {
-      state.library.followedArtists = action.payload;
-    },
     addFollowedArtist: {
       reducer(state, action: StampedAction) {
         pushUnique(state.library.followedArtists, action.payload);
@@ -805,14 +790,17 @@ export const musicSlice = createSlice({
       }>,
     ) {
       const sync = state.librarySync;
-      const rec = plain(sync.record);
-      for (const { shard, wire } of action.payload.shards) {
-        // The published copy may be pruned (higher floor): fold it back in.
-        const merged = mergeLibraryShard(rec, shard, wire);
-        sync.record = merged;
-        if (sameLibraryShard(libraryShardWire(merged, shard), wire)) {
-          sync.dirtyShards = sync.dirtyShards.filter((s) => s !== shard);
+      if (action.payload.shards.length > 0) {
+        let rec = plain(sync.record);
+        for (const { shard, wire } of action.payload.shards) {
+          // The published copy may be pruned (higher floor): fold it back in.
+          rec = mergeLibraryShard(rec, shard, wire);
+          if (sameLibraryShard(libraryShardWire(rec, shard), wire)) {
+            sync.dirtyShards = sync.dirtyShards.filter((s) => s !== shard);
+          }
         }
+        sync.record = rec;
+        arraysFromRecord(state);
       }
       let docs = plain(sync.folderDocs);
       for (const { id, doc: sent } of action.payload.folders) {
@@ -1235,19 +1223,14 @@ export const {
   indexTrackByArtistName,
   indexAlbumByArtist,
   indexAlbumByArtistName,
-  setSavedTrackIds,
   addSavedTrack,
   removeSavedTrack,
-  setSavedAlbumIds,
   addSavedAlbum,
   removeSavedAlbum,
-  setFavoritedTrackIds,
-  setFavoritedAlbumIds,
   addFavoritedTrack,
   removeFavoritedTrack,
   addFavoritedAlbum,
   removeFavoritedAlbum,
-  setFollowedArtists,
   addFollowedArtist,
   removeFollowedArtist,
   musicLibraryHydrated,

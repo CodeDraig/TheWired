@@ -7,6 +7,7 @@ import { describe, it, expect } from "vitest";
 import {
   applyLibraryIntent,
   emptyLibraryRecord,
+  libraryView,
   folderView,
   libraryShardOf,
   libraryShardWire,
@@ -169,5 +170,47 @@ describe("following", () => {
     store.dispatch(addFollowedArtist(A));
     expect(store.getState().music.library.followedArtists).toEqual([B, A]);
     expect(Object.keys(store.getState().music.librarySync.record.artists).sort()).toEqual([A, B]);
+  });
+});
+
+describe("librarySyncPublished (review fixes)", () => {
+  const OTHER = (() => {
+    for (const c of "0123456789bcdef") {
+      const pk = c.repeat(64);
+      if (libraryShardOf(pk) !== libraryShardOf(A)) return pk;
+    }
+    throw new Error("no other shard");
+  })();
+
+  it("folds every published shard in, not just the last one", () => {
+    const store = hydrated();
+    store.dispatch(addSavedTrack(t("1")));
+    store.dispatch(addSavedTrack(t("2", OTHER)));
+    const rec = store.getState().music.librarySync.record;
+    const s1 = libraryShardOf(A);
+    const s2 = libraryShardOf(OTHER);
+    store.dispatch(
+      librarySyncPublished({
+        shards: [
+          { shard: s1, wire: { ...libraryShardWire(rec, s1), floor: 50 } },
+          { shard: s2, wire: { ...libraryShardWire(rec, s2), floor: 60 } },
+        ],
+        folders: [],
+      }),
+    );
+    const floors = store.getState().music.librarySync.record.floors;
+    expect(floors[s1]).toBe(50);
+    expect(floors[s2]).toBe(60);
+  });
+
+  it("keeps the arrays equal to the record's view after folding in a pruned copy", () => {
+    const old = applyLibraryIntent(emptyLibraryRecord(), "saved", t("old"), true, 40).record;
+    const store = hydrated({}, old);
+    const s1 = libraryShardOf(A);
+    // The copy that went out was pruned to floor 50 and doesn't list t("old").
+    const wire = { ...libraryShardWire(emptyLibraryRecord(), s1), floor: 50 };
+    store.dispatch(librarySyncPublished({ shards: [{ shard: s1, wire }], folders: [] }));
+    const music = store.getState().music;
+    expect(music.library.savedTrackIds).toEqual(libraryView(music.librarySync.record).savedTrackIds);
   });
 });

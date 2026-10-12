@@ -34,7 +34,8 @@ export function missingLibraryAddresses(): string[] {
   return missing;
 }
 
-/** One REQ for everything missing, grouped by kind + author. */
+/** One REQ for everything missing, grouped by kind + author. It closes on
+ *  EOSE (or timeout): this runs after every sync merge. */
 export function fetchMissingLibraryItems(addrs: string[] = missingLibraryAddresses()): void {
   const groups = new Map<string, { kind: number; author: string; ds: string[] }>();
   for (const addr of addrs) {
@@ -53,5 +54,5 @@ export function fetchMissingLibraryItems(addrs: string[] = missingLibraryAddress
     authors: [g.author],
     "#d": g.ds,
   }));
-  subscriptionManager.subscribe({ filters, relayUrls: PROFILE_RELAYS });
+  void subscriptionManager.subscribeOnce({ filters, relayUrls: PROFILE_RELAYS });
 }

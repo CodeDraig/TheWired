@@ -359,23 +359,32 @@ export const selectProfileAlbums = (pubkey: string) =>
 
 // ── Folders (synced shelves; docs/MUSIC_LIBRARY_SYNC.md) ──────────────
 
+// Keyed on the pieces they read, not the whole music slice — which changes
+// on every playback position tick.
+const selectFolderList = (state: RootState) => state.music.folders;
+const selectTracks = (state: RootState) => state.music.tracks;
+const selectAlbums = (state: RootState) => state.music.albums;
+
 /** Pinned first, then most recently touched. */
-export const selectFolders = createSelector(selectMusicState, (music) => sortFolders(music.folders));
+export const selectFolders = createSelector(selectFolderList, sortFolders);
 
 /** What the folder summary helpers need from the catalog. */
-export const selectFolderMembers = createSelector(selectMusicState, (music) => {
-  const out: Record<string, FolderMemberLike> = {};
-  for (const folder of music.folders) {
-    for (const id of folder.itemIds) {
-      if (out[id]) continue;
-      const track = music.tracks[id];
-      if (track) {
-        out[id] = { addressableId: id, kind: "track", artwork: getTrackImage(track, music.albums) ?? null };
-        continue;
+export const selectFolderMembers = createSelector(
+  [selectFolderList, selectTracks, selectAlbums],
+  (folders, tracks, albums) => {
+    const out: Record<string, FolderMemberLike> = {};
+    for (const folder of folders) {
+      for (const id of folder.itemIds) {
+        if (out[id]) continue;
+        const track = tracks[id];
+        if (track) {
+          out[id] = { addressableId: id, kind: "track", artwork: getTrackImage(track, albums) ?? null };
+          continue;
+        }
+        const album = albums[id];
+        if (album) out[id] = { addressableId: id, kind: "album", artwork: album.imageUrl ?? null };
       }
-      const album = music.albums[id];
-      if (album) out[id] = { addressableId: id, kind: "album", artwork: album.imageUrl ?? null };
     }
-  }
-  return out;
-});
+    return out;
+  },
+);
