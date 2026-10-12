@@ -561,9 +561,15 @@ export const musicRoutes: FastifyPluginAsync = async (server) => {
                        ELSE 4 END`)
         .limit(1);
 
+      // A ready ladder is stable (immutable output dir), so the lookup can sit
+      // in a shared cache for a minute; anything still in flight is re-polled
+      // soon and gets only a short grace.
+      const ready = row?.status === "ready" && !!row.hlsMasterPath;
+      reply.header("Cache-Control", ready ? "public, max-age=60" : "public, max-age=10");
+
       if (!row) return { data: { status: "unknown" as const } };
 
-      if (row.status === "ready" && row.hlsMasterPath) {
+      if (ready) {
         return {
           data: {
             status: "ready" as const,

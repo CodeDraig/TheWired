@@ -16,6 +16,10 @@ type Limits struct {
 	ReadPerMin   int
 	WritePerMin  int
 	SearchPerMin int
+	// Play-time media lookups (GET /api/music/variants/*, /api/music/access/*).
+	// Starting a queue of tracks fires one of each per track, which used to
+	// drain the read budget alongside the /spaces/* refetch bursts.
+	MediaPerMin int
 	// POST /api/reports has its own hourly bucket on top of the write budget:
 	// a guest report needs no key and every report pages the operator, so
 	// anonymous callers are keyed by IP and kept tight.
@@ -27,6 +31,7 @@ var DefaultLimits = Limits{
 	ReadPerMin:        100,
 	WritePerMin:       30,
 	SearchPerMin:      10,
+	MediaPerMin:       300,
 	ReportAnonPerHour: 5,
 	ReportPerHour:     30,
 }
@@ -101,6 +106,8 @@ func (l *Limiter) Allow(ctx context.Context, pubkey string, category string) (Al
 		limit = l.limits.WritePerMin
 	case "search":
 		limit = l.limits.SearchPerMin
+	case "media":
+		limit = l.limits.MediaPerMin
 	default:
 		limit = l.limits.ReadPerMin
 	}

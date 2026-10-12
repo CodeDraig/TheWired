@@ -124,6 +124,40 @@ describe("GET /hls/:sha/:rendition/:file", () => {
     expect(res.headers["cache-control"]).toContain("max-age=31536000");
   });
 
+  it("sends Content-Length, an ETag and Accept-Ranges on a full segment response", async () => {
+    const res = await server.inject({
+      method: "GET",
+      url: `/hls/${SHA_READY}/128k/seg_00000.m4s`,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-length"]).toBe("8");
+    expect(res.headers["accept-ranges"]).toBe("bytes");
+    expect(res.headers.etag).toBe(`"${SHA_READY}-seg_00000.m4s"`);
+    expect(res.rawPayload.length).toBe(8);
+  });
+
+  it("answers HEAD with the same headers and no body", async () => {
+    const res = await server.inject({
+      method: "HEAD",
+      url: `/hls/${SHA_READY}/128k/seg_00000.m4s`,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-length"]).toBe("8");
+    expect(res.headers.etag).toBe(`"${SHA_READY}-seg_00000.m4s"`);
+    expect(res.headers["cache-control"]).toContain("immutable");
+    expect(res.rawPayload.length).toBe(0);
+  });
+
+  it("returns 304 for a matching If-None-Match", async () => {
+    const res = await server.inject({
+      method: "GET",
+      url: `/hls/${SHA_READY}/128k/seg_00000.m4s`,
+      headers: { "if-none-match": `"${SHA_READY}-seg_00000.m4s"` },
+    });
+    expect(res.statusCode).toBe(304);
+    expect(res.rawPayload.length).toBe(0);
+  });
+
   it("serves index.m3u8 with short cache", async () => {
     const res = await server.inject({
       method: "GET",
@@ -155,5 +189,28 @@ describe("GET /hls/:sha/:rendition/:file", () => {
       url: `/hls/${SHA_READY}/128k/playlist.txt`,
     });
     expect(res.statusCode).toBe(404);
+  });
+});
+
+describe("GET /music/variants/:sha cache headers", () => {
+  it("lets a ready lookup sit in a shared cache for a minute", async () => {
+    const res = await server.inject({ method: "GET", url: `/music/variants/${SHA_READY}` });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data.status).toBe("ready");
+    expect(res.headers["cache-control"]).toBe("public, max-age=60");
+  });
+
+  it("gives an in-flight lookup only a short grace", async () => {
+    const res = await server.inject({ method: "GET", url: `/music/variants/${SHA_PENDING}` });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data.status).toBe("pending");
+    expect(res.headers["cache-control"]).toBe("public, max-age=10");
+  });
+
+  it("treats an unknown sha like an in-flight one", async () => {
+    const res = await server.inject({ method: "GET", url: `/music/variants/${"d".repeat(64)}` });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data.status).toBe("unknown");
+    expect(res.headers["cache-control"]).toBe("public, max-age=10");
   });
 });

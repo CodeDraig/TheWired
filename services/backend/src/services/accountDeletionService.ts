@@ -9,6 +9,7 @@ import { getRedis } from "../lib/redis.js";
 import { getMeilisearchClient } from "../lib/meilisearch.js";
 import { escapeMsFilter } from "../lib/meiliFilter.js";
 import { verifyEvent } from "../lib/nostr/eventVerifier.js";
+import { removeCoverVariants } from "../lib/coverVariants.js";
 import { musicService } from "./musicService.js";
 import { cloudflareTunnelService } from "./cloudflareTunnelService.js";
 
@@ -222,7 +223,7 @@ const STEPS: Array<[string, StepFn]> = [
       return n;
     },
   ],
-  // 7. Blobs — ownership, then any blob nobody else owns (file, HLS, row).
+  // 7. Blobs — ownership, then any blob nobody else owns (file, HLS, cover variants, row).
   [
     "blobs",
     async (pk) => {
@@ -235,6 +236,7 @@ const STEPS: Array<[string, StepFn]> = [
         if (other) continue;
         await unlink(join(BLOB_DIR, sha256)).catch(() => {});
         await rm(join(BLOB_DIR, "hls", sha256), { recursive: true, force: true }).catch(() => {});
+        await removeCoverVariants(BLOB_DIR, sha256);
         await db.delete(blobs).where(eq(blobs.sha256, sha256));
       }
       return owned.length;

@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync, FastifyRequest } from "fastify";
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import { createReadStream } from "node:fs";
 import { stat, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -7,12 +7,18 @@ import { db } from "../db/connection.js";
 import { musicUploads } from "../db/schema/music.js";
 import { config } from "../config.js";
 import { getProtectedRefsForBlob } from "../services/blobAccess.js";
-import { verifyMediaToken } from "../lib/mediaToken.js";
+import { verifyMediaTokenDetailed } from "../lib/mediaToken.js";
+import { parseRange } from "../lib/httpRange.js";
 
 const BLOB_DIR = resolve(process.cwd(), config.blobDir);
 const SHA_RE = /^[0-9a-f]{64}$/;
 const RENDITION_RE = /^(128k|256k)$/;
 const SEG_FILE_RE = /^(seg_\d{5}\.m4s|init\.mp4)$/;
+
+/** Tokened (private) ladders: cacheable by the client only, for about as long
+ *  as a listening session. Was `no-store`, which made AVPlayer re-download every
+ *  segment on a back-seek. Public ladders keep their immutable / short caching. */
+const TOKENED_CACHE_CONTROL = "private, max-age=3600";
 
 function contentTypeFor(file: string): string {
   if (file.endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
@@ -21,21 +27,35 @@ function contentTypeFor(file: string): string {
   return "application/octet-stream";
 }
 
+type HlsAccess =
+  | { ok: true; tokened: boolean; token?: string }
+  | { ok: false; reason: "denied" | "token_expired" };
+
 /**
  * Access decision for an HLS request. The HLS routes get NO `X-Auth-Pubkey` from the
  * gateway (media elements can't send NIP-98), so a protected ladder can only be served
  * with a valid capability token (`?tk=`). A present+valid token short-circuits the DB
  * lookup entirely (hot segment path). Public ladders are served without a token.
+ * A protected ladder asked for with an EXPIRED (but correctly signed) token is
+ * reported as such so the route can answer 401 and the client can re-mint.
  */
-async function checkHlsAccess(
-  sha: string,
-  request: FastifyRequest,
-): Promise<{ ok: boolean; tokened: boolean; token?: string }> {
+async function checkHlsAccess(sha: string, request: FastifyRequest): Promise<HlsAccess> {
   const tk = (request.query as { tk?: string }).tk;
-  if (tk && verifyMediaToken(sha, tk)) return { ok: true, tokened: true, token: tk };
+  const verdict = tk ? verifyMediaTokenDetailed(sha, tk) : "invalid";
+  if (verdict === "valid") return { ok: true, tokened: true, token: tk };
   const protectedRefs = await getProtectedRefsForBlob(sha);
-  if (protectedRefs.length > 0) return { ok: false, tokened: false }; // protected, no valid token → deny
+  if (protectedRefs.length > 0) {
+    return { ok: false, reason: verdict === "expired" ? "token_expired" : "denied" };
+  }
   return { ok: true, tokened: false }; // public
+}
+
+/** 401 `token_expired` for a stale token (re-mint hint); 404 otherwise, to hide existence. */
+function denyHls(access: { reason: "denied" | "token_expired" }, reply: FastifyReply) {
+  if (access.reason === "token_expired") {
+    return reply.status(401).header("Cache-Control", "no-store").send({ error: "token_expired" });
+  }
+  return reply.callNotFound();
 }
 
 /** Append `?tk=<token>` to every child/segment URI in a playlist so relative-URL
@@ -60,26 +80,36 @@ function tokenizePlaylist(body: string, token: string): string {
 async function servePlaylist(
   path: string,
   access: { tokened: boolean; token?: string },
-  reply: import("fastify").FastifyReply,
+  request: FastifyRequest,
+  reply: FastifyReply,
 ) {
+  let st: Awaited<ReturnType<typeof stat>>;
   try {
-    await stat(path);
+    st = await stat(path);
   } catch {
     return reply.callNotFound();
   }
+  // Playlists are rewritten per token, so the validator is the on-disk file's
+  // identity (size + mtime) — one URL always carries one token.
+  const etag = `"${st.size}-${Math.floor(st.mtimeMs)}"`;
+  reply
+    .header("Content-Type", contentTypeFor(path))
+    .header("Cache-Control", access.tokened ? TOKENED_CACHE_CONTROL : "public, max-age=60")
+    .header("ETag", etag);
+  if (request.headers["if-none-match"] === etag) return reply.status(304).send();
   let body = await readFile(path, "utf8");
   if (access.tokened && access.token) body = tokenizePlaylist(body, access.token);
-  return reply
-    .header("Content-Type", contentTypeFor(path))
-    .header("Cache-Control", access.tokened ? "private, no-store" : "public, max-age=60")
-    .send(body);
+  reply.header("Content-Length", Buffer.byteLength(body));
+  if (request.method === "HEAD") return reply.send();
+  return reply.send(body);
 }
 
 export const hlsRoutes: FastifyPluginAsync = async (server) => {
-  // GET /hls/:sha/master.m3u8 — master playlist, status- and access-gated
-  server.get<{ Params: { sha: string } }>(
-    "/:sha/master.m3u8",
-    async (request, reply) => {
+  // GET|HEAD /hls/:sha/master.m3u8 — master playlist, status- and access-gated
+  server.route<{ Params: { sha: string } }>({
+    method: ["GET", "HEAD"],
+    url: "/:sha/master.m3u8",
+    handler: async (request, reply) => {
       const { sha } = request.params;
       if (!SHA_RE.test(sha)) return reply.callNotFound();
 
@@ -91,30 +121,40 @@ export const hlsRoutes: FastifyPluginAsync = async (server) => {
       if (!row || row.status !== "ready") return reply.callNotFound();
 
       const access = await checkHlsAccess(sha, request);
-      if (!access.ok) return reply.callNotFound();
+      if (!access.ok) return denyHls(access, reply);
 
-      return servePlaylist(join(BLOB_DIR, "hls", sha, "master.m3u8"), access, reply);
+      return servePlaylist(join(BLOB_DIR, "hls", sha, "master.m3u8"), access, request, reply);
     },
-  );
+  });
 
-  // GET /hls/:sha/:rendition/index.m3u8 — media playlist per rendition
-  server.get<{ Params: { sha: string; rendition: string } }>(
-    "/:sha/:rendition/index.m3u8",
-    async (request, reply) => {
+  // GET|HEAD /hls/:sha/:rendition/index.m3u8 — media playlist per rendition
+  server.route<{ Params: { sha: string; rendition: string } }>({
+    method: ["GET", "HEAD"],
+    url: "/:sha/:rendition/index.m3u8",
+    handler: async (request, reply) => {
       const { sha, rendition } = request.params;
       if (!SHA_RE.test(sha) || !RENDITION_RE.test(rendition)) return reply.callNotFound();
 
       const access = await checkHlsAccess(sha, request);
-      if (!access.ok) return reply.callNotFound();
+      if (!access.ok) return denyHls(access, reply);
 
-      return servePlaylist(join(BLOB_DIR, "hls", sha, rendition, "index.m3u8"), access, reply);
+      return servePlaylist(
+        join(BLOB_DIR, "hls", sha, rendition, "index.m3u8"),
+        access,
+        request,
+        reply,
+      );
     },
-  );
+  });
 
-  // GET /hls/:sha/:rendition/:file — segments (*.m4s) and init.mp4
-  server.get<{ Params: { sha: string; rendition: string; file: string } }>(
-    "/:sha/:rendition/:file",
-    async (request, reply) => {
+  // GET|HEAD /hls/:sha/:rendition/:file — segments (*.m4s) and init.mp4.
+  // Single-range `Range` → 206 (+ Content-Range / Content-Length), 416 when
+  // unsatisfiable, ETag "<sha>-<file>" (segments are content-addressed by their
+  // ladder, so the validator never needs the file's bytes), HEAD for probes.
+  server.route<{ Params: { sha: string; rendition: string; file: string } }>({
+    method: ["GET", "HEAD"],
+    url: "/:sha/:rendition/:file",
+    handler: async (request, reply) => {
       const { sha, rendition, file } = request.params;
       if (
         !SHA_RE.test(sha) ||
@@ -125,23 +165,45 @@ export const hlsRoutes: FastifyPluginAsync = async (server) => {
       }
 
       const access = await checkHlsAccess(sha, request);
-      if (!access.ok) return reply.callNotFound();
+      if (!access.ok) return denyHls(access, reply);
 
       const path = join(BLOB_DIR, "hls", sha, rendition, file);
+      let size: number;
       try {
-        await stat(path);
+        size = (await stat(path)).size;
       } catch {
         return reply.callNotFound();
       }
 
-      return reply
+      const etag = `"${sha}-${file}"`;
+      reply
         .header("Content-Type", contentTypeFor(file))
         .header(
           "Cache-Control",
-          access.tokened ? "private, no-store" : "public, max-age=31536000, immutable",
+          access.tokened ? TOKENED_CACHE_CONTROL : "public, max-age=31536000, immutable",
         )
         .header("Accept-Ranges", "bytes")
-        .send(createReadStream(path));
+        .header("ETag", etag);
+
+      if (request.headers["if-none-match"] === etag) return reply.status(304).send();
+
+      const range = parseRange(request.headers.range, size);
+      if (range === "unsatisfiable") {
+        return reply.status(416).header("Content-Range", `bytes */${size}`).send();
+      }
+      if (range) {
+        const { start, end } = range;
+        reply
+          .status(206)
+          .header("Content-Length", end - start + 1)
+          .header("Content-Range", `bytes ${start}-${end}/${size}`);
+        if (request.method === "HEAD") return reply.send();
+        return reply.send(createReadStream(path, { start, end }));
+      }
+
+      reply.header("Content-Length", size);
+      if (request.method === "HEAD") return reply.send();
+      return reply.send(createReadStream(path));
     },
-  );
+  });
 };

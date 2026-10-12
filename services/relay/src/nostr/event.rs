@@ -31,6 +31,13 @@ impl Event {
             .collect()
     }
 
+    /// NIP-01 ephemeral kinds (20000–29999): relayed to live subscribers but
+    /// never persisted — a REQ cannot return them. The backend's kind-20900
+    /// space-config nudge lives here on purpose.
+    pub fn is_ephemeral(&self) -> bool {
+        is_ephemeral_kind(self.kind)
+    }
+
     /// Compute the canonical serialization for hashing (NIP-01)
     pub fn serialize_for_id(&self) -> String {
         let tags_value = serde_json::to_value(&self.tags).unwrap_or_default();
@@ -44,6 +51,11 @@ impl Event {
         ]))
         .unwrap_or_default()
     }
+}
+
+/// NIP-01 ephemeral kind range: `20000 <= kind < 30000`.
+pub fn is_ephemeral_kind(kind: i32) -> bool {
+    (20000..30000).contains(&kind)
 }
 
 #[cfg(test)]
@@ -158,5 +170,16 @@ mod tests {
         let serialized = event.serialize_for_id();
         let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
         assert_eq!(parsed[5], "hello 🌍 世界");
+    }
+
+    #[test]
+    fn ephemeral_kind_range_is_20000_to_29999() {
+        assert!(is_ephemeral_kind(20000));
+        assert!(is_ephemeral_kind(20900)); // backend space-config nudge
+        assert!(is_ephemeral_kind(29999));
+        assert!(!is_ephemeral_kind(19999)); // replaceable range ends here
+        assert!(!is_ephemeral_kind(30000)); // addressable range starts here
+        assert!(!is_ephemeral_kind(1));
+        assert!(!is_ephemeral_kind(1059));
     }
 }

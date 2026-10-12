@@ -46,14 +46,23 @@ export async function probeDurationSec(inputPath: string): Promise<number | null
 
 // Minimal, deterministic audio-only HLS master playlist. Two variants at
 // 128 and 256 kbps. Hand-written because ffmpeg's -master_pl_name for
-// audio-only streams is historically finicky; this file is 6 lines of text.
+// audio-only streams is historically finicky; this file is a few lines of text.
+// INDEPENDENT-SEGMENTS (every segment starts decodable — ffmpeg is told the same
+// via `-hls_flags independent_segments`) and AVERAGE-BANDWIDTH let AVPlayer /
+// hls.js pick a rendition and seek without probing segments first.
 const MASTER_PLAYLIST =
   "#EXTM3U\n" +
   "#EXT-X-VERSION:7\n" +
-  "#EXT-X-STREAM-INF:BANDWIDTH=160000,CODECS=\"mp4a.40.2\"\n" +
+  "#EXT-X-INDEPENDENT-SEGMENTS\n" +
+  "#EXT-X-STREAM-INF:BANDWIDTH=160000,AVERAGE-BANDWIDTH=140000,CODECS=\"mp4a.40.2\"\n" +
   "128k/index.m3u8\n" +
-  "#EXT-X-STREAM-INF:BANDWIDTH=300000,CODECS=\"mp4a.40.2\"\n" +
+  "#EXT-X-STREAM-INF:BANDWIDTH=300000,AVERAGE-BANDWIDTH=270000,CODECS=\"mp4a.40.2\"\n" +
   "256k/index.m3u8\n";
+
+/** A single ffmpeg job may not block the serial transcode queue forever: a hung
+ *  decoder (truncated input, stuck filter graph) fails after this and the job's
+ *  normal failure path (purge output dir, mark `failed`) runs. */
+export const FFMPEG_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * Produce a two-rendition HLS ladder with −14 LUFS loudness normalization.
@@ -80,6 +89,7 @@ export async function transcodeAudio(input: TranscodeInput): Promise<TranscodeRe
     "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
     "-hls_time", "6",
     "-hls_playlist_type", "vod",
+    "-hls_flags", "independent_segments",
     "-hls_segment_type", "fmp4",
     "-hls_segment_filename", join(dir128, "seg_%05d.m4s"),
     "-hls_fmp4_init_filename", "init.mp4",
@@ -89,6 +99,7 @@ export async function transcodeAudio(input: TranscodeInput): Promise<TranscodeRe
     "-c:a", "aac", "-b:a", "256k", "-ar", "48000",
     "-hls_time", "6",
     "-hls_playlist_type", "vod",
+    "-hls_flags", "independent_segments",
     "-hls_segment_type", "fmp4",
     "-hls_segment_filename", join(dir256, "seg_%05d.m4s"),
     "-hls_fmp4_init_filename", "init.mp4",
@@ -96,7 +107,11 @@ export async function transcodeAudio(input: TranscodeInput): Promise<TranscodeRe
   ];
 
   try {
-    await execFileAsync("ffmpeg", args, { maxBuffer: 16 * 1024 * 1024 });
+    await execFileAsync("ffmpeg", args, {
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: FFMPEG_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
   } catch (err) {
     await rm(outDir, { recursive: true, force: true }).catch(() => {});
     throw err;

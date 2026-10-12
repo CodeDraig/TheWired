@@ -412,6 +412,22 @@ async fn handle_event(
         }
     }
 
+    // NIP-01 ephemeral kinds (20000–29999) are relayed to live subscribers
+    // but never persisted: they are refetch hints (kind 20900 space-config
+    // nudges, typing/presence style signals), not history, and would only
+    // bloat `relay.events` for REQs that must never return them anyway.
+    if event.is_ephemeral() {
+        tracing::debug!(
+            event_id = log_prefix(&event.id),
+            kind = event.kind,
+            pubkey = log_prefix(&event.pubkey),
+            "Ephemeral event broadcast (not stored)"
+        );
+        let id = event.id.clone();
+        let _ = broadcast_tx.send(event);
+        return vec![format!(r#"["OK","{}",true,""]"#, id)];
+    }
+
     // Store regular events
     match state.pool.store_event_flagged(&event, self_published).await {
         Ok(true) => {
