@@ -49,7 +49,7 @@ export function MusicLinkResolver({ type }: MusicLinkResolverProps) {
     }
     if (type === "playlist" && existingPlaylist) {
       dispatch(setSidebarMode("music"));
-      dispatch(setActiveDetailId({ view: "playlist-detail", id: addressableId }));
+      dispatch(setActiveDetailId({ view: "published-folder", id: addressableId }));
       navigate("/", { replace: true });
       return;
     }
@@ -87,7 +87,7 @@ export function MusicLinkResolver({ type }: MusicLinkResolverProps) {
           dispatch(setSidebarMode("music"));
           dispatch(
             setActiveDetailId({
-              view: type === "album" ? "album-detail" : "playlist-detail",
+              view: type === "album" ? "album-detail" : "published-folder",
               id: addressableId!,
             }),
           );

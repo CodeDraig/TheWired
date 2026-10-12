@@ -30,7 +30,7 @@ import { HistoryTab } from "./panel/HistoryTab";
 
 import { ReplaceAudioModal } from "./ReplaceAudioModal";
 import { MoveTrackModal } from "./MoveTrackModal";
-import { AddToPlaylistModal } from "./AddToPlaylistModal";
+import { AddToFolderModal } from "./AddToFolderModal";
 import { RecipientPickerModal } from "@/components/sharing/RecipientPickerModal";
 import { SpacePickerModal } from "@/components/sharing/SpacePickerModal";
 import { MusicPostModal } from "./MusicPostModal";
@@ -130,7 +130,7 @@ export function TrackActionPanel({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [replaceAudioOpen, setReplaceAudioOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
-  const [playlistOpen, setPlaylistOpen] = useState(false);
+  const [folderOpen, setFolderOpen] = useState(false);
   const [dmPickerOpen, setDmPickerOpen] = useState(false);
   const [spacePickerOpen, setSpacePickerOpen] = useState(false);
   const [sharingToggling, setSharingToggling] = useState(false);
@@ -148,7 +148,7 @@ export function TrackActionPanel({
   const { addItem: addShowcaseItem, removeItem: removeShowcaseItem, isInShowcase } = useProfileShowcase(pubkey ?? null);
   const trackInShowcase = isInShowcase(track.addressableId);
 
-  const anyModalOpen = replaceAudioOpen || moveOpen || playlistOpen || dmPickerOpen || spacePickerOpen || postModalOpen;
+  const anyModalOpen = replaceAudioOpen || moveOpen || folderOpen || dmPickerOpen || spacePickerOpen || postModalOpen;
 
   const albums = useAppSelector((s) => s.music.albums);
   const originalEvent = useAppSelector((s) => s.events.entities[track.eventId]);
@@ -465,7 +465,7 @@ export function TrackActionPanel({
                   onAddToQueue={handleAddToQueue}
                   onSaveToggle={handleSaveToggle}
                   onFavoriteToggle={handleFavoriteToggle}
-                  onAddToPlaylist={() => setPlaylistOpen(true)}
+                  onAddToFolder={() => setFolderOpen(true)}
                   onCopyLink={handleCopyLink}
                   onSendToDM={() => setDmPickerOpen(true)}
                   onShareToSpace={() => setSpacePickerOpen(true)}
@@ -541,12 +541,12 @@ export function TrackActionPanel({
           onBack={() => setMoveOpen(false)}
         />
       )}
-      {playlistOpen && (
-        <AddToPlaylistModal
-          open={playlistOpen}
-          onClose={() => setPlaylistOpen(false)}
-          onBack={() => setPlaylistOpen(false)}
-          trackAddrId={track.addressableId}
+      {folderOpen && (
+        <AddToFolderModal
+          open={folderOpen}
+          onClose={() => setFolderOpen(false)}
+          onBack={() => setFolderOpen(false)}
+          itemAddrId={track.addressableId}
         />
       )}
       {dmPickerOpen && (

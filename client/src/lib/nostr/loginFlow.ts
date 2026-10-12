@@ -44,7 +44,15 @@ import { loadAllMembers } from "../db/spaceMembersStore";
 import { setMembers } from "../../store/slices/spaceConfigSlice";
 import { updateSpaceMembers } from "../../store/slices/spacesSlice";
 import { syncSpaceMembers } from "../../store/thunks/spaceMembers";
-import { loadMusicLibrary } from "../db/musicStore";
+import { loadMusicLibraryWithTime, loadMusicFolders, type MusicFoldersRow, type MusicLibraryState } from "../db/musicStore";
+import { parseFolderDocs, parseLibraryRecord } from "@ishtarservices/core";
+import { fetchMissingLibraryItems, resetLibraryFill } from "../../features/music/libraryFill";
+import {
+  startMusicLibrarySync,
+  drainMusicLibrarySync,
+  flushMusicLibrarySync,
+  cancelMusicLibrarySync,
+} from "../../features/music/librarySync";
 import { syncSavedVersions, watchSavedItemsForUpdates } from "../../features/music/savedVersionSync";
 import { getEventsByKind } from "../db/eventStore";
 import {
@@ -69,13 +77,7 @@ import {
   indexTrackByArtistName,
   indexAlbumByArtist,
   indexAlbumByArtistName,
-  setSavedTrackIds,
-  setSavedAlbumIds,
-  setFavoritedTrackIds,
-  setFavoritedAlbumIds,
-  setFollowedArtists,
-  setUserPlaylists,
-  setRecentlyPlayedIds,
+  musicLibraryHydrated,
   recordMovedRelease,
 } from "../../store/slices/musicSlice";
 import { parseTrackEvent, parsePrivateTrackEvent } from "../../features/music/trackParser";
@@ -139,6 +141,7 @@ let cleanupDMReadState: (() => void) | null = null;
 let cleanupFollowerPersistence: (() => void) | null = null;
 let cleanupFriendRequestPersistence: (() => void) | null = null;
 let cleanupNotificationPersistence: (() => void) | null = null;
+let cleanupMusicLibrarySync: (() => void) | null = null;
 let cleanupActiveSpacePersistence: (() => void) | null = null;
 let cleanupGiftWrapReconciliation: (() => void) | null = null;
 let cleanupProjectKeyListener: (() => void) | null = null;
@@ -1095,21 +1098,33 @@ export async function performLogin(
     }
   }
 
-  // Step 7d: Load music library state from IndexedDB
-  const musicLib = await loadMusicLibrary();
-  if (musicLib) {
-    store.dispatch(setSavedTrackIds(musicLib.savedTrackIds));
-    store.dispatch(setSavedAlbumIds(musicLib.savedAlbumIds));
-    if (musicLib.favoritedTrackIds) {
-      store.dispatch(setFavoritedTrackIds(musicLib.favoritedTrackIds));
-    }
-    if (musicLib.favoritedAlbumIds) {
-      store.dispatch(setFavoritedAlbumIds(musicLib.favoritedAlbumIds));
-    }
-    store.dispatch(setFollowedArtists(musicLib.followedArtists));
-    store.dispatch(setUserPlaylists(musicLib.userPlaylists));
-    store.dispatch(setRecentlyPlayedIds(musicLib.recentlyPlayedIds));
+  // Step 7d: Load the music library — arrays, its sync record and the
+  // folders — in ONE action, so the cross-device sync never sees a half-read
+  // library (docs/MUSIC_LIBRARY_SYNC.md §5). A failed read blocks persisting
+  // and publishing rather than syncing an empty library over the real one.
+  let musicLib: MusicLibraryState | undefined;
+  let musicLibWrittenAt = 0;
+  let musicFoldersRow: MusicFoldersRow | undefined;
+  let musicReadFailed = false;
+  try {
+    const [libRow, foldersRow] = await Promise.all([loadMusicLibraryWithTime(), loadMusicFolders()]);
+    musicLib = libRow?.row;
+    musicLibWrittenAt = libRow?.writtenAt ?? 0;
+    musicFoldersRow = foldersRow;
+  } catch (err) {
+    console.error("[music] library read failed — sync paused for this session:", err);
+    musicReadFailed = true;
   }
+  store.dispatch(
+    musicLibraryHydrated({
+      arrays: musicLib ?? {},
+      record: parseLibraryRecord(musicLib?.sync?.record),
+      rowUpdatedAt: Math.floor((musicLibWrittenAt || Date.now()) / 1000),
+      folderDocs: parseFolderDocs(musicFoldersRow?.docs),
+      recentlyPlayedIds: musicLib?.recentlyPlayedIds ?? [],
+      readFailed: musicReadFailed,
+    }),
+  );
 
   // Step 7d-b: Load notification state BEFORE relay subscriptions so that
   // re-delivered events (which trigger evaluateCollaboratorNotification)
@@ -1163,37 +1178,17 @@ export async function performLogin(
   cleanupProjectKeyListener = onProjectKeyAdded((projectPubkey) => subscribeProjectAuthors([projectPubkey]));
   hydrateHeldProjectKeys(pubkey).then(subscribeProjectAuthors).catch(() => {});
 
-  // Step 7e-b: Re-fetch any saved items that are missing from Redux.
-  // This handles albums/tracks from API responses that weren't persisted to IndexedDB,
-  // or events that were evicted by TTL. Events arrive via eventPipeline → IndexedDB + Redux.
-  if (musicLib) {
-    const currentMusic = store.getState().music;
-    const missingIds = [
-      ...musicLib.savedAlbumIds.filter((id) => !currentMusic.albums[id]),
-      ...musicLib.savedTrackIds.filter((id) => !currentMusic.tracks[id]),
-    ];
-    if (missingIds.length > 0) {
-      // Group by kind:author to minimize filter count
-      const groups = new Map<string, string[]>();
-      for (const addrId of missingIds) {
-        const parts = addrId.split(":");
-        const key = `${parts[0]}:${parts[1]}`;
-        const dTag = parts.slice(2).join(":");
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key)!.push(dTag);
-      }
-      const filters: import("../../types/nostr").NostrFilter[] = [];
-      for (const [key, dTags] of groups) {
-        const [kindStr, authorPk] = key.split(":");
-        filters.push({ kinds: [parseInt(kindStr, 10)], authors: [authorPk], "#d": dTags });
-      }
-      subscriptionManager.subscribe({ filters, relayUrls: PROFILE_RELAYS });
-    }
+  // Step 7e-b: Re-fetch any saved items (and folder members) missing from
+  // Redux — evicted by TTL, or saved on another device. Events arrive via
+  // eventPipeline → IndexedDB + Redux.
+  fetchMissingLibraryItems();
 
-    // Step 7e-c: Saved items we DO hold — ask relays for anything newer than
-    // our copy, and pull the backend's saved-version rows (which also fetch
-    // versions the ingester saw first and raise "updated" notifications).
-    watchSavedItemsForUpdates([...musicLib.savedAlbumIds, ...musicLib.savedTrackIds]);
+  // Step 7e-c: Saved items we DO hold — ask relays for anything newer than
+  // our copy, and pull the backend's saved-version rows (which also fetch
+  // versions the ingester saw first and raise "updated" notifications).
+  {
+    const lib = store.getState().music.library;
+    watchSavedItemsForUpdates([...lib.savedAlbumIds, ...lib.savedTrackIds]);
     void syncSavedVersions({ force: true });
   }
 
@@ -1218,6 +1213,12 @@ export async function performLogin(
   // are correctly marked as already-read.
   loadDMReadState();
   cleanupDMReadState = startDMReadStateSync();
+
+  // Step 7f-a2: Music library + folders sync with the account's other
+  // devices (encrypted kind-30078 docs). After the DM bootstrap so a remote
+  // signer serves DM unwraps first.
+  cleanupMusicLibrarySync?.();
+  cleanupMusicLibrarySync = startMusicLibrarySync(pubkey);
 
   // Step 7f-b: Load persisted friend requests from IndexedDB
   await loadFriendRequestState();
@@ -1471,6 +1472,10 @@ export async function switchAccount(targetPubkey: string): Promise<void> {
   store.dispatch(setSwitchingAccount(true));
 
   try {
+    // 0. Publish pending music library/folder edits while this account's
+    //    signer is still the active one (bounded; cleanup can't do it).
+    await drainMusicLibrarySync();
+
     // 1. Run cleanup (cancels timers, unsubs listeners, clears caches, disconnects relays)
     performCleanup();
 
@@ -1564,6 +1569,7 @@ export function performCleanup(): void {
   flushFollowerSave();
   flushFriendRequestSave();
   flushNotificationSave();
+  flushMusicLibrarySync();
 
   // 2. Unsubscribe persistence listeners
   cleanupDMPersistence?.();
@@ -1576,6 +1582,9 @@ export function performCleanup(): void {
   cleanupFriendRequestPersistence = null;
   cleanupNotificationPersistence?.();
   cleanupNotificationPersistence = null;
+  cleanupMusicLibrarySync?.();
+  cleanupMusicLibrarySync = null;
+  resetLibraryFill();
 
   cleanupActiveSpacePersistence?.();
   cleanupActiveSpacePersistence = null;
@@ -1604,12 +1613,18 @@ export function performCleanup(): void {
 
 /** Full logout: stop listeners, close subscriptions, clear caches, reset store */
 export async function performLogout(): Promise<void> {
+  // 0. Publish pending music library/folder edits while the signer is still
+  //    active (bounded): the local rows are wiped below, so anything still
+  //    unsent would otherwise be lost for good.
+  await drainMusicLibrarySync();
+
   // 1. Cancel pending debounce timers FIRST to prevent stale writes
   cancelDMSave();
   cancelDMReadStateSave();
   cancelFollowerSave();
   cancelFriendRequestSave();
   cancelNotificationSave();
+  cancelMusicLibrarySync();
 
   // 2. Stop persistence listeners
   cleanupDMPersistence?.();
@@ -1622,6 +1637,9 @@ export async function performLogout(): Promise<void> {
   cleanupFriendRequestPersistence = null;
   cleanupNotificationPersistence?.();
   cleanupNotificationPersistence = null;
+  cleanupMusicLibrarySync?.();
+  cleanupMusicLibrarySync = null;
+  resetLibraryFill();
   cleanupActiveSpacePersistence?.();
   cleanupActiveSpacePersistence = null;
   cleanupGiftWrapReconciliation?.();

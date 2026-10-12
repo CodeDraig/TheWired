@@ -5,10 +5,11 @@ import { MusicHome } from "./views/MusicHome";
 import { SongList } from "./views/SongList";
 import { AlbumGrid } from "./views/AlbumGrid";
 import { ArtistList } from "./views/ArtistList";
-import { PlaylistList } from "./views/PlaylistList";
+import { FolderList } from "./views/FolderList";
+import { FolderDetail } from "./views/FolderDetail";
 import { ArtistDetail } from "./views/ArtistDetail";
 import { AlbumDetail } from "./views/AlbumDetail";
-import { PlaylistDetail } from "./views/PlaylistDetail";
+import { PublishedFolderDetail } from "./views/PublishedFolderDetail";
 import { RecentlyAdded } from "./views/RecentlyAdded";
 import { FavoritesList } from "./views/FavoritesList";
 import { MyUploads } from "./views/MyUploads";
@@ -27,13 +28,14 @@ const VIEW_COMPONENTS: Record<MusicView, React.ComponentType> = {
   artists: ArtistList,
   albums: AlbumGrid,
   songs: SongList,
-  playlists: PlaylistList,
+  folders: FolderList,
+  "folder-detail": FolderDetail,
   "my-uploads": MyUploads,
   explore: ExploreMusic,
   "for-you": ExploreMusic,
   "artist-detail": ArtistDetail,
   "album-detail": AlbumDetail,
-  "playlist-detail": PlaylistDetail,
+  "published-folder": PublishedFolderDetail,
   search: SearchResults,
   "project-history": ProjectHistory,
   // TODO: Re-enable proposals/changes system later

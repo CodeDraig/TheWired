@@ -1,4 +1,6 @@
 import { createSelector } from "@reduxjs/toolkit";
+import { sortFolders, type FolderMemberLike } from "@ishtarservices/core";
+import { getTrackImage } from "./trackImage";
 import type { RootState } from "@/store";
 import type { ArtistEntry, MusicMember, MusicVisibility } from "@/types/music";
 
@@ -162,13 +164,6 @@ export const selectFollowedArtists = createSelector(
   (music) => music.library.followedArtists,
 );
 
-export const selectUserPlaylists = createSelector(
-  selectMusicState,
-  (music) =>
-    music.library.userPlaylists
-      .map((id) => music.playlists[id])
-      .filter(Boolean),
-);
 
 /** Every track the user owns — INCLUDING `catalog:none` clips, so My Music is
  *  the one place on desktop to find an unlisted clip and re-list it. */
@@ -361,3 +356,35 @@ export const selectProfileAlbums = (pubkey: string) =>
       })
       .sort((a, b) => b.createdAt - a.createdAt);
   });
+
+// ── Folders (synced shelves; docs/MUSIC_LIBRARY_SYNC.md) ──────────────
+
+// Keyed on the pieces they read, not the whole music slice — which changes
+// on every playback position tick.
+const selectFolderList = (state: RootState) => state.music.folders;
+const selectTracks = (state: RootState) => state.music.tracks;
+const selectAlbums = (state: RootState) => state.music.albums;
+
+/** Pinned first, then most recently touched. */
+export const selectFolders = createSelector(selectFolderList, sortFolders);
+
+/** What the folder summary helpers need from the catalog. */
+export const selectFolderMembers = createSelector(
+  [selectFolderList, selectTracks, selectAlbums],
+  (folders, tracks, albums) => {
+    const out: Record<string, FolderMemberLike> = {};
+    for (const folder of folders) {
+      for (const id of folder.itemIds) {
+        if (out[id]) continue;
+        const track = tracks[id];
+        if (track) {
+          out[id] = { addressableId: id, kind: "track", artwork: getTrackImage(track, albums) ?? null };
+          continue;
+        }
+        const album = albums[id];
+        if (album) out[id] = { addressableId: id, kind: "album", artwork: album.imageUrl ?? null };
+      }
+    }
+    return out;
+  },
+);

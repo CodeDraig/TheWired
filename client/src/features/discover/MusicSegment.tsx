@@ -30,7 +30,7 @@ import { SectionHeader } from "./components/SectionHeader";
 import { RailSkeleton, RowSkeleton } from "./components/Skeletons";
 import { TrackRow } from "./components/TrackRow";
 import { AlbumTile } from "./components/AlbumTile";
-import { PlaylistRow } from "./components/PlaylistRow";
+import { PublishedFolderRow } from "./components/PublishedFolderRow";
 import { formatAge, rankTracks, sortDisclosure, trackSignalLabel } from "./ranking";
 import { matchesScene, sceneBySlug, sceneChips } from "./taxonomy";
 import { useScenes } from "./useScenes";
@@ -281,7 +281,7 @@ export function MusicSegment({ query }: { query: string }) {
   const publicPlaylists = useMemo(
     () =>
       Object.values(playlists)
-        .filter((p) => p.visibility === "public" && p.trackRefs.length > 0)
+        .filter((p) => p.visibility === "public" && !p.deleted && p.trackRefs.length > 0)
         .sort((a, b) => b.createdAt - a.createdAt)
         .slice(0, ALBUM_LIMIT),
     [playlists],
@@ -328,7 +328,7 @@ export function MusicSegment({ query }: { query: string }) {
   );
 
   const enterMusic = useCallback(
-    (payload: { view: "album-detail" | "playlist-detail"; id: string }) => {
+    (payload: { view: "album-detail" | "published-folder"; id: string }) => {
       dispatch(setSidebarMode("music"));
       dispatch(setActiveDetailId(payload));
       navigate("/");
@@ -368,7 +368,7 @@ export function MusicSegment({ query }: { query: string }) {
 
   const openPlaylist = useCallback(
     (playlistId: string) => {
-      enterMusic({ view: "playlist-detail", id: playlistId });
+      enterMusic({ view: "published-folder", id: playlistId });
       const pl = playlists[playlistId];
       if (pl) hydrateTrackRefs(pl.trackRefs);
     },
@@ -477,7 +477,7 @@ export function MusicSegment({ query }: { query: string }) {
     status === "loading" || displayAlbums.length > 0
       ? "albums"
       : publicPlaylists.length > 0
-        ? "playlists"
+        ? "folders"
         : "tracks";
 
   return (
@@ -504,10 +504,10 @@ export function MusicSegment({ query }: { query: string }) {
         <div className="grid grid-cols-1 gap-6 @3xl:grid-cols-[3fr_2fr]">
           {publicPlaylists.length > 0 && (
             <section>
-              <SectionHeader title="Playlists" right={firstSection === "playlists" ? sceneRow : null} />
+              <SectionHeader title="Folders" right={firstSection === "folders" ? sceneRow : null} />
               <div className="space-y-1">
                 {publicPlaylists.map((pl: MusicPlaylist) => (
-                  <PlaylistRow key={pl.addressableId} playlist={pl} onOpen={openPlaylist} />
+                  <PublishedFolderRow key={pl.addressableId} playlist={pl} onOpen={openPlaylist} />
                 ))}
               </div>
             </section>

@@ -4,7 +4,7 @@ import { removeTrack, removeAlbum } from "@/store/slices/musicSlice";
 import { buildDeletionEvent } from "@/lib/nostr/eventBuilder";
 import { signAndPublish } from "@/lib/nostr/publish";
 import { deleteEvent, deleteAddressableEvent } from "@/lib/db/eventStore";
-import { removeLocalEventId, getLocalEventIds, saveMusicLibrary } from "@/lib/db/musicStore";
+import { removeLocalEventId, getLocalEventIds, persistMusicLibraryFrom } from "@/lib/db/musicStore";
 import { deleteMusic } from "@/lib/api/music";
 import { removeCachedAudio } from "@/lib/db/audioCache";
 import { store } from "@/store";
@@ -13,13 +13,9 @@ import { signerForRelease } from "./sharedKey/ownership";
 
 /** Persist library state after deletions modify savedTrackIds/savedAlbumIds */
 function persistLibraryAfterDelete() {
-  const { savedTrackIds, savedAlbumIds, favoritedTrackIds, favoritedAlbumIds, followedArtists, userPlaylists } =
-    store.getState().music.library;
-  const { recentlyPlayedIds } = store.getState().music.discovery;
-  saveMusicLibrary({
-    savedTrackIds, savedAlbumIds, favoritedTrackIds, favoritedAlbumIds,
-    followedArtists, userPlaylists, recentlyPlayedIds,
-  }).catch((err) => console.error("[music] Failed to persist library after delete:", err));
+  persistMusicLibraryFrom(store.getState()).catch((err) =>
+    console.error("[music] Failed to persist library after delete:", err),
+  );
 }
 
 /** Extract the d-tag (slug) from an addressable ID like "31683:pubkey:slug" */

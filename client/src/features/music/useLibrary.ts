@@ -21,23 +21,14 @@ import {
 } from "@/store/slices/musicSlice";
 import { removeCachedAudio } from "@/lib/db/audioCache";
 import { store } from "@/store";
-import { saveMusicLibrary } from "@/lib/db/musicStore";
+import { persistMusicLibraryFrom } from "@/lib/db/musicStore";
 import { saveVersion, saveVersions, forgetVersion, forgetVersions, type VersionItem } from "./savedVersionSync";
 
-/** Persist current library state to IndexedDB */
+/** Persist current library state (arrays + sync record) to IndexedDB */
 function persistLibrary() {
-  const { savedTrackIds, savedAlbumIds, favoritedTrackIds, favoritedAlbumIds, followedArtists, userPlaylists } =
-    store.getState().music.library;
-  const { recentlyPlayedIds } = store.getState().music.discovery;
-  saveMusicLibrary({
-    savedTrackIds,
-    savedAlbumIds,
-    favoritedTrackIds,
-    favoritedAlbumIds,
-    followedArtists,
-    userPlaylists,
-    recentlyPlayedIds,
-  }).catch((err) => console.error("[music] Failed to persist library:", err));
+  persistMusicLibraryFrom(store.getState()).catch((err) =>
+    console.error("[music] Failed to persist library:", err),
+  );
 }
 
 /**
@@ -268,12 +259,14 @@ export function useLibrary() {
         const artistPk = album.artistPubkeys.length > 0
           ? album.artistPubkeys[0]
           : (album.artist === album.pubkey ? album.pubkey : null);
-        // Check if the artist has any other saved albums; if not, unfollow
+        // Check if the artist has any other saved albums; if not, unfollow.
+        // A saved album this device hasn't loaded yet (normal after a sync)
+        // might be theirs — unknown counts as "keep the follow".
         if (artistPk) {
           const remaining = state.library.savedAlbumIds.filter((id) => {
             if (id === addrId) return false;
             const a = state.albums[id];
-            if (!a) return false;
+            if (!a) return true;
             const otherArtistPk = a.artistPubkeys.length > 0
               ? a.artistPubkeys[0]
               : (a.artist === a.pubkey ? a.pubkey : null);

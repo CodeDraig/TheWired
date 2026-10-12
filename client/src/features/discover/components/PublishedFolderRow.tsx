@@ -1,10 +1,11 @@
 import { memo } from "react";
-import { ListMusic } from "lucide-react";
+import { Folder } from "lucide-react";
 import type { MusicPlaylist } from "@/types/music";
 import { useProfile } from "@/features/profile/useProfile";
 import { getDisplayName } from "@/features/dm/dmUtils";
 
-export const PlaylistRow = memo(function PlaylistRow({
+/** Someone's published folder (a kind-30119), as Discover lists it. */
+export const PublishedFolderRow = memo(function PublishedFolderRow({
   playlist,
   onOpen,
 }: {
@@ -24,7 +25,7 @@ export const PlaylistRow = memo(function PlaylistRow({
         <img src={playlist.imageUrl} alt="" className="h-10 w-10 rounded object-cover" />
       ) : (
         <div className="flex h-10 w-10 items-center justify-center rounded bg-card">
-          <ListMusic size={18} className="text-muted" />
+          <Folder size={18} className="text-muted" />
         </div>
       )}
       <div className="min-w-0 flex-1">

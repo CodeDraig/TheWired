@@ -15,7 +15,7 @@ import { addZap, addZaps, type ZapInput } from "../../store/slices/zapsSlice";
 import { addPollVote, addPollVotes, removeVoteByEventId, removePoll, type PollVoteInput } from "../../store/slices/pollsSlice";
 import { getSatoshisAmountFromBolt11 } from "nostr-tools/nip57";
 import { notifyMusicUpdate } from "../../features/music/savedVersionSync";
-import { addTrack, indexTrackByArtist, indexTrackByAlbum, indexTrackByArtistName, indexAlbumByArtist, indexAlbumByArtistName, addAlbum, addPlaylist, addAnnotation, removeAnnotation, removeTrack, removeAlbum, removePlaylist, recordMovedRelease } from "../../store/slices/musicSlice";
+import { addTrack, indexTrackByArtist, indexTrackByAlbum, indexTrackByArtistName, indexAlbumByArtist, indexAlbumByArtistName, addAlbum, addPlaylist, addAnnotation, removeAnnotation, removeTrack, removeAlbum, removePlaylist, recordMovedRelease, libraryReleaseMoved } from "../../store/slices/musicSlice";
 import { addDMMessage, editDMMessage, remoteDeleteDMMessage, reactDMMessage, removeDMReaction, setTyping, applyReceipt, markDMWrapProcessed } from "../../store/slices/dmSlice";
 import { parseDMWire } from "@ishtarservices/core";
 import { DM_EXPIRATION_SECONDS } from "@ishtarservices/shared-types";
@@ -1452,6 +1452,9 @@ function handleMovedStub(event: NostrEvent, movedTo: string): void {
   const music = getState().music;
   const current = event.kind === EVENT_KINDS.MUSIC_TRACK ? music.tracks[from] : music.albums[from];
   if (current && current.createdAt > event.created_at) return;
+  // The listener's saved/favorited entry follows the release to its new
+  // address (keeping its place) before the old copy is dropped.
+  dispatch(libraryReleaseMoved({ from, to: movedTo }));
   dispatch(event.kind === EVENT_KINDS.MUSIC_TRACK ? removeTrack(from) : removeAlbum(from));
   dispatch(recordMovedRelease({ from, to: movedTo, at: event.created_at }));
   if (isHeldKey(event.pubkey)) forgetHeldProjectKey(event.pubkey).catch(() => {});

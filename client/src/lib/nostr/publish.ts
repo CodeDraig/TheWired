@@ -39,6 +39,11 @@ async function signWith(unsigned: UnsignedEvent, opts?: SignOptions): Promise<No
   return signingQueue.enqueue(() => signer.signEvent(unsigned), getSignerTimeoutMs());
 }
 
+/** Sign with the logged-in account (through the signing queue), no publish. */
+export async function signWithAccount(unsigned: UnsignedEvent): Promise<NostrEvent> {
+  return signWith(unsigned);
+}
+
 /** Sign and publish an event to write relays */
 export async function signAndPublish(
   unsigned: UnsignedEvent,
