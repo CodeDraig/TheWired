@@ -47,7 +47,12 @@ import { syncSpaceMembers } from "../../store/thunks/spaceMembers";
 import { loadMusicLibraryWithTime, loadMusicFolders, type MusicFoldersRow, type MusicLibraryState } from "../db/musicStore";
 import { parseFolderDocs, parseLibraryRecord } from "@ishtarservices/core";
 import { fetchMissingLibraryItems, resetLibraryFill } from "../../features/music/libraryFill";
-import { startMusicLibrarySync, flushMusicLibrarySync, cancelMusicLibrarySync } from "../../features/music/librarySync";
+import {
+  startMusicLibrarySync,
+  drainMusicLibrarySync,
+  flushMusicLibrarySync,
+  cancelMusicLibrarySync,
+} from "../../features/music/librarySync";
 import { syncSavedVersions, watchSavedItemsForUpdates } from "../../features/music/savedVersionSync";
 import { getEventsByKind } from "../db/eventStore";
 import {
@@ -1467,6 +1472,10 @@ export async function switchAccount(targetPubkey: string): Promise<void> {
   store.dispatch(setSwitchingAccount(true));
 
   try {
+    // 0. Publish pending music library/folder edits while this account's
+    //    signer is still the active one (bounded; cleanup can't do it).
+    await drainMusicLibrarySync();
+
     // 1. Run cleanup (cancels timers, unsubs listeners, clears caches, disconnects relays)
     performCleanup();
 
