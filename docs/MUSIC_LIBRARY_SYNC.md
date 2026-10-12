@@ -134,9 +134,10 @@ idempotent: merge any copies in any order and every device converges.
 3. **Absent ≠ empty.** Publish a document only after the app relay sent EOSE
    for the REQ. A copy that fails to decrypt or has a higher `v` is never
    published over. A failed decrypt may be a signer that timed out: retry it
-   at 2 s, 10 s and 30 s, then treat the copy as closed for the session
-   (parse and version failures are final at once). A failed local read
-   blocks persisting and publishing.
+   at 2 s, 10 s and 30 s, then treat the copy as closed until the next REQ
+   of that document (foreground, reconnect, refetch), which tries it once
+   more — at most for the session (parse and version failures are final at
+   once). A failed local read blocks persisting and publishing.
 4. **Stored means stored.** `created_at = max(now, newest seen + 1)`, where
    "seen" only counts copies whose signature verified (verify every copy,
    even one whose id was already decoded). An OK whose message starts with

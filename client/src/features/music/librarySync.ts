@@ -73,8 +73,9 @@ const FOCUS_REFETCH_MS = 30_000;
  *  removals are tombstones and never count, so a bulk unsave still goes out. */
 const REMOVAL_BACKSTOP = 250;
 /** A decrypt that fails is retried at these delays before the copy counts as
- *  closed for the session: a timed-out or dismissed signer fails exactly like
- *  a foreign key. Same schedule as the mobile client. */
+ *  closed until the next REQ of it (a refetch tries it once more): a
+ *  timed-out or dismissed signer fails exactly like a foreign key. Same
+ *  schedule as the mobile client. */
 const DECRYPT_RETRY_MS = [2_000, 10_000, 30_000];
 /** Backoff after a publish that failed for a transient reason (signer
  *  timeout or rejection, relay unreachable or refusing). */
@@ -118,6 +119,9 @@ interface Session {
   decoded: Map<string, { key: DocKey; shard?: MusicLibraryShardWire; folder?: MusicFolderDoc } | null>;
   /** Decrypt attempts per event id (see DECRYPT_RETRY_MS). */
   decryptAttempts: Map<string, number>;
+  /** Ids whose decrypt retries ran out: cached as unreadable until the next
+   *  REQ, which tries each once more. */
+  decryptClosed: Set<string>;
   /** The account's own kind-30119s from this session's REQ, newest copy per
    *  address — the only input to adoption. */
   ownPlaylists: Map<string, OwnPlaylist>;
@@ -225,6 +229,7 @@ async function handleEvent(s: Session, event: NostrEvent, relayUrl: string): Pro
           later(s, DECRYPT_RETRY_MS[attempts - 1], () => void handleEvent(s, event, relayUrl).catch(() => {}));
         } else {
           s.decoded.set(event.id, null);
+          if (failure === "decrypt") s.decryptClosed.add(event.id);
         }
       }
     }
@@ -568,6 +573,10 @@ function subscribe(s: Session): void {
   s.appAnswered = false;
   s.appEose = false;
   s.lastFetchAt = Date.now();
+  // A signer that was down may be back: give copies whose decrypt retries ran
+  // out one more try (one attempt each, no new retry chain).
+  for (const id of s.decryptClosed) s.decoded.delete(id);
+  s.decryptClosed.clear();
   s.subId = relayManager.subscribe({
     filters: [
       { kinds: [EVENT_KINDS.APP_SPECIFIC_DATA], authors: [s.pubkey], "#d": libraryShardDTags() },
@@ -619,6 +628,7 @@ export function startMusicLibrarySync(pubkey: string): () => void {
     maxSeen: new Map(),
     decoded: new Map(),
     decryptAttempts: new Map(),
+    decryptClosed: new Set(),
     ownPlaylists: new Map(),
     pending: { shards: [], folders: [] },
     flushQueued: false,

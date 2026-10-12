@@ -338,16 +338,36 @@ describe("library sync driver — review fixes", () => {
     expect(plain).toContain('"31683:mine"');
   });
 
-  it("a copy that still can't be decrypted after every retry stays closed for the session", async () => {
+  it("a copy that still can't be decrypted after every retry stays closed until the next REQ", async () => {
     startMusicLibrarySync(h.pk);
     store.dispatch(addSavedTrack(t("mine")));
     h.decryptFail = 99;
-    h.subs[0].onEvent(remoteShard([t("a")], 500), "wss://app.test");
+    const remote = remoteShard([t("a")], 500);
+    h.subs[0].onEvent(remote, "wss://app.test");
     h.subs[0].onEOSE?.("sub-0", "wss://app.test");
     await settle(120_000);
     expect(h.published).toHaveLength(0);
     // First try + one retry per DECRYPT_RETRY_MS entry, then it stops asking.
     expect(99 - h.decryptFail).toBe(4);
+    // The next REQ (focus refetch) tries it once more — still failing: one
+    // attempt, no new retry chain, still nothing published over it.
+    window.dispatchEvent(new Event("focus"));
+    let sub = h.subs[h.subs.length - 1];
+    sub.onEvent(remote, "wss://app.test");
+    sub.onEOSE?.(sub.id, "wss://app.test");
+    await settle(120_000);
+    expect(99 - h.decryptFail).toBe(5);
+    expect(h.published).toHaveLength(0);
+    // The signer is back by the following REQ: it merges, then publishes the union.
+    h.decryptFail = 0;
+    window.dispatchEvent(new Event("focus"));
+    sub = h.subs[h.subs.length - 1];
+    sub.onEvent(remote, "wss://app.test");
+    sub.onEOSE?.(sub.id, "wss://app.test");
+    await settle(3000);
+    expect(new Set(store.getState().music.library.savedTrackIds)).toEqual(new Set([t("a"), t("mine")]));
+    await settle(3000);
+    expect(h.published).toHaveLength(1);
   });
 
   it("a signing failure (rejected prompt, timeout) doesn't switch sync off for the session", async () => {
