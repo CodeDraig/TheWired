@@ -1613,6 +1613,11 @@ export function performCleanup(): void {
 
 /** Full logout: stop listeners, close subscriptions, clear caches, reset store */
 export async function performLogout(): Promise<void> {
+  // 0. Publish pending music library/folder edits while the signer is still
+  //    active (bounded): the local rows are wiped below, so anything still
+  //    unsent would otherwise be lost for good.
+  await drainMusicLibrarySync();
+
   // 1. Cancel pending debounce timers FIRST to prevent stale writes
   cancelDMSave();
   cancelDMReadStateSave();

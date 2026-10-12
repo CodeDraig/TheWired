@@ -707,10 +707,11 @@ function stopSession(flush: boolean): void {
   window.removeEventListener("beforeunload", s.onUnload);
 }
 
-/** Account switch, before anything is torn down: publish pending edits with
- *  the account (and signer) they belong to. Bounded, so a switch can't hang
- *  on an unreachable relay; whatever doesn't make it stays in the persisted
- *  record and goes out at that account's next login here. */
+/** Account switch or sign-out, before anything is torn down: publish pending
+ *  edits with the account (and signer) they belong to. Bounded, so neither
+ *  can hang on an unreachable relay. After a switch, whatever doesn't make it
+ *  stays in the persisted record and goes out at that account's next login
+ *  here; sign-out wipes the local rows, so this is its only chance. */
 export async function drainMusicLibrarySync(timeoutMs = DRAIN_TIMEOUT_MS): Promise<void> {
   const s = session;
   if (!s || !live(s) || !s.appAnswered) return;
@@ -739,7 +740,7 @@ export function flushMusicLibrarySync(): void {
   persistMusicFoldersFrom(state).catch(() => {});
 }
 
-/** Logout: drop pending work without writing. */
+/** Logout (after drainMusicLibrarySync): stop without writing locally. */
 export function cancelMusicLibrarySync(): void {
   stopSession(false);
 }

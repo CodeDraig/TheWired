@@ -155,4 +155,5 @@ idempotent: merge any copies in any order and every device converges.
 7. Fetch at login (full), then incrementally with `since` (minus 120 s), on
    foreground/focus, and live via a subscription to the account's own shards
    and `#l` folder docs. Debounce publishes (~2 s); flush on background/exit,
-   and before an account switch (while the old account's signer is active).
+   and before an account switch or sign-out (while that account's signer is
+   still active — sign-out wipes the local rows, so it's the last chance).
