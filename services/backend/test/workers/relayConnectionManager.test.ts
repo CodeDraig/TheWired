@@ -298,6 +298,85 @@ describe("relay manager — NIP-42 ingest role (own relay)", () => {
     expect(reqFrames(own).filter((r) => r[1] === "ingester-wraps")).toHaveLength(2);
   });
 
+  it("sends the gated REQs when the AUTH OK lands before the cursor read resolves", async () => {
+    // Regression: the relay challenges on connect, so the AUTH round trip can
+    // finish while the open handler is still awaiting getSince (Redis). The OK
+    // found nothing armed, the handler then armed the set, and the wraps REQ
+    // was never sent for the life of the socket — no dm pushes at all.
+    const redis = getRedis();
+    const cursor = Math.floor(Date.now() / 1000) - 600;
+    await redis.set("ingester:last_seen", String(cursor));
+    const realGet = redis.get.bind(redis);
+    let releaseCursor!: () => void;
+    const cursorHeld = new Promise<void>((r) => (releaseCursor = r));
+    const get = vi.spyOn(redis, "get").mockImplementation((async (key: string) => {
+      if (key === "ingester:last_seen") await cursorHeld;
+      return realGet(key);
+    }) as typeof redis.get);
+    try {
+      await startManager();
+      const own = await waitForWs(config.relayUrl);
+      own.simulateOpen(); // open handler parks on the cursor read
+      own.simulateMessage(["AUTH", "challenge-race"]);
+      const auth = own.sent.map((s) => JSON.parse(s)).find((m) => m[0] === "AUTH")!;
+      own.simulateMessage(["OK", auth[1].id, true, ""]);
+      await tick();
+
+      releaseCursor();
+      await tick();
+      const reqs = reqFrames(own);
+      expect(reqs.map((r) => r[1])).toEqual([
+        "ingester",
+        "ingester-music-backfill",
+        "ingester-wraps",
+        "ingester-reports",
+      ]);
+      // The reports REQ waited for the real cursor rather than a stale one.
+      const { REPORT_LOOKBACK_SEC } = await import("../../src/workers/relayConnectionManager.js");
+      expect((reqs[3][2] as { since: number }).since).toBe(cursor - REPORT_LOOKBACK_SEC);
+
+      // A second AUTH round on the same socket does not replay them.
+      own.simulateMessage(["AUTH", "challenge-again"]);
+      const reauth = own.sent.map((s) => JSON.parse(s)).filter((m) => m[0] === "AUTH")[1];
+      own.simulateMessage(["OK", reauth[1].id, true, ""]);
+      await tick();
+      expect(reqFrames(own).filter((r) => r[1] === "ingester-wraps")).toHaveLength(1);
+    } finally {
+      get.mockRestore();
+      await redis.del("ingester:last_seen");
+    }
+  });
+
+  it("re-arms the gated REQs on every reconnect", async () => {
+    await startManager();
+    const first = await waitForWs(config.relayUrl);
+    first.simulateOpen();
+    await tick();
+    first.simulateMessage(["AUTH", "c-first"]);
+    const a1 = first.sent.map((s) => JSON.parse(s)).find((m) => m[0] === "AUTH")!;
+    first.simulateMessage(["OK", a1[1].id, true, ""]);
+    await tick();
+    expect(reqFrames(first).filter((r) => r[1] === "ingester-wraps")).toHaveLength(1);
+
+    first.close(); // relay restart; backoff is 30 ms
+    await new Promise((r) => setTimeout(r, 80));
+    const second = MockWebSocket.instances.filter((w) => w.url === config.relayUrl)[1];
+    second.simulateOpen();
+    await tick();
+    // Fresh socket, fresh AUTH: nothing gated until its own OK.
+    expect(reqFrames(second).map((r) => r[1])).toEqual(["ingester", "ingester-music-backfill"]);
+    second.simulateMessage(["AUTH", "c-second"]);
+    const a2 = second.sent.map((s) => JSON.parse(s)).find((m) => m[0] === "AUTH")!;
+    second.simulateMessage(["OK", a2[1].id, true, ""]);
+    await tick();
+    expect(reqFrames(second).map((r) => r[1])).toEqual([
+      "ingester",
+      "ingester-music-backfill",
+      "ingester-wraps",
+      "ingester-reports",
+    ]);
+  });
+
   it("ignores AUTH challenges when no ingest key is configured (legacy path)", async () => {
     (config as { ingestSecretKey: string }).ingestSecretKey = "";
     await startManager();
