@@ -62,6 +62,15 @@ async fn maybe_refresh_memberships(
 /// Maximum incoming WebSocket message size (128 KiB)
 const MAX_MESSAGE_SIZE: usize = 128 * 1024;
 
+/// Has a socket gone quiet for longer than the configured idle timeout? A zero
+/// timeout disables the check. Any inbound frame (text, pong, even a client
+/// ping) counts as activity; server-sent frames do not — a peer whose phone
+/// was backgrounded keeps *receiving* nothing and *sending* nothing, and that
+/// is exactly the socket we want to reclaim.
+fn idle_expired(last_activity: Instant, idle_timeout: Duration) -> bool {
+    idle_timeout > Duration::ZERO && last_activity.elapsed() >= idle_timeout
+}
+
 /// Visibility check for broadcast events (no per-broadcast DB query), with
 /// the DM wire contract's gift-wrap gate and NIP-40 expiration applied:
 ///   0. Expired events are never forwarded; a kind-1059 wrap goes only to
@@ -172,6 +181,16 @@ pub async fn handle_connection(
     let mut rate_window_start: Instant = Instant::now();
     let mut msgs_in_window: u32 = 0;
     let auth_challenge = nip42::generate_challenge();
+    // Keepalive: ping on a timer and drop sockets that stay silent. A socket
+    // the OS killed under a backgrounded app never sends a FIN, so without
+    // this it would hold a `max_conns_per_ip` slot until TCP keepalive gives
+    // up (often >10 min) — long enough to lock a user out of their own cap.
+    let ping_enabled = state.config.ws_ping_interval_secs > 0;
+    let ping_every = Duration::from_secs(state.config.ws_ping_interval_secs.max(1));
+    let idle_timeout = Duration::from_secs(state.config.ws_idle_timeout_secs);
+    let mut last_activity: Instant = Instant::now();
+    let mut ping_tick = tokio::time::interval_at(tokio::time::Instant::now() + ping_every, ping_every);
+    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Send NIP-42 AUTH challenge on connect
     let auth_msg = format!(r#"["AUTH","{}"]"#, auth_challenge);
@@ -181,6 +200,9 @@ pub async fn handle_connection(
         tokio::select! {
             // Handle incoming WebSocket messages from the client
             ws_msg = receiver.next() => {
+                if let Some(Ok(_)) = &ws_msg {
+                    last_activity = Instant::now();
+                }
                 match ws_msg {
                     Some(Ok(Message::Text(text))) => {
                         if text.len() > MAX_MESSAGE_SIZE {
@@ -237,6 +259,22 @@ pub async fn handle_connection(
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
+                }
+            }
+
+            // Keepalive tick: reclaim a silent socket, else ping it.
+            _ = ping_tick.tick(), if ping_enabled => {
+                if idle_expired(last_activity, idle_timeout) {
+                    tracing::info!(
+                        remote = %addr,
+                        idle_secs = last_activity.elapsed().as_secs(),
+                        "Dropping idle connection"
+                    );
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
+                if sender.send(Message::Ping(axum::body::Bytes::new())).await.is_err() {
+                    break;
                 }
             }
 
@@ -590,5 +628,24 @@ mod tests {
         );
         assert!(is_event_visible_to(&evt, &Some("bob".into()), &empty_set()));
         assert!(!is_event_visible_to(&evt, &Some("fay".into()), &empty_set()));
+    }
+
+    /// Keepalive: a zero timeout never expires; a fresh socket is not idle; a
+    /// socket silent for longer than the timeout is.
+    #[test]
+    fn idle_expired_respects_timeout_and_zero_disables() {
+        let fresh = Instant::now();
+        assert!(!idle_expired(fresh, Duration::from_secs(90)));
+        assert!(!idle_expired(fresh, Duration::ZERO));
+        // `checked_sub`: a monotonic clock younger than 91 s (a just-booted CI
+        // box) cannot represent these instants; the fresh-socket cases above
+        // already pin the behaviour, so only then skip the stale ones.
+        if let Some(stale) = Instant::now().checked_sub(Duration::from_secs(91)) {
+            assert!(idle_expired(stale, Duration::from_secs(90)));
+            assert!(!idle_expired(stale, Duration::ZERO), "0 = never drop");
+        }
+        if let Some(borderline) = Instant::now().checked_sub(Duration::from_secs(90)) {
+            assert!(idle_expired(borderline, Duration::from_secs(90)), "the 3rd unanswered ping drops");
+        }
     }
 }

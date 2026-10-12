@@ -104,6 +104,10 @@ services:
       # forwarded here so the .env rollback lever actually reaches the relay.
       RELAY_RATE_MAX_MSGS: ${RELAY_RATE_MAX_MSGS:-300}
       RELAY_MAX_CONNS_PER_IP: ${RELAY_MAX_CONNS_PER_IP:-32}
+      # WebSocket keepalive: ping every N s, drop a socket silent for M s so a
+      # connection a backgrounded phone lost stops holding a per-IP slot.
+      RELAY_WS_PING_SECS: ${RELAY_WS_PING_SECS:-30}
+      RELAY_WS_IDLE_TIMEOUT_SECS: ${RELAY_WS_IDLE_TIMEOUT_SECS:-90}
       RUST_ENV: production
       RUST_LOG: ${RUST_LOG:-info,thewired_relay=info}
       LOG_FORMAT: json

@@ -35,6 +35,16 @@ pub struct Config {
     /// Trust `X-Forwarded-For` for the client IP (set behind Caddy).
     /// `RELAY_TRUST_PROXY` = 1|true.
     pub trust_proxy: bool,
+
+    // ── WebSocket keepalive ──
+    /// Seconds between server-initiated WebSocket pings. `RELAY_WS_PING_SECS`
+    /// (30); 0 = never ping (and never drop idle sockets).
+    pub ws_ping_interval_secs: u64,
+    /// Drop a connection that has sent nothing (no frame, no pong) for this
+    /// many seconds. Sockets a backgrounded phone silently loses otherwise
+    /// linger — and keep counting toward `max_conns_per_ip` — until the TCP
+    /// stack gives up. `RELAY_WS_IDLE_TIMEOUT_SECS` (90); 0 = never drop.
+    pub ws_idle_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -54,6 +64,8 @@ impl Default for Config {
             rate_window_secs: 10,
             max_conns_per_ip: 32,
             trust_proxy: false,
+            ws_ping_interval_secs: 30,
+            ws_idle_timeout_secs: 90,
         }
     }
 }
@@ -104,6 +116,8 @@ impl Config {
             rate_window_secs: env_or("RELAY_RATE_WINDOW_SECS", d.rate_window_secs),
             max_conns_per_ip: env_or("RELAY_MAX_CONNS_PER_IP", d.max_conns_per_ip),
             trust_proxy: env_bool("RELAY_TRUST_PROXY"),
+            ws_ping_interval_secs: env_or("RELAY_WS_PING_SECS", d.ws_ping_interval_secs),
+            ws_idle_timeout_secs: env_or("RELAY_WS_IDLE_TIMEOUT_SECS", d.ws_idle_timeout_secs),
         }
     }
 
