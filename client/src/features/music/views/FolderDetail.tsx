@@ -51,7 +51,7 @@ export function FolderDetail() {
   const { playQueue } = useAudioPlayer();
   const { scrollPaddingClass } = usePlaybackBarSpacing();
   const [renaming, setRenaming] = useState(false);
-  const [busy, setBusy] = useState<"publish" | "unpublish" | null>(null);
+  const [busy, setBusy] = useState<"publish" | "unpublish" | "delete" | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -84,6 +84,19 @@ export function FolderDetail() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Couldn't reach the relays.");
     } finally {
+      setBusy(null);
+    }
+  };
+
+  const remove = async () => {
+    setBusy("delete");
+    setError(null);
+    try {
+      await deleteFolderById(folder.id);
+      dispatch(setMusicView("folders"));
+    } catch (err) {
+      // The playlist couldn't be retracted, so the folder stays.
+      setError(err instanceof Error ? err.message : "Couldn't take the published copy down.");
       setBusy(null);
     }
   };
@@ -161,14 +174,12 @@ export function FolderDetail() {
             )}
             {confirmDelete ? (
               <button
-                onClick={() => {
-                  void deleteFolderById(folder.id);
-                  dispatch(setMusicView("folders"));
-                }}
-                className="flex items-center gap-1.5 rounded-full border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm text-red-400 transition-colors hover:bg-red-500/20"
+                onClick={() => void remove()}
+                disabled={busy !== null}
+                className="flex items-center gap-1.5 rounded-full border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
               >
                 <Trash2 size={14} />
-                {folder.publishedAs ? "Delete + unpublish" : "Delete folder"}
+                {busy === "delete" ? "Deleting…" : folder.publishedAs ? "Delete + unpublish" : "Delete folder"}
               </button>
             ) : (
               <button

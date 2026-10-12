@@ -2,7 +2,9 @@
 // @ishtarservices/core `music/folders`). Every edit goes through
 // `folderEdited`, which stamps it into the folder's synced doc; publishing
 // writes a kind-30119 playlist at `30119:<me>:<folder id>` AFTER the folder
-// doc reached the app relay (docs/MUSIC_LIBRARY_SYNC.md §4).
+// doc reached the app relay (docs/MUSIC_LIBRARY_SYNC.md §4). A publish that
+// fails at either step puts the folder's published state back; a published
+// folder is only deleted once its playlist is retracted.
 //
 // Filing into a folder never saves to the library or follows an artist, and
 // deleting a folder never deletes music.
@@ -102,11 +104,24 @@ export function flattenToTracks(itemIds: string[]): string[] {
 }
 
 function dTagOf(address: string): string {
-  return address.split(":").slice(2).join(":");
+  return parseMusicAddress(address)?.d ?? "";
+}
+
+/** Put a folder's published state back to what `before` had (after a publish
+ *  that didn't go through). Other edits made meanwhile are kept. */
+function restorePublished(id: string, before: MusicFolder): void {
+  const current = folderById(id);
+  if (!current) return;
+  const next = before.publishedAs
+    ? markPublished(current, before.publishedAs, before.publishedAt ?? 0, nowSec())
+    : markUnpublished(current, nowSec());
+  store.dispatch(folderEdited({ id, next }));
 }
 
 /** Publish (or re-publish) a folder as a playlist. The folder doc carries the
- *  published state and goes out first; the 30119 is its public copy. */
+ *  published state and goes out first; the 30119 is its public copy, sent
+ *  only once the doc reached the app relay. Throws (with the folder's
+ *  published state restored) when either step fails. */
 export async function publishFolderById(id: string): Promise<boolean> {
   const state = store.getState();
   const pubkey = state.identity.pubkey;
@@ -119,7 +134,11 @@ export async function publishFolderById(id: string): Promise<boolean> {
   const existing = state.music.playlists[address];
   const at = Math.max(nowSec(), (folder.publishedAt ?? 0) + 1, (existing?.createdAt ?? 0) + 1);
   store.dispatch(folderEdited({ id, next: markPublished(folder, address, at, nowSec()) }));
-  await publishFolderDocNow(id);
+  const docLanded = await publishFolderDocNow(id).catch(() => false);
+  if (!docLanded) {
+    restorePublished(id, folder);
+    throw new Error("Couldn't sync the folder to your relay. Try again in a moment.");
+  }
 
   const unsigned = buildPlaylistEvent(pubkey, {
     title: folder.name,
@@ -133,7 +152,12 @@ export async function publishFolderById(id: string): Promise<boolean> {
   });
   unsigned.created_at = at;
   unsigned.tags.push(MUSIC_FOLDER_LABEL_TAG);
-  await signAndPublish(unsigned);
+  try {
+    await signAndPublish(unsigned);
+  } catch (err) {
+    restorePublished(id, folder);
+    throw err;
+  }
   return true;
 }
 
@@ -156,15 +180,15 @@ async function retractPlaylist(pubkey: string, address: string, after: number): 
 }
 
 /** Delete the shelf (the music stays). A published folder's playlist is
- *  taken down with it. */
+ *  retracted FIRST: if that fails the folder stays (and this throws), so the
+ *  public copy is never left up with no folder to take it down from. */
 export async function deleteFolderById(id: string): Promise<void> {
   const pubkey = store.getState().identity.pubkey;
   const folder = folderById(id);
   if (!folder) return;
-  store.dispatch(folderDeleted(id));
-  if (pubkey && folder.publishedAs) {
-    await retractPlaylist(pubkey, folder.publishedAs, folder.publishedAt ?? 0).catch((err) =>
-      console.warn("[folders] retract failed:", err),
-    );
+  if (folder.publishedAs) {
+    if (!pubkey) throw new Error("Sign in to take the published copy down.");
+    await retractPlaylist(pubkey, folder.publishedAs, folder.publishedAt ?? 0);
   }
+  store.dispatch(folderDeleted(id));
 }
