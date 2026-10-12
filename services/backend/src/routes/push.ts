@@ -88,15 +88,20 @@ export const pushRoutes: FastifyPluginAsync = async (server) => {
   });
 
   /** GET /push/devices — what the server holds for the caller: the devices
-   *  it would push to and the last Expo delivery failure. The app's
-   *  You → Notifications screen reads this so "pushes don't arrive" shows
-   *  WHICH hop is broken (no token registered vs. the push service refusing). */
+   *  it would push to, the last Expo delivery failure, what it decided for
+   *  the newest dm wrap addressed to the caller (`lastDm`), and when the
+   *  ingester last took any wrap from the relay (`ingestLastWrapAt`, unix
+   *  ms, global). The app's You → Notifications screen reads this so
+   *  "pushes don't arrive" shows WHICH hop is broken (wraps not ingested,
+   *  dm skipped, no token registered, the push service refusing). */
   server.get("/devices", async (request, reply) => {
     const pubkey = (request as any).pubkey;
     if (!pubkey) return reply.status(401).send({ error: "Unauthorized", code: "UNAUTHORIZED" });
-    const [devices, lastError] = await Promise.all([
+    const [devices, lastError, lastDm, ingestLastWrapAt] = await Promise.all([
       pushService.devicesFor(pubkey),
       pushService.lastDeliveryError(pubkey),
+      pushService.lastDmOutcome(pubkey),
+      pushService.lastWrapIngestedAt(),
     ]);
     return {
       data: {
@@ -110,6 +115,8 @@ export const pushRoutes: FastifyPluginAsync = async (server) => {
           lastSeenAt: d.lastSeenAt.toISOString(),
         })),
         lastError,
+        lastDm,
+        ingestLastWrapAt,
       },
     };
   });

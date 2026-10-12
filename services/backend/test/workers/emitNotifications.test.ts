@@ -3,7 +3,8 @@
  * real preference gate, real queue rows. Covers the reply/mention/chat/dm
  * paths on the own relay, graceful degradation when relay.events has no row
  * for a parent, the h_tag publicness gate on reaction previews, wrap replay
- * dedupe, and that an external-relay context never queues anything.
+ * dedupe, typing wraps never queueing, and that an external-relay context
+ * never queues anything.
  *
  * Harness TRUNCATEs app.* between tests. Needs Postgres `thewired_test`.
  * relay.events is NOT truncated — rows seeded here use file-unique ids and
@@ -201,15 +202,14 @@ describe("kind 1059 wrap through processEvent", () => {
     expect(JSON.stringify(rows[0])).not.toContain("opaque-ciphertext");
     expect(JSON.stringify(rows[0])).not.toContain(wrap.pubkey);
 
-    // Reconnect replay (the wraps REQ looks back 2 days): same wrap id again,
-    // outside the dm rate window — still no second row.
-    await getRedis().del(`notif:dm:${LUNA.pubkey}`);
+    // Reconnect replay (the wraps REQ looks back 2 days): same wrap id
+    // again — still no second row.
     await processEvent(wrap, own);
     rows = await rowsFor(LUNA.pubkey);
     expect(rows).toHaveLength(1);
 
     // And from an external relay a wrap is dropped outright.
-    await getRedis().del(`notif:dm:${LUNA.pubkey}`, `notif:wrap:${wrap.id}`);
+    await getRedis().del(`notif:wrap:${wrap.id}`);
     await db.delete(notificationQueue).where(eq(notificationQueue.pubkey, LUNA.pubkey));
     await processEvent(wrap, ext);
     expect(await rowsFor(LUNA.pubkey)).toHaveLength(0);
@@ -250,5 +250,58 @@ describe("kind 1059 wrap through processEvent", () => {
     ) as NostrEvent;
     await processEvent(inbound, own);
     expect(await rowsFor(LUNA.pubkey)).toHaveLength(1);
+  });
+
+  it("a typing wrap never queues and records 'signal'; the message right after it still pushes", async () => {
+    await pushService.registerDevice({
+      pubkey: LUNA.pubkey,
+      provider: "expo",
+      token: "ExponentPushToken[emitluna3]",
+      platform: "ios",
+    });
+    const now = Math.floor(Date.now() / 1000);
+    // Typing (20014): wrap expiration = created_at + 30.
+    const typing = finalizeEvent(
+      { kind: 1059, created_at: now, tags: [["p", LUNA.pubkey], ["expiration", String(now + 30)]], content: "t" },
+      MARCUS.secretKey,
+    ) as NostrEvent;
+    await processEvent(typing, own);
+    expect(await rowsFor(LUNA.pubkey)).toHaveLength(0);
+    expect(await pushService.lastDmOutcome(LUNA.pubkey)).toMatchObject({ outcome: "signal" });
+    // No wrap marker was spent on it.
+    expect(await getRedis().exists(`notif:wrap:${typing.id}`)).toBe(0);
+
+    const message = finalizeEvent(
+      { kind: 1059, created_at: now - 3600, tags: [["p", LUNA.pubkey]], content: "m" },
+      MARCUS.secretKey,
+    ) as NostrEvent;
+    await processEvent(message, own);
+    expect(await rowsFor(LUNA.pubkey)).toHaveLength(1);
+    expect(await pushService.lastDmOutcome(LUNA.pubkey)).toMatchObject({ outcome: "queued" });
+
+    // A call invite (+120 s) is not a signal.
+    const invite = finalizeEvent(
+      { kind: 1059, created_at: now, tags: [["p", LUNA.pubkey], ["expiration", String(now + 120)]], content: "c" },
+      MARCUS.secretKey,
+    ) as NostrEvent;
+    await processEvent(invite, own);
+    expect(await rowsFor(LUNA.pubkey)).toHaveLength(2);
+  });
+
+  it("stamps ingest:lastwrap for every own-relay wrap, not for an external relay's", async () => {
+    await getRedis().del("ingest:lastwrap");
+    const wrap = finalizeEvent(
+      { kind: 1059, created_at: Math.floor(Date.now() / 1000) - 60, tags: [["p", LUNA.pubkey]], content: "x" },
+      MARCUS.secretKey,
+    ) as NostrEvent;
+    await processEvent(wrap, ext);
+    expect(await pushService.lastWrapIngestedAt()).toBeNull();
+    const before = Date.now();
+    await processEvent(wrap, own); // no device: nothing queues, the stamp still lands
+    const at = await pushService.lastWrapIngestedAt();
+    expect(at).not.toBeNull();
+    expect(at!).toBeGreaterThanOrEqual(before);
+    expect(await pushService.lastDmOutcome(LUNA.pubkey)).toMatchObject({ outcome: "no-devices" });
+    await getRedis().del("ingest:lastwrap");
   });
 });
