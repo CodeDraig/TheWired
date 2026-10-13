@@ -590,6 +590,7 @@ export function AlbumActionPanel({ album, open, onClose, onEdit }: AlbumActionPa
             artist: resolvedArtist,
             imageUrl: album.imageUrl,
             kind: "album",
+            visibility: album.visibility,
           }}
         />
       )}

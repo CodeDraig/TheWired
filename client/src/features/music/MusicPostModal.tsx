@@ -16,6 +16,7 @@ import { buildNaddrReference } from "@/lib/nostr/naddrEncode";
 import { signAndPublish } from "@/lib/nostr/publish";
 import { registerGifShare } from "@/lib/api/gif";
 import type { AttachmentMeta } from "@/lib/nostr/eventBuilder";
+import type { MusicVisibility } from "@/types/music";
 import type { GifItem } from "@/types/emoji";
 import type { EmojiSelectResult } from "@/components/chat/EmojiPicker";
 
@@ -34,7 +35,13 @@ export interface MusicPostTarget {
   artist: string;
   imageUrl?: string;
   kind: "track" | "album";
+  /** Only a public release may be posted or reposted to the feed: a note
+   *  names the release's address (naddr) in public, so private and
+   *  space-only releases stay off it, as in the track and project menus. */
+  visibility: MusicVisibility;
 }
+
+const GATED_POST_ERROR = "Private and members-only releases can't be posted or reposted.";
 
 interface MusicPostModalProps {
   open: boolean;
@@ -57,6 +64,8 @@ function detectEmojiQuery(value: string, cursorPos: number): string | null {
 export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
   const pubkey = useAppSelector((s) => s.identity.pubkey);
   const originalEvent = useAppSelector((s) => s.events.entities[target.eventId]);
+  const gated =
+    target.visibility !== "public" || (originalEvent !== undefined && isGatedTags(originalEvent.tags));
 
   const [value, setValue] = useState("");
   const [publishing, setPublishing] = useState(false);
@@ -211,6 +220,10 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
   const handlePost = useCallback(async () => {
     if (!pubkey) return;
     if (publishing || isUploading) return;
+    if (gated) {
+      setError(GATED_POST_ERROR);
+      return;
+    }
     setError(null);
     setPublishing(true);
 
@@ -279,14 +292,14 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
     } finally {
       setPublishing(false);
     }
-  }, [pubkey, value, attachments, pendingGif, publishing, isUploading, target.addressableId, onClose, clearAttachments]);
+  }, [pubkey, value, attachments, pendingGif, publishing, isUploading, gated, target.addressableId, onClose, clearAttachments]);
 
   /** Simple kind:6 repost of the original event */
   const handleRepost = useCallback(async () => {
     if (!pubkey || !originalEvent) return;
     if (reposting) return;
-    if (isGatedTags(originalEvent.tags)) {
-      setError("Members-only and private releases can't be reposted.");
+    if (gated) {
+      setError(GATED_POST_ERROR);
       return;
     }
     setError(null);
@@ -306,7 +319,7 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
     } finally {
       setReposting(false);
     }
-  }, [pubkey, originalEvent, reposting, onClose, clearAttachments]);
+  }, [pubkey, originalEvent, reposting, gated, onClose, clearAttachments]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (mentionQuery !== null || emojiQuery !== null) {
@@ -526,7 +539,7 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
 
             {/* Action buttons */}
             <div className="flex items-center gap-2">
-              {originalEvent && (
+              {originalEvent && !gated && (
                 <button
                   type="button"
                   onClick={handleRepost}
@@ -544,7 +557,7 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
               <button
                 type="button"
                 onClick={handlePost}
-                disabled={!hasContent || publishing || isUploading}
+                disabled={gated || !hasContent || publishing || isUploading}
                 className="flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-primary to-primary-soft px-4 py-1.5 text-xs font-medium text-white transition-all hover:opacity-90 press-effect disabled:opacity-40"
               >
                 {publishing ? (

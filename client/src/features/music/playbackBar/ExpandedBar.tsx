@@ -79,7 +79,9 @@ export function ExpandedBar() {
   if (!currentTrack) return null;
 
   const imageUrl = getTrackImage(currentTrack, albums);
-  const isLocal = currentTrack.visibility === "local";
+  // Share opens the feed composer, so only for public tracks (private and
+  // space-only ones share through the track menu's link and DM instead).
+  const isPublic = currentTrack.visibility === "public";
   const errored = player.playbackError?.trackId === currentTrack.addressableId;
 
   const handleFavoriteToggle = () => {
@@ -184,7 +186,7 @@ export function ExpandedBar() {
                 className={isFavorited ? "fill-red-500 text-red-500" : ""}
               />
             </button>
-            {!isLocal && (
+            {isPublic && (
               <button
                 onClick={() => setPostModalOpen(true)}
                 className="shrink-0 rounded p-1 text-soft transition-colors hover:text-heading"
@@ -317,6 +319,7 @@ export function ExpandedBar() {
             artist: currentTrack.artist,
             imageUrl,
             kind: "track",
+            visibility: currentTrack.visibility,
           }}
         />
       )}
