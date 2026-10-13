@@ -100,8 +100,10 @@ served as such with `X-Content-Type-Options: nosniff`. SVG is served with
 
 - **Music check**: unchanged (`blobAccess.getProtectedRefsForBlob`).
 - **Scope check**: public if any owner is `public`, or every owner is
-  `neutral` / there are no owners. Otherwise scoped to the union of the
-  scoped owners' spaces. Scoped with no scope rows left → deny (never public).
+  `neutral` / there are no owners, or an owner has published the bytes in a
+  public music event (someone re-uploading a public release into their space
+  can't make it members-only). Otherwise scoped to the union of the scoped
+  owners' spaces. Scoped with no scope rows left → deny (never public).
 - The blob is **public** only if both checks say public.
 - Otherwise it is **allowed** if any of these holds:
   - a valid music token for the sha
@@ -132,6 +134,9 @@ then served), `enforce`. Scope rows are recorded in every mode.
 
 ## 5. Rendering rules
 
+- **Grant timing**: clients mint the grant at login. Members-only own-server
+  media that renders before it exists waits up to 2 s for it (a same-size
+  placeholder), so the first request already carries the token.
 - **Token**: append `?tk=<grant>` ONLY to own-origin sha URLs
   (`withMediaGrant`), and only for media carried by an event with an `h` tag.
   Do this once at the parse chokepoint, so every consumer (image, video,
@@ -144,6 +149,9 @@ then served), `enforce`. Scope rows are recorded in every mode.
   2. then `blobFallbackCandidates`: imeta `fallback`, our server, the author's
      kind 10063, each by hash;
   3. then a "media unavailable" tile — not a bare link.
+- **Loopback aliases**: `localhost`, `127.x` and `[::1]` with the same port are
+  one origin (`sameServerOrigin`); a dev build's URLs and API base may name it
+  differently.
 - **Encrypted DM blobs**: the same candidate chain. `sha256(ciphertext) === x`
   is still verified before decrypting, so a candidate server can't swap bytes.
 
@@ -152,7 +160,9 @@ then served), `enforce`. Scope rows are recorded in every mode.
 - **Account deletion** removes the user's ownership rows (scope rows cascade).
   A blob is unlinked when no owner remains.
 - **Admin removal** of an event (`platformModeration.removeEvent`) deletes the
-  own-server blobs it references and denylists their shas.
+  own-server blobs it references that the event's author owns, and denylists
+  their shas (another user's media can't be taken down by quoting its URL in a
+  reported event). Music routes refuse denylisted shas too (451).
 - **Admins** pass the read gate, so reported space media can be reviewed.
 - **Not yet**: deleting a chat message (kind 5 / NIP-29 9005) doesn't delete
   its blob. The blob stays members-only. GC is a follow-up.
