@@ -66,7 +66,9 @@ export function PlaybackBar() {
   if (!currentTrack) return null;
 
   const imageUrl = getTrackImage(currentTrack, albums);
-  const isLocal = currentTrack.visibility === "local";
+  // Share opens the feed composer, so only for public tracks (private and
+  // space-only ones share through the track menu's link and DM instead).
+  const isPublic = currentTrack.visibility === "public";
 
   const handleSaveToggle = () => {
     if (!currentTrack) return;
@@ -183,7 +185,7 @@ export function PlaybackBar() {
 
       {/* Right: Share + Volume + queue */}
       <div className="flex w-56 items-center justify-end gap-3 shrink-0">
-        {!isLocal && (
+        {isPublic && (
           <button
             onClick={() => setPostModalOpen(true)}
             className="rounded p-1 text-soft transition-colors hover:text-heading"
@@ -241,6 +243,7 @@ export function PlaybackBar() {
             artist: currentTrack.artist,
             imageUrl,
             kind: "track",
+            visibility: currentTrack.visibility,
           }}
         />
       )}

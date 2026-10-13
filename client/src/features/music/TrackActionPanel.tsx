@@ -578,6 +578,7 @@ export function TrackActionPanel({
             artist: resolvedArtist,
             imageUrl: getTrackImage(track, albums),
             kind: "track",
+            visibility: track.visibility,
           }}
         />
       )}
