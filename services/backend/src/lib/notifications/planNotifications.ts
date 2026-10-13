@@ -56,6 +56,8 @@ export interface PlanDeps {
   /** The relay's public URL, carried in DM push data so the iOS Notification
    *  Service Extension knows where to fetch the wrap (§8). */
   publicRelayUrl?: string;
+  /** Unix seconds "now" for expiration checks (defaults to the clock). */
+  nowSec?: number;
   /** Author of a note id we have in relay.events (undefined = unknown). */
   parentAuthorOf(eventId: string): string | undefined;
   /** Short public preview of a note we have (undefined = unknown). */
@@ -70,9 +72,24 @@ export interface PlanDeps {
 export const PREVIEW_MAX = 120;
 export const KIND_GIFT_WRAP = 1059;
 export const RELEASE_KINDS = new Set([31683, 33123]);
+/** A wrap that expires within this many seconds is a signal, not a message:
+ *  typing (20014) wraps carry `expiration = created_at + 30`. A call invite
+ *  (+120) still pushes; so does a receipt (+7 d) — the server cannot see
+ *  kinds, and the phone's extension demotes those (docs/DM_WIRE_CONTRACT.md
+ *  §8). */
+export const SIGNAL_WRAP_MAX_TTL_SEC = 60;
 
 const tagValue = (event: NostrEvent, name: string): string | undefined =>
   event.tags.find((t) => t[0] === name)?.[1];
+
+/** Pure: is this gift wrap a short-lived signal (typing) — or already
+ *  expired — and so never worth a push? A missing or malformed
+ *  `expiration` is a message. */
+export function isSignalWrap(event: NostrEvent, nowSec: number): boolean {
+  const raw = tagValue(event, "expiration");
+  if (!raw || !/^\d+$/.test(raw)) return false;
+  return Number(raw) - nowSec <= SIGNAL_WRAP_MAX_TTL_SEC;
+}
 
 /** Distinct `p` recipients other than the author. */
 function mentionedPubkeys(event: NostrEvent): string[] {
@@ -276,6 +293,8 @@ export function planNotifications(
       // Content-free by construction: we know only who it is FOR.
       const recipient = tagValue(event, "p");
       if (!recipient) return out;
+      // Typing wraps would buzz the phone every few seconds of composing.
+      if (isSignalWrap(event, deps.nowSec ?? Math.floor(Date.now() / 1000))) return out;
       // data = DMPushData (shared-types): the NSE fetches `eventId` from
       // `relay` over an authenticated socket and decrypts on device.
       out.push({

@@ -5,6 +5,7 @@ import { randomUUID } from "crypto";
 import { getRedis } from "../lib/redis.js";
 import { pushService } from "./pushService.js";
 import type { NotificationType } from "../lib/notifications/planNotifications.js";
+import { DM_DISPATCH_KICK_MS, requestDispatchSoon } from "../workers/notificationDispatcher.js";
 
 export interface EnqueueParams {
   pubkey: string;
@@ -18,9 +19,6 @@ export interface EnqueueParams {
   data?: Record<string, unknown>;
 }
 
-/** One "new message" push per recipient per window — a burst of DMs is one
- *  lock-screen line, not ten. */
-export const DM_RATE_WINDOW_SEC = 120;
 /** A release is addressable: an edit republishes the same kind:pubkey:d.
  *  One push per watcher per address per day, so a tag fix never re-buzzes. */
 export const RELEASE_DEDUPE_SEC = 86_400;
@@ -93,35 +91,47 @@ export function preferencesAllow(
 
 /**
  * Enqueue a push notification for a user, gated by their server-side
- * preferences. Resolves true when a row was written.
+ * preferences. Resolves true when a row was written. A dm records its
+ * decision for GET /push/devices and asks the dispatcher for a pass in
+ * ~1 s rather than at the next 30 s tick.
  */
 export async function enqueueNotification(params: EnqueueParams): Promise<boolean> {
   const { pubkey, type, title, body, url, collapseKey, data } = params;
+  const isDm = type === "dm";
   try {
     const rows = await db
       .select()
       .from(notificationPreferences)
       .where(eq(notificationPreferences.pubkey, pubkey))
       .limit(1);
-    if (!preferencesAllow(rows[0], type, data)) return false;
+    if (!preferencesAllow(rows[0], type, data)) {
+      if (isDm) await pushService.recordDmOutcome(pubkey, "prefs");
+      return false;
+    }
 
-    if (type === "dm") {
+    if (isDm) {
       // Content-free pushes are only worth sending to a phone; desktop has
       // the relay open. Checked before the wrap marker so a wrap first seen
       // while the user has no device can still push after they register one.
       const devices = await pushService.devicesFor(pubkey);
-      if (devices.length === 0) return false;
+      if (devices.length === 0) {
+        await pushService.recordDmOutcome(pubkey, "no-devices");
+        return false;
+      }
       // The wraps REQ replays up to 2 days of wraps on every reconnect: a
       // wrap id pushes at most once, ever.
       const wrapId = typeof data?.eventId === "string" ? data.eventId : undefined;
       if (wrapId) {
         const fresh = await getRedis().set(`notif:wrap:${wrapId}`, "1", "EX", WRAP_SEEN_SEC, "NX");
-        if (fresh !== "OK") return false;
+        if (fresh !== "OK") {
+          await pushService.recordDmOutcome(pubkey, "seen");
+          return false;
+        }
       }
-      // And one per window: the dispatcher collapses, but a burst spread over
-      // minutes would otherwise buzz for each message.
-      const ok = await getRedis().set(`notif:dm:${pubkey}`, "1", "EX", DM_RATE_WINDOW_SEC, "NX");
-      if (ok !== "OK") return false;
+      // No per-recipient window here: a burst is shaped by the dispatcher's
+      // send gate (DM_SEND_GATE_SEC), which defers and folds rows instead of
+      // dropping them — a drop could swallow the real message that follows
+      // a receipt wrap.
     }
 
     // Releases AND saved-version updates are addressable: a tag fix republishes
@@ -141,6 +151,10 @@ export async function enqueueNotification(params: EnqueueParams): Promise<boolea
       collapseKey: collapseKey ?? null,
       data: data ? JSON.stringify(data) : null,
     });
+    if (isDm) {
+      await pushService.recordDmOutcome(pubkey, "queued");
+      requestDispatchSoon(DM_DISPATCH_KICK_MS);
+    }
     return true;
   } catch (err) {
     console.error("[notificationEnqueue] Failed to enqueue:", err);

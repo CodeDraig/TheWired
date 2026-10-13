@@ -121,8 +121,12 @@ interface Conn {
   /** Own relay only: the gated REQs (wraps, reports) wait for AUTH to
    *  complete — never sent yet, or CLOSED auth-required. */
   gatedPendingAuth: Set<string>;
+  /** Own relay only: gated REQs already sent on this socket. */
+  gatedSent: Set<string>;
   /** Own relay only: the cursor the reports REQ starts from. */
   reportsSince: number;
+  /** `reportsSince` has been read for this socket. */
+  sinceReady: boolean;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   backoffMs: number;
   maxSeen: number;
@@ -189,7 +193,9 @@ export function startRelayIngester(): { stop: () => Promise<void> } {
       windowCount: 0,
       authed: false,
       gatedPendingAuth: new Set(),
+      gatedSent: new Set(),
       reportsSince: 0,
+      sinceReady: false,
     };
   }
 
@@ -226,9 +232,20 @@ export function startRelayIngester(): { stop: () => Promise<void> } {
       conn.backoffMs = cfg.reconnectBaseMs;
       conn.authed = false;
       conn.pendingAuthId = undefined;
-      conn.gatedPendingAuth.clear();
+      conn.sinceReady = false;
+      conn.gatedSent.clear();
+      // Armed BEFORE the first await: the relay sends its AUTH challenge on
+      // connect, so the OK can land while getSince is still reading Redis. An
+      // OK that found nothing armed used to strand the gated REQs (no wraps,
+      // so no dm pushes) for the life of the socket.
+      const gated = isOwn(url) && ingestSecretKeyBytes() !== null;
+      conn.gatedPendingAuth = gated ? new Set(GATED_SUBS) : new Set();
       const since = await getSince(url);
+      // Closed and redialled while the cursor was read: the new socket's own
+      // open handler owns the connection state now.
+      if (conn.ws !== ws) return;
       conn.reportsSince = since;
+      conn.sinceReady = true;
       // One line per (re)connect: a relay restart that leaves the ingester
       // silently disconnected is visible as its absence.
       console.log(`[ingester] connected to ${isOwn(url) ? "own relay" : "relay"} ${url}`);
@@ -249,10 +266,12 @@ export function startRelayIngester(): { stop: () => Promise<void> } {
         // 1984 (NIP-56 reports) go to the moderation queue (app.reports).
         // The relay serves both only to an authenticated ingest-role socket
         // (docs/DM_WIRE_CONTRACT.md §7.1–7.2, relay report_gate): with a key
-        // configured the REQs wait for the AUTH OK (see the message handler);
+        // configured the REQs wait for the AUTH OK (see the message handler)
+        // — or go now if that OK already landed during the await above;
         // without one they are sent now (dev, or a relay whose gates are off).
-        if (ingestSecretKeyBytes()) {
-          conn.gatedPendingAuth = new Set(GATED_SUBS);
+        if (gated) {
+          const sent = flushGated(conn, ws);
+          if (sent.length > 0) console.log(`[ingester] sent gated REQs (${sent.join(", ")}) after AUTH`);
         } else {
           ws.send(wrapsReq());
           ws.send(reportsReq(since));
@@ -314,6 +333,23 @@ export function startRelayIngester(): { stop: () => Promise<void> } {
 
   function sendGated(conn: Conn, ws: WebSocket, subId: string): void {
     ws.send(subId === "ingester-reports" ? reportsReq(conn.reportsSince) : wrapsReq());
+    conn.gatedSent.add(subId);
+  }
+
+  /** Send the gated REQs that are waiting — plus any never sent on this
+   *  socket, so an AUTH OK always yields them once — when AUTH has completed
+   *  AND the reports cursor is known. Whichever of the two lands last sends.
+   *  Returns the sub ids sent. */
+  function flushGated(conn: Conn, ws: WebSocket): string[] {
+    if (!conn.authed || !conn.sinceReady) return [];
+    const sent: string[] = [];
+    for (const subId of GATED_SUBS) {
+      if (conn.gatedPendingAuth.delete(subId) || !conn.gatedSent.has(subId)) {
+        sendGated(conn, ws, subId);
+        sent.push(subId);
+      }
+    }
+    return sent;
   }
 
   /** NIP-42 on the own relay: answer AUTH challenges with the ingest key,
@@ -337,10 +373,11 @@ export function startRelayIngester(): { stop: () => Promise<void> } {
         // The relay accepted the key — but only RELAY_INGEST_PUBKEYS makes it
         // the ingest ROLE; an unlisted key is an ordinary authed user and the
         // wraps/reports REQs below come back empty (relay logs a warning).
-        console.log(`[ingester] ingest AUTH accepted by ${config.relayUrl}; sending gated REQs (wraps, reports)`);
-        for (const subId of GATED_SUBS) {
-          if (conn.gatedPendingAuth.delete(subId)) sendGated(conn, ws, subId);
-        }
+        const sent = flushGated(conn, ws);
+        console.log(
+          `[ingester] ingest AUTH accepted by ${config.relayUrl}; ` +
+            (sent.length > 0 ? `sent gated REQs (${sent.join(", ")})` : "gated REQs follow once the cursor is read"),
+        );
       } else {
         console.warn(`[ingester] relay rejected ingest AUTH: ${String(msg[3] ?? "")}`);
       }
@@ -352,8 +389,8 @@ export function startRelayIngester(): { stop: () => Promise<void> } {
       if (reason.startsWith("auth-required")) {
         // Sent before AUTH completed: retry after the OK (or immediately if
         // we are already authenticated on this socket).
-        if (conn.authed) sendGated(conn, ws, subId);
-        else conn.gatedPendingAuth.add(subId);
+        conn.gatedPendingAuth.add(subId);
+        flushGated(conn, ws);
       } else {
         console.warn(`[ingester] ${subId} subscription closed: ${reason}`);
       }

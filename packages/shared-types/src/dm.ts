@@ -200,8 +200,14 @@ export interface DMPushData {
   type: "dm";
   /** Deep link the tap opens. */
   url: string;
-  /** The kind-1059 wrap id to fetch and decrypt on device. */
+  /** The kind-1059 wrap id to fetch and decrypt on device — the newest one
+   *  this push stands for. */
   eventId: string;
+  /** Every wrap id this push stands for (≤ 10, newest first; eventIds[0] ===
+   *  eventId). Wraps that reach the backend inside its per-recipient send
+   *  gate fold into one push; fetch them all. Absent from older backends —
+   *  fall back to `[eventId]`. */
+  eventIds?: string[];
   /** Relay to fetch it from (wss://…). */
   relay: string;
 }

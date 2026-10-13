@@ -169,9 +169,10 @@ describe("GET /push/devices (diagnostics)", () => {
     const anon = await server.inject({ method: "GET", url: "/push/devices" });
     expect(anon.statusCode).toBe(401);
 
+    await getRedis().del(`notif:lastdm:${LUNA.pubkey}`, "ingest:lastwrap");
     const empty = await server.inject({ method: "GET", url: "/push/devices", headers: { "x-auth-pubkey": LUNA.pubkey } });
     expect(empty.statusCode).toBe(200);
-    expect(empty.json().data).toEqual({ devices: [], lastError: null });
+    expect(empty.json().data).toEqual({ devices: [], lastError: null, lastDm: null, ingestLastWrapAt: null });
 
     await register(LUNA.pubkey);
     await pushService.recordDeliveryError(LUNA.pubkey, "InvalidCredentials", "no APNs key");
@@ -184,10 +185,31 @@ describe("GET /push/devices (diagnostics)", () => {
 
     // Another account sees nothing of it.
     const other = await server.inject({ method: "GET", url: "/push/devices", headers: { "x-auth-pubkey": MARCUS.pubkey } });
-    expect(other.json().data).toEqual({ devices: [], lastError: null });
+    expect(other.json().data).toEqual({ devices: [], lastError: null, lastDm: null, ingestLastWrapAt: null });
 
     await pushService.clearDeliveryError(LUNA.pubkey);
     expect(await pushService.lastDeliveryError(LUNA.pubkey)).toBeNull();
+  });
+
+  it("names the dm hop: the decision for the caller's newest wrap and when the ingester last took one", async () => {
+    await getRedis().del(`notif:lastdm:${LUNA.pubkey}`, `notif:lastdm:${MARCUS.pubkey}`, "ingest:lastwrap");
+    const before = Date.now();
+    await pushService.recordWrapIngested();
+    await pushService.recordDmOutcome(LUNA.pubkey, "signal");
+    await pushService.recordDmOutcome(LUNA.pubkey, "queued");
+
+    const res = await server.inject({ method: "GET", url: "/push/devices", headers: { "x-auth-pubkey": LUNA.pubkey } });
+    const data = res.json().data;
+    expect(data.lastDm).toEqual({ at: expect.any(Number), outcome: "queued" });
+    expect(data.lastDm.at).toBeGreaterThanOrEqual(before);
+    expect(typeof data.ingestLastWrapAt).toBe("number");
+    expect(data.ingestLastWrapAt).toBeGreaterThanOrEqual(before);
+
+    // lastDm is per account; ingestLastWrapAt is the ingester's, global.
+    const other = await server.inject({ method: "GET", url: "/push/devices", headers: { "x-auth-pubkey": MARCUS.pubkey } });
+    expect(other.json().data.lastDm).toBeNull();
+    expect(other.json().data.ingestLastWrapAt).toBe(data.ingestLastWrapAt);
+    await getRedis().del(`notif:lastdm:${LUNA.pubkey}`, "ingest:lastwrap");
   });
 });
 

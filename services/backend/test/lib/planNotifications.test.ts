@@ -2,8 +2,10 @@ import { describe, it, expect } from "vitest";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools";
 import type { IngestContext, NostrEvent } from "../../src/workers/ingestHandlers.js";
 import {
+  isSignalWrap,
   planNotifications,
   preview,
+  SIGNAL_WRAP_MAX_TTL_SEC,
   threadParentId,
   type PlanDeps,
 } from "../../src/lib/notifications/planNotifications.js";
@@ -261,6 +263,32 @@ describe("planNotifications", () => {
       data: { type: "dm", eventId: "1".repeat(64), relay: "wss://relay.test" },
     });
     expect(JSON.stringify(d)).not.toContain("ciphertext");
+  });
+
+  it("kind 1059: a typing-style wrap (expiring within a minute) plans no push; a call invite and a receipt still do", () => {
+    const now = 1_700_000_000;
+    const wrapExpiring = (inSec: number) =>
+      ev({ kind: 1059, pubkey: "9".repeat(64), tags: [["p", ME], ["expiration", String(now + inSec)]] });
+    // typing (20014): expiration = created_at + 30
+    expect(planNotifications(wrapExpiring(30), own, deps({ nowSec: now }))).toEqual([]);
+    expect(planNotifications(wrapExpiring(SIGNAL_WRAP_MAX_TTL_SEC), own, deps({ nowSec: now }))).toEqual([]);
+    // already expired
+    expect(planNotifications(wrapExpiring(-5), own, deps({ nowSec: now }))).toEqual([]);
+    // call invite (+120 s) and receipt (+7 d) push as before
+    expect(planNotifications(wrapExpiring(120), own, deps({ nowSec: now }))).toHaveLength(1);
+    expect(planNotifications(wrapExpiring(7 * 86_400), own, deps({ nowSec: now }))).toHaveLength(1);
+    // A late-ingested call invite (70 s old) is a stale ring: no push.
+    expect(planNotifications(wrapExpiring(120 - 70), own, deps({ nowSec: now }))).toEqual([]);
+  });
+
+  it("isSignalWrap: no or malformed expiration is a message", () => {
+    const now = 1_700_000_000;
+    const w = (tags: string[][]) => ev({ kind: 1059, tags: [["p", ME], ...tags] });
+    expect(isSignalWrap(w([]), now)).toBe(false);
+    expect(isSignalWrap(w([["expiration", ""]]), now)).toBe(false);
+    expect(isSignalWrap(w([["expiration", "soon"]]), now)).toBe(false);
+    expect(isSignalWrap(w([["expiration", String(now + 30)]]), now)).toBe(true);
+    expect(isSignalWrap(w([["expiration", String(now + 61)]]), now)).toBe(false);
   });
 
   it("releases fan out to watchers with the public title; private ones never", () => {

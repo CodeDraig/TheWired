@@ -1,6 +1,6 @@
 # DM wire contract — The Wired desktop ↔ soot mobile ↔ relay ↔ backend
 
-**Contract version:** `wire_version = 1` · **Document version:** 1.0.1 (2026-09-21)
+**Contract version:** `wire_version = 1` · **Document version:** 1.2.0 (2026-10-12)
 **Owner:** the TheWiredV1 monorepo (server side + `@ishtarservices/core`). soot implements it; it does not change it.
 **Ships in:** `@ishtarservices/shared-types@0.2.0`, `@ishtarservices/core@0.2.0`, `thewired-relay` ≥ 0.2.0, backend ≥ migration 0029.
 
@@ -201,22 +201,35 @@ Sent through the Expo push API to every registered device of the wrap's `p` pubk
   "channelId": "dms",                              // Android
   "categoryId": "dm",
   "mutableContent": true,                          // iOS: wakes the Notification Service Extension
-  "data": { "type": "dm", "url": "soot://dm?segment=messages", "eventId": "<wrap id>", "relay": "wss://relay.thewired.app" }
+  "data": {
+    "type": "dm", "url": "soot://dm?segment=messages",
+    "eventId": "<newest wrap id>",
+    "eventIds": ["<newest wrap id>", "<older wrap id>", …],   // ≤ 10, newest first (1.2.0)
+    "relay": "wss://relay.thewired.app"
+  }
 }
 ```
-`collapseKey = dm:<recipient>`, at most one DM push per recipient per 120 s (existing).
+`collapseKey = dm:<recipient>`. Timing and filtering (backend):
+- **Typing is not pushed.** A wrap whose `expiration` is ≤ 60 s away when the backend ingests it (typing, 20014, `+30`; anything already expired) produces no push. Call invites and media keys (`+120`) and receipts (`+7 d`) still push — the server cannot see kinds; §8.2 demotes them on the phone.
+- **5-s send gate, fold instead of drop.** At most one dm push per recipient per 5 s. Wraps that arrive while the gate is shut are deferred, never dropped: they fold into the next push, whose `eventIds` names them all (newest first, ≤ 10; `eventId` = `eventIds[0]`, kept for older apps). This replaces the 120-s window of 1.0–1.1, which dropped every wrap after the first — a receipt or typing wrap could swallow the message right behind it.
+- **Latency.** A queued dm is dispatched ~1 s after ingest, and a deferred one as soon as its gate lapses; the 30-s tick is only the backstop. A row still unsent after 15 min is dropped (a stale "new message" is worse than none).
+- **Once per wrap.** A wrap id pushes at most once; the ingester's 2-day replay after a reconnect never re-pushes.
+- **Diagnostics.** `GET /push/devices` returns, besides the devices and `lastError` (`{ at, error, message?, stage: "ticket" | "receipt", sentAt? }` — receipt-stage errors are APNs/FCM refusals reported ~15 min after an ok ticket), `lastDm: { at, outcome } | null` — the decision for the caller's newest wrap, `outcome` ∈ `queued` · `prefs` · `no-devices` · `seen` · `signal` — and `ingestLastWrapAt` (unix ms, global, `null` if none): when the ingester last took any wrap from the relay. Stale while dms flow = the ingester's wraps subscription is down.
 
 ### 8.2 iOS Notification Service Extension — what the client needs
-The server never learns the sender or text; the extension decrypts on device. Contract for soot:
-- **Entitlements** on app + extension: `keychain-access-groups: [$(AppIdentifierPrefix)app.soot.shared]`, `com.apple.security.application-groups: [group.app.soot]`. The app stores the active account's nsec in the shared keychain group (`kSecAttrAccessGroup`) and a small **profile-name cache** (`pubkey → displayName, updatedAt`, JSON, ≤ 5 000 entries) plus the preview preference in the App Group container.
+The server never learns the sender or text; the extension decrypts on device. Contract for the iOS app:
+- **Entitlements.** App: `keychain-access-groups: [$(AppIdentifierPrefix)app.soot.mobile, $(AppIdentifierPrefix)app.soot.shared]` — the app's **private group first**: the first entry is the default access group, so ordinary keychain writes (the app's other secrets, libraries that never name a group) land there and not in the group the extension can read. Extension: `keychain-access-groups: [$(AppIdentifierPrefix)app.soot.shared]` only. Both: `com.apple.security.application-groups: [group.app.soot]`.
+- **Shared state.** The app writes a copy of the active account's nsec to the shared group explicitly (`kSecAttrAccessGroup`) with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`: readable by the extension while the phone is locked (after the first unlock since boot), never synced or restored to another device. In the App Group container: a small **profile-name cache** (`pubkey → displayName, updatedAt`, JSON, ≤ 5 000 entries), the preview preference and — if the extension sends receipts (below) — the receipts toggle and the friend set.
 - **Preference** `dmPreview: "none" | "name" | "nameAndText"` (default `name`), also mirrored in `NotificationPreferencesDto` later if we want it server-side (not needed).
-- **Extension flow** (budget 25 s of the 30 s iOS allows): read `data.eventId`, `data.relay`; open a WebSocket to `relay`; answer `AUTH` with a 22242 event signed by the nsec; `REQ {"ids":[eventId]}`; on the event: verify wrap sig, unwrap per §1 (seal sig verify, id recompute), parse per §2. Then set `title` = display name from the cache (else `npub…` short form), `body` = per preference: `none` → "new message"; `name` → "new message"; `nameAndText` → kind 14 text (≤ 120 chars) / kind 15 → "sent a photo|file|voice note" / kind 7 → "reacted <emoji>". Typing, receipts and control rumors (`friend_request_*`, `call_decline`, `call_missed`, `dm_edit`, `dm_delete`, `dm_reaction_remove`) SHOULD be demoted: keep the generic "new message" text but set `interruptionLevel = passive` and no sound (iOS does not let an extension drop a notification). The server cannot see kinds, so it pushes for every non-self wrap; the extension is the only place to tell them apart. If decryption fails or times out, deliver the generic content unchanged.
-- Set `threadIdentifier = conversationId` so iOS groups per conversation. Write the decrypted rumor to an App Group spool file `inbox/<wrapId>.json` so the app can import it on next launch without a network round trip (optional but recommended).
-- Never write plaintext to logs; wipe the spool on logout.
-- Decrypt library: rust-nostr's Swift bindings (`NostrSDK`) provide NIP-44 + `unwrapGiftWrap`; or a ~300-line Swift port of core's unwrap over `secp256k1.swift` + CryptoKit ChaCha20-Poly1305. Either satisfies §1.
+- **Extension flow** (budget 25 s of the 30 s iOS allows): read `data.eventIds` (absent from older backends → `[data.eventId]`) and `data.relay`; open a WebSocket to `relay`; answer `AUTH` with a 22242 event signed by the nsec; `REQ {"ids": eventIds}` — **fetch every id**, a folded push stands for all of them; on each event: verify wrap sig, unwrap per §1 (seal sig verify, id recompute), parse per §2. Describe the newest wrap that unwraps to a message rumor: `title` = display name from the cache (else `npub…` short form), `body` = per preference: `none` → "new message"; `name` → "new message"; `nameAndText` → kind 14 text (≤ 120 chars) / kind 15 → "sent a photo|file|voice note" / kind 7 → "reacted <emoji>". Receipts, media keys and control rumors (`friend_request_*`, `call_decline`, `call_missed`, `dm_edit`, `dm_delete`, `dm_reaction_remove`; typing too, from backends before 1.2.0) SHOULD be demoted: keep the generic "new message" text but set `interruptionLevel = passive` and no sound (iOS does not let an extension drop a notification). If decryption fails or times out, deliver the generic content unchanged.
+- **Delivered receipts.** The extension MAY send the `delivered` receipt (20015, §2) for **1:1 kind-14/15 rumors from friends** when the user has receipts enabled — the same rule the app follows (§2, §9). It records that in the spool (`receiptSent: true`), and the app MUST NOT send a second `delivered` for a wrap the extension already receipted. Rooms, non-friends and every other kind: the app decides, as before.
+- **Spool.** Write every fetched wrap — the **raw wrap** (the kind-1059 event as received, ciphertext), never the decrypted rumor — to the App Group file `inbox/<wrapId>.json` = `{ "v": 1, "p": <recipient pubkey>, "wrap": <event>, "receiptSent": <bool>, "at": <unix ms written> }`. The app imports spool files through its normal wrap pipeline (signature check, §1 unwrap, dedupe by wrap id; `p` picks the account) on launch / foreground, then deletes them. Replaces the decrypted-rumor spool of 1.0–1.1, so no plaintext is ever written outside the app's own store.
+- Set `threadIdentifier = conversationId` so iOS groups per conversation.
+- Never write plaintext to logs; wipe the spool and the shared nsec copy on logout.
+- **Decrypt library.** NIP-44 v2 is **ChaCha20 + HMAC-SHA256** (HKDF-derived keys, encrypt-then-MAC) — not ChaCha20-Poly1305. Options: rust-nostr's Swift bindings (`NostrSDK`, NIP-44 + `unwrapGiftWrap`); a Swift port of core's unwrap over `secp256k1.swift` + CryptoKit (HKDF, HMAC; CryptoKit exposes ChaCha20 only inside ChaChaPoly, so a port brings its own ChaCha20); or — what the reference client does — core's own functions run in JavaScriptCore inside the extension, one implementation shared with the app. Any of these satisfies §1.
 
 ### 8.3 Android
-FCM (via Expo) high-priority data message; expo-notifications background task receives it and runs the same unwrap in JS with the app's normal core; then posts a local notification with the same rules as §8.2.
+FCM (via Expo) high-priority data message; expo-notifications background task receives it and runs the same unwrap in JS with the app's normal core over every id in `data.eventIds` (else `[data.eventId]`); then posts a local notification with the same rules as §8.2.
 
 ## 9. Friend requests and message requests
 Wire unchanged (`friend_request*` typed rumors, `docs/nips/NIP-XX-Friend-Requests.md`). Client policy, both apps: non-friends land in a **requests** tray; no typing, no receipts, no push preview (the NSE shows the generic text) until accepted; accepting = `friend_request_accept`. Server-side `notification_preferences.friendRequests` is honoured once the planner emits that type (it does not today; tracked separately).
@@ -233,19 +246,20 @@ The July-2026 restructure of the spec (`github.com/marmot-protocol/marmot`, `tra
 
 Plan: (1) on login publish a 30443 with a signing key distinct from the nsec (kept in the keystore); (2) new conversations check the peer's 30443 → start a 2-member MLS group (444 welcome) else NIP-17; (3) rooms > 10 are Marmot-only; (4) each device is its own MLS leaf → "link devices" UX and history transfer are product work, not protocol work; (5) libraries: MDK (Rust, via Tauri command on desktop; UniFFI/native module on mobile) or marmot-ts. Blocked on: the `conversationId` refactor (done in wire_version 1), encrypted media (done), and the audit gate in `NIP17_GROUP_ROOMS.md`.
 
-## 11. Implementation status (monorepo side, 2026-09-21)
+## 11. Implementation status (monorepo side, 2026-10-12)
 
 | Layer | Status |
 |---|---|
 | `@ishtarservices/shared-types@0.2.0` | `DM_KINDS`, `DM_RUMOR_KINDS`, `DMControlType`, `DMFileMeta`, `DMReadStateRecordV2`, `DMPushData`, `DM_EXPIRATION_SECONDS`, `DM_EDIT_WINDOW_SECONDS` |
 | `@ishtarservices/core@0.2.0` | `unwrapGiftWrap` hardened (seal sig, rumor-id recompute, kind allowlist, expiration); `buildRumor`/wraps take `kind` + `expiration`; `parseDMWire` + `*RumorTags` builders; `conversationIdOf`; `encryptDMFile`/`decryptDMFile`; read-state v2 merge; `Negentropy` client+responder (NIP-77); room wraps take `extraTags`/`kind`/`expiration`/`noSelfWrap` |
 | relay 0.2.0 | §7 complete: 1059 gate (`RELAY_WRAP_AUTH_GATE`), ingest role, `self_published`, NIP-40 + sweeper, NIP-77, per-connection + per-IP limits, NIP-11 |
-| backend | ingester AUTHs with `INGEST_SECRET_KEY`; self-published wraps never queue; dm push carries `DMPushData` + `mutableContent` + `categoryId`; `/push/suppress` deprecated no-op |
+| backend | ingester AUTHs with `INGEST_SECRET_KEY` (gated REQs survive an AUTH OK that lands before the cursor read); self-published and typing wraps never queue; dm push carries `DMPushData` (+ `eventIds`) + `mutableContent` + `categoryId`; 5-s per-recipient fold gate, dispatch ~1 s after ingest; `GET /push/devices` reports `lastDm`, `ingestLastWrapAt` and receipt-stage errors; `/push/suppress` deprecated no-op |
 | desktop | writes the spec form (`e` replies, kind 7, kind 15), reads both; typing/receipts (friends, opt-out); pin/archive/mute/disappearing via read-state v2; rooms (≤10, `g` id); block = kind-10000; AUTH `CLOSED` → re-REQ; NIP-77 inbox reconcile every 15 min. Desktop does **not** republish `have` ids (it keeps no wrap ciphertext), so §7.5 step 5 is mobile-only for now. AI summarize/ask gated by a per-session consent dialog for remote providers. |
-| iOS NSE | soot's — contract only (§8.2) |
+| iOS NSE | in progress (§8.2) |
 | Marmot | §10 plan only |
 
 ## 12. Change log
+- **1.2.0 (2026-10-12)** — push timing and the iOS extension (§8); no wire change. Backend: typing-style wraps (`expiration` ≤ 60 s away) are no longer pushed; the 120-s per-recipient drop window becomes a 5-s send gate that defers and folds (nothing dropped); a dm is dispatched ~1 s after ingest; push `data.eventIds` names every folded wrap (`DMPushData.eventIds`, optional); `GET /push/devices` gains `lastDm`, `ingestLastWrapAt` and receipt-stage `lastError`s. Extension (§8.2): fetch every id in `eventIds`; MAY send `delivered` for 1:1 kind-14/15 rumors from friends (the app must not repeat it); the spool holds the raw wrap (`{v:1, p, wrap, receiptSent, at}`) instead of the decrypted rumor; the app's private keychain group comes first and the extension gets only the shared one; the shared nsec copy is after-first-unlock-this-device-only; decrypt note corrected (NIP-44 v2 = ChaCha20 + HMAC-SHA256).
 - **1.1.0 (2026-09-25)** — frame-level E2EE for calls and channels (docs/E2EE_CALLS.md): `caps.e2ee` on `call_invite` (invites without it are declined), new rumor kind **20016 media key** (per-sender LiveKit keys for channels, 120-s expiry, no self-wrap), `DM_RUMOR_KINDS` gains 20016, `DM_EXPIRATION_SECONDS.mediaKey`. Backend `/voice/token` + `/voice/dm-token` require `supportsE2EE: true` (409 `E2EE_REQUIRED` otherwise). shared-types/core 0.4.0.
 - **1.0.1 (2026-09-21)** — clarified the stable `auth-required:` prefix and strfry's `negentropy disabled` NOTICE (§7.1, §7.5). No wire change.
 - **1.0.0 (2026-09-21)** — initial contract: seal verification + rumor-id recompute, kinds 15/7/20014/20015, `e` replies, expiration table, read-state v2 with merge + tombstones, relay AUTH gate / NIP-40 / NIP-77 / rate limits, `self_published` replaces `/push/suppress`, NSE contract, Marmot kinds corrected to 30443/444/445.

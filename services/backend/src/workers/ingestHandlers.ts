@@ -9,7 +9,9 @@ import { getMeilisearchClient } from "../lib/meilisearch.js";
 import { verifyEvent } from "../lib/nostr/eventVerifier.js";
 import { parseZapSats } from "../lib/nostr/zapAmount.js";
 import { enqueueNotification } from "../services/notificationEnqueue.js";
+import { pushService } from "../services/pushService.js";
 import {
+  isSignalWrap,
   KIND_GIFT_WRAP,
   planNotifications,
   preview,
@@ -236,7 +238,11 @@ export async function processEvent(event: NostrEvent, ctx: IngestContext): Promi
       await indexGroupMembers(event);
       break;
     case "giftWrap":
-      break; // notification-only (see emitNotifications)
+      // Notification-only (see emitNotifications). The timestamp is what
+      // GET /push/devices shows as ingestLastWrapAt: proof the gated wraps
+      // REQ is live.
+      await pushService.recordWrapIngested();
+      break;
     case "report":
       await indexReport(event);
       break;
@@ -385,7 +391,16 @@ export async function isSelfPublishedWrap(eventId: string): Promise<boolean> {
 export async function emitNotifications(event: NostrEvent, ctx: IngestContext): Promise<void> {
   if (!ctx.isOwnRelay || !NOTIFYING_KINDS.has(event.kind)) return;
   try {
-    if (event.kind === KIND_GIFT_WRAP && (await isSelfPublishedWrap(event.id))) return;
+    if (event.kind === KIND_GIFT_WRAP) {
+      if (await isSelfPublishedWrap(event.id)) return;
+      // A typing wrap never pushes (planNotifications agrees); say so for
+      // the recipient's diagnostics and skip the plan lookups.
+      const recipient = getTagValue(event, "p");
+      if (recipient && isSignalWrap(event, Math.floor(Date.now() / 1000))) {
+        await pushService.recordDmOutcome(recipient, "signal");
+        return;
+      }
+    }
     const deps = await collectPlanDeps(event);
     const intents = planNotifications(event, ctx, deps);
     for (const intent of intents) {
