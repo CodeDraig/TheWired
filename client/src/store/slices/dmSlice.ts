@@ -15,6 +15,12 @@ import type {
   DMReceiptStatus,
 } from "@ishtarservices/shared-types";
 
+/** Own message delivery, matching the mobile app: `pending` until a relay
+ *  answers OK for the recipient's wrap, `sent` once one does, `failed` when
+ *  every relay refused or none answered in time. Absent = sent (history rows,
+ *  rows from before this field). */
+export type DMSendStatus = "pending" | "sent" | "failed";
+
 export interface DMMessage {
   id: string;
   senderPubkey: string;
@@ -59,6 +65,8 @@ export interface DMMessage {
   /** The self-wrap failed to publish: this message may never reach our other
    *  devices (docs/DM_WIRE_CONTRACT.md §1). */
   syncWarning?: boolean;
+  /** Own messages sent from this device: see DMSendStatus. */
+  status?: DMSendStatus;
   /** Friends who acknowledged this rumor (kind-20015 receipts). */
   deliveredTo?: string[];
   readBy?: string[];
@@ -303,6 +311,17 @@ export const dmSlice = createSlice({
     ) {
       const { partnerPubkey, message, myPubkey } = action.payload;
       const isOwnMessage = message.senderPubkey === myPubkey;
+
+      // A relay serving our own wrap back (live or on resync) proves it stored
+      // the message: rescue a pending/failed original whose OK frame was lost,
+      // or that restored as failed after a relaunch.
+      if (isOwnMessage && message.status === undefined) {
+        const existing = state.messages[partnerPubkey]?.find((m) => m.wrapId === message.wrapId);
+        if (existing?.status && existing.status !== "sent") {
+          existing.status = "sent";
+          state.mutationCounter += 1;
+        }
+      }
 
       // O(1) dedup via lookup map
       if (state.processedWrapIdSet[message.wrapId]) return;
@@ -650,6 +669,16 @@ export const dmSlice = createSlice({
       state.mutationCounter += 1;
     },
 
+    /** A relay answered (or none did in time) for an own message's recipient
+     *  wrap. Only a pending row moves; an echo may have settled it first. */
+    dmSendResolved(state, action: PayloadAction<{ partnerPubkey: string; wrapId: string; ok: boolean }>) {
+      const { partnerPubkey, wrapId, ok } = action.payload;
+      const msg = state.messages[partnerPubkey]?.find((m) => m.wrapId === wrapId);
+      if (!msg || msg.status !== "pending") return;
+      msg.status = ok ? "sent" : "failed";
+      state.mutationCounter += 1;
+    },
+
     /** Flag (or clear) a message whose self-wrap did not publish. */
     markDMSyncWarning(state, action: PayloadAction<{ partnerPubkey: string; wrapId: string; warning: boolean }>) {
       const { partnerPubkey, wrapId, warning } = action.payload;
@@ -764,11 +793,14 @@ export const dmSlice = createSlice({
         const BASE64_ONLY = /^[A-Za-z0-9+/=]+$/;
         const cleaned: Record<string, DMMessage[]> = {};
         for (const [pubkey, msgs] of Object.entries(messages)) {
-          const valid = msgs.filter(
-            (m) =>
-              typeof m.content === "string" &&
-              !(m.content.length > 50 && BASE64_ONLY.test(m.content)),
-          );
+          const valid = msgs
+            .filter(
+              (m) =>
+                typeof m.content === "string" &&
+                !(m.content.length > 50 && BASE64_ONLY.test(m.content)),
+            )
+            // A send still pending from a previous session will never resolve.
+            .map((m) => (m.status === "pending" ? { ...m, status: "failed" as const } : m));
           if (valid.length > 0) cleaned[pubkey] = valid;
         }
         state.messages = cleaned;
@@ -818,6 +850,7 @@ export const dmSlice = createSlice({
 
 export const {
   addDMMessage,
+  dmSendResolved,
   markDMWrapProcessed,
   setActiveConversation,
   markConversationRead,

@@ -1,5 +1,5 @@
 import { useRef, useMemo, useState, useCallback, memo } from "react";
-import { SmilePlus, Check, CheckCheck, AlertTriangle, Timer } from "lucide-react";
+import { SmilePlus, Check, CheckCheck, AlertTriangle, AlertCircle, Clock, Timer } from "lucide-react";
 import { DM_EDIT_WINDOW_SECONDS } from "@ishtarservices/shared-types";
 import { DMFileAttachment } from "./DMFileAttachment";
 import { RichContent } from "@/components/content/RichContent";
@@ -17,6 +17,8 @@ import type { DMMessage as DMMessageType } from "@/store/slices/dmSlice";
 
 const URL_RE = /https?:\/\/\S+/;
 
+const RECEIPT_TITLE = { sent: "Sent", delivered: "Delivered", read: "Read" } as const;
+
 interface DMMessageProps {
   message: DMMessageType;
   partnerPubkey: string;
@@ -27,6 +29,8 @@ interface DMMessageProps {
   onReply?: (message: DMMessageType) => void;
   /** Add (remove=false) or remove (remove=true) our emoji reaction. */
   onReact?: (message: DMMessageType, emoji: string, remove: boolean) => void;
+  /** Send a failed own message again. */
+  onResend?: (message: DMMessageType) => void;
   /** All messages in the conversation, for looking up reply targets */
   allMessages?: DMMessageType[];
   onJumpToMessage?: (wrapId: string) => void;
@@ -44,6 +48,7 @@ export const DMMessage = memo(function DMMessage({
   onDeleteForEveryone,
   onReply,
   onReact,
+  onResend,
   allMessages,
   onJumpToMessage,
   isRoom,
@@ -104,11 +109,16 @@ export const DMMessage = memo(function DMMessage({
   // Advisory edit window (docs/DM_WIRE_CONTRACT.md §2): 24 h, UI only.
   const canEdit = isMe && !message.isDeleted &&
     (Math.floor(Date.now() / 1000) - message.createdAt) <= DM_EDIT_WINDOW_SECONDS;
-  const readCount = message.readBy?.length ?? 0;
-  const deliveredCount = message.deliveredTo?.length ?? 0;
+  // Own message state, as on mobile: sending (no relay has answered yet) →
+  // sent (a relay accepted it) → delivered / read (receipts); failed when
+  // every relay refused or none answered in time. Rows without a status
+  // (history, older rows) count as sent.
+  const sendStatus = message.status ?? "sent";
+  const receipt: "sent" | "delivered" | "read" =
+    (message.readBy?.length ?? 0) > 0 ? "read" : (message.deliveredTo?.length ?? 0) > 0 ? "delivered" : "sent";
   // Receipt / sync glyphs render even inside a grouped run (the time does not),
   // otherwise a read mark on the last message of a run is invisible.
-  const hasStatusGlyph = isMe && (!!message.syncWarning || readCount > 0 || deliveredCount > 0);
+  const hasStatusGlyph = isMe;
 
   // Deleted message placeholder
   if (message.isDeleted) {
@@ -231,13 +241,40 @@ export const DMMessage = memo(function DMMessage({
                 <AlertTriangle size={10} />
               </span>
             )}
-            {isMe && !message.syncWarning && (readCount > 0 || deliveredCount > 0) && (
+            {isMe && sendStatus === "pending" && (
+              <span title="Sending…" className="inline-flex items-center" data-testid="dm-sending">
+                <Clock size={10} />
+              </span>
+            )}
+            {isMe && sendStatus === "failed" && (
+              <>
+                <span
+                  title="Not sent — no relay accepted this message"
+                  className="inline-flex items-center gap-0.5 text-red-400"
+                  data-testid="dm-failed"
+                >
+                  <AlertCircle size={10} />
+                  Failed
+                </span>
+                {onResend && (
+                  <button
+                    type="button"
+                    onClick={() => onResend(message)}
+                    className="text-muted underline hover:text-heading"
+                    data-testid="dm-resend"
+                  >
+                    Resend
+                  </button>
+                )}
+              </>
+            )}
+            {isMe && sendStatus === "sent" && !message.syncWarning && (
               <span
-                title={readCount > 0 ? "Read" : "Delivered"}
-                className={`inline-flex items-center ${readCount > 0 ? "text-primary" : ""}`}
-                data-testid={readCount > 0 ? "dm-read" : "dm-delivered"}
+                title={RECEIPT_TITLE[receipt]}
+                className={`inline-flex items-center ${receipt === "read" ? "text-primary" : ""}`}
+                data-testid={`dm-${receipt}`}
               >
-                {readCount > 0 ? <CheckCheck size={11} /> : <Check size={11} />}
+                {receipt === "sent" ? <Check size={11} /> : <CheckCheck size={11} />}
               </span>
             )}
           </div>
