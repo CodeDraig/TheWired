@@ -1,4 +1,4 @@
-import { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import { join, resolve } from "node:path";
 import { mkdir, stat, unlink, rename } from "node:fs/promises";
 import { createReadStream, createWriteStream } from "node:fs";
@@ -6,11 +6,15 @@ import { createHash } from "node:crypto";
 import { eq, and, desc, lt } from "drizzle-orm";
 import { db } from "../db/connection.js";
 import { blobs, blobOwners } from "../db/schema/blobs.js";
+import { spaces } from "../db/schema/spaces.js";
 import { config } from "../config.js";
 import { nanoid } from "../lib/id.js";
 import { verifyBlossomAuth } from "../middleware/blossomAuth.js";
-import { getProtectedRefsForBlob, authorizeProtectedRefs } from "../services/blobAccess.js";
-import { verifyMediaTokenDetailed } from "../lib/mediaToken.js";
+import { authorizeBlobRead, invalidateBlobScope } from "../services/blobReadAccess.js";
+import { isDenylisted, recordBlobOwner } from "../services/blobStore.js";
+import { spacesMemberOf } from "../services/musicVisibility.js";
+import { blobDescriptorUrl, blobServePolicy, OCTET_STREAM, sniffBlobType } from "../lib/blobMime.js";
+import { recordUploadBytes, takeUploadSlot, uploadQuota } from "../lib/uploadGuard.js";
 import { parseRange } from "../lib/httpRange.js";
 import {
   coverVariantPath,
@@ -24,8 +28,48 @@ import {
 const BLOB_DIR = resolve(process.cwd(), config.blobDir);
 const MAX_BLOB_SIZE = config.maxBlobSize;
 const SHA256_REGEX = /^([0-9a-f]{64})(?:\.\w+)?$/;
+const HEX64_RE = /^[0-9a-f]{64}$/;
 /** How long a sized request waits for a lazy render before taking the original. */
 const LAZY_VARIANT_WAIT_MS = 2000;
+/** A gated (non-public) blob may only sit in the viewer's own cache. */
+const GATED_CACHE_CONTROL = "private, max-age=86400";
+const PUBLIC_CACHE_CONTROL = "public, max-age=31536000, immutable";
+/** Spaces whose media the backend can gate: the ones only The Wired apps
+ *  join. NIP-29-native groups are read by other clients that can't present a
+ *  grant, so their media is uploaded unscoped (docs/MEDIA_STORAGE.md §1). */
+const GATEABLE_SPACE_MODES: ReadonlySet<string> = new Set(["platform", "decentralized"]);
+
+function tooManyUploads(reply: FastifyReply, retryAfter: number, error: string) {
+  return reply
+    .status(429)
+    .header("Retry-After", String(retryAfter))
+    .header("X-Reason", error === "upload_rate_limited" ? "Upload rate exceeded" : "Daily upload quota exceeded")
+    .send({ error });
+}
+
+function denylisted(reply: FastifyReply) {
+  return reply.status(451).header("X-Reason", "Blob removed by moderation").send({ error: "blob_denylisted" });
+}
+
+/** Why a scoped upload into `spaceId` by `pubkey` is refused, or null: only
+ *  into a space the backend gates (422), and only by a member (403). */
+async function scopedUploadRejection(
+  spaceId: string,
+  pubkey: string,
+): Promise<{ status: 403 | 422; error: string; reason: string } | null> {
+  const [space] = await db
+    .select({ spaceMode: spaces.spaceMode })
+    .from(spaces)
+    .where(eq(spaces.id, spaceId))
+    .limit(1);
+  if (!space || !GATEABLE_SPACE_MODES.has(space.spaceMode)) {
+    return { status: 422, error: "space_not_gateable", reason: "Space media can't be gated" };
+  }
+  if (!(await spacesMemberOf([spaceId], pubkey)).has(spaceId)) {
+    return { status: 403, error: "not_a_member", reason: "Not a member of the space" };
+  }
+  return null;
+}
 
 export async function blossomRoutes(server: FastifyInstance) {
   // Blossom PUT /upload sends raw binary bodies with arbitrary content types.
@@ -47,26 +91,19 @@ export async function blossomRoutes(server: FastifyInstance) {
       return reply.status(404).header("X-Reason", "Blob not found").send();
     }
 
-    // Access control: a blob referenced by a protected (private/unlisted/space) music
-    // event requires either a valid capability token (?tk=, for header-less <audio>/HLS)
-    // or an authorized viewer (NIP-98 → X-Auth-Pubkey). 404 on denial to hide existence.
-    const protectedRefs = await getProtectedRefsForBlob(sha256);
-    if (protectedRefs.length > 0) {
-      const tk = (request.query as { tk?: string }).tk;
-      const verdict = verifyMediaTokenDetailed(sha256, tk);
-      if (verdict !== "valid") {
-        const authPubkey = (request as any).pubkey as string | undefined;
-        const allowed = await authorizeProtectedRefs(protectedRefs, authPubkey);
-        if (!allowed) {
-          // A well-formed token whose only fault is its age gets an explicit
-          // 401 so the client re-mints via /music/access instead of treating
-          // the track as gone. Garbage / foreign tokens stay 404 (hide existence).
-          if (verdict === "expired") {
-            return reply.status(401).header("Cache-Control", "no-store").send({ error: "token_expired" });
-          }
-          return reply.status(404).send();
-        }
+    // Read gate (services/blobReadAccess.ts): music + space scope. 404 on
+    // denial hides existence; a correctly signed but EXPIRED token (music token
+    // or viewer grant) gets 401 so the client re-mints instead of giving up.
+    const tk = (request.query as { tk?: unknown }).tk;
+    const access = await authorizeBlobRead(sha256, {
+      tk: typeof tk === "string" ? tk : null,
+      authPubkey: (request as { pubkey?: string }).pubkey ?? null,
+    });
+    if (!access.ok) {
+      if (access.reason === "token_expired") {
+        return reply.status(401).header("Cache-Control", "no-store").send({ error: "token_expired" });
       }
+      return reply.status(404).send();
     }
 
     const filePath = join(BLOB_DIR, sha256);
@@ -77,10 +114,16 @@ export async function blossomRoutes(server: FastifyInstance) {
       return reply.status(404).header("X-Reason", "Blob not found on disk").send();
     }
 
-    const isProtected = protectedRefs.length > 0;
-    const contentType = blob.type ?? "application/octet-stream";
-    // Protected content must never be cached by a shared cache; public blobs are immutable.
-    let cacheControl = isProtected ? "private, no-store" : "public, max-age=31536000, immutable";
+    const gated = access.gated;
+    // The stored type is sniffed at upload; the policy maps anything that
+    // isn't servable media to an octet-stream attachment (lib/blobMime.ts).
+    const policy = blobServePolicy(blob.type);
+    const contentType = policy.contentType;
+    reply.header("X-Content-Type-Options", "nosniff");
+    if (policy.sandbox) reply.header("Content-Security-Policy", "sandbox");
+    if (policy.attachment) reply.header("Content-Disposition", "attachment");
+    // Gated content must never be cached by a shared cache; public blobs are immutable.
+    let cacheControl = gated ? GATED_CACHE_CONTROL : PUBLIC_CACHE_CONTROL;
 
     // Sized cover art: `?w=` picks a resized variant (same gate as above, so
     // `?w=256&tk=…` works). A cover that predates variants is rendered on its
@@ -104,7 +147,7 @@ export async function blossomRoutes(server: FastifyInstance) {
       if (size !== null) {
         const etag = `"${sha256}-${width}.${format}"`;
         reply
-          .header("Cache-Control", isProtected ? "private, max-age=3600" : "public, max-age=31536000, immutable")
+          .header("Cache-Control", cacheControl)
           .header("ETag", etag);
         if (request.headers["if-none-match"] === etag) return reply.status(304).send();
         return reply
@@ -112,7 +155,7 @@ export async function blossomRoutes(server: FastifyInstance) {
           .header("Content-Length", size)
           .send(createReadStream(variantPath));
       }
-      cacheControl = isProtected ? "private, max-age=60" : "public, max-age=60";
+      cacheControl = gated ? "private, max-age=60" : "public, max-age=60";
     }
 
     // Range support (seeking on large audio) — applied AFTER the access check above.
@@ -167,6 +210,8 @@ export async function blossomRoutes(server: FastifyInstance) {
     if (deleted.length === 0) {
       return reply.status(404).header("X-Reason", "Blob not found or not owned by you").send();
     }
+    // This owner's blob_scopes rows went with it (FK cascade).
+    invalidateBlobScope(sha256);
 
     // Check if any owners remain
     const remaining = await db
@@ -188,6 +233,8 @@ export async function blossomRoutes(server: FastifyInstance) {
   });
 
   // ---- BUD-02: PUT /upload -- Upload blob ----
+  // Without an `h` tag the uploader becomes a `public` owner; with one, a
+  // `scoped` owner whose space gates reads (docs/MEDIA_STORAGE.md §3).
   server.put("/upload", async (request, reply) => {
     const auth = verifyBlossomAuth(request, "upload");
     if (!auth.ok) {
@@ -195,8 +242,31 @@ export async function blossomRoutes(server: FastifyInstance) {
     }
 
     const pubkey = auth.pubkey;
-    const contentType = (request.headers["content-type"] as string) ?? "application/octet-stream";
+    const spaceId = auth.hTags[0] ?? null;
     const declaredHash = request.headers["x-sha-256"] as string | undefined;
+
+    // Abuse guard: uploads per minute, then the day's byte quota.
+    const slot = await takeUploadSlot(pubkey);
+    if (!slot.ok) return tooManyUploads(reply, slot.retryAfter, "upload_rate_limited");
+    const quota = await uploadQuota(pubkey);
+    const declaredLength = Number(request.headers["content-length"]);
+    if (quota.remaining <= 0 || (Number.isFinite(declaredLength) && declaredLength > quota.remaining)) {
+      return tooManyUploads(reply, quota.retryAfter, "upload_quota_exceeded");
+    }
+
+    // A moderator-removed sha named up front is refused before its bytes are
+    // read; the computed hash is checked again below.
+    const namedHash = declaredHash ?? (auth.xTags.length === 1 ? auth.xTags[0] : undefined);
+    if (namedHash && HEX64_RE.test(namedHash) && (await isDenylisted(namedHash))) {
+      return denylisted(reply);
+    }
+
+    if (spaceId) {
+      const rejection = await scopedUploadRejection(spaceId, pubkey);
+      if (rejection) {
+        return reply.status(rejection.status).header("X-Reason", rejection.reason).send({ error: rejection.error });
+      }
+    }
 
     // Ensure blob directory exists
     await mkdir(BLOB_DIR, { recursive: true });
@@ -213,6 +283,11 @@ export async function blossomRoutes(server: FastifyInstance) {
         writeStream.destroy();
         await unlink(tempPath).catch(() => {});
         return reply.status(413).header("X-Reason", "File too large").send();
+      }
+      if (size > quota.remaining) {
+        writeStream.destroy();
+        await unlink(tempPath).catch(() => {});
+        return tooManyUploads(reply, quota.retryAfter, "upload_quota_exceeded");
       }
       hash.update(chunk);
       writeStream.write(chunk);
@@ -236,36 +311,43 @@ export async function blossomRoutes(server: FastifyInstance) {
       return reply.status(403).header("X-Reason", "Auth x-tag does not match blob hash").send();
     }
 
-    // Dedup: check if blob already exists
-    const [existing] = await db.select().from(blobs).where(eq(blobs.sha256, sha256)).limit(1);
-    if (existing) {
+    if (await isDenylisted(sha256)) {
       await unlink(tempPath).catch(() => {});
-      await db.insert(blobOwners).values({ sha256, pubkey }).onConflictDoNothing();
-
-      return reply.status(200).send({
-        url: `${config.publicUrl}/${sha256}`,
-        sha256,
-        size: existing.size,
-        type: existing.type ?? contentType,
-        uploaded: existing.uploaded,
-      });
+      return denylisted(reply);
     }
 
-    // Rename temp to final
     const finalPath = join(BLOB_DIR, sha256);
-    await rename(tempPath, finalPath);
+    let [row] = await db.select().from(blobs).where(eq(blobs.sha256, sha256)).limit(1);
+    let created = false;
+    if (row) {
+      // Dedup. The row can outlive its file (a failed write, a manual
+      // cleanup); these bytes hash to the same sha, so they restore it.
+      const onDisk = await stat(finalPath).then(() => true, () => false);
+      if (onDisk) await unlink(tempPath).catch(() => {});
+      else await rename(tempPath, finalPath);
+    } else {
+      // The stored type comes from the bytes; the client's Content-Type is
+      // only a hint for what the sniffer can't identify (lib/blobMime.ts).
+      const type = await sniffBlobType(tempPath, request.headers["content-type"]);
+      await rename(tempPath, finalPath);
+      const uploaded = Math.floor(Date.now() / 1000);
+      // DO NOTHING on conflict: an identical upload running concurrently may
+      // have inserted the row first, and both uploads succeed.
+      const inserted = await db.insert(blobs).values({ sha256, size, type, uploaded }).onConflictDoNothing().returning();
+      created = inserted.length > 0;
+      [row] = created ? inserted : await db.select().from(blobs).where(eq(blobs.sha256, sha256)).limit(1);
+      row ??= { sha256, size, type, uploaded };
+    }
 
-    const uploaded = Math.floor(Date.now() / 1000);
+    await recordBlobOwner(sha256, pubkey, spaceId ? { state: "scoped", spaceId } : { state: "public" });
+    await recordUploadBytes(pubkey, size);
 
-    await db.insert(blobs).values({ sha256, size, type: contentType, uploaded });
-    await db.insert(blobOwners).values({ sha256, pubkey });
-
-    return reply.status(201).send({
-      url: `${config.publicUrl}/${sha256}`,
+    return reply.status(created ? 201 : 200).send({
+      url: blobDescriptorUrl(sha256, row.type),
       sha256,
-      size,
-      type: contentType,
-      uploaded,
+      size: row.size,
+      type: row.type ?? OCTET_STREAM,
+      uploaded: row.uploaded,
     });
   });
 
@@ -288,6 +370,13 @@ export async function blossomRoutes(server: FastifyInstance) {
     if (contentLength > MAX_BLOB_SIZE) {
       return reply.status(413).header("X-Reason", "File too large").send();
     }
+    // The same refusals PUT would give, before any bytes move.
+    if (await isDenylisted(declaredHash)) {
+      return reply.status(451).header("X-Reason", "Blob removed by moderation").send();
+    }
+    const spaceId = auth.hTags[0];
+    const rejection = spaceId ? await scopedUploadRejection(spaceId, auth.pubkey) : null;
+    if (rejection) return reply.status(rejection.status).header("X-Reason", rejection.reason).send();
 
     const [existing] = await db.select().from(blobs).where(eq(blobs.sha256, declaredHash)).limit(1);
     if (existing) {
@@ -337,10 +426,10 @@ export async function blossomRoutes(server: FastifyInstance) {
       .orderBy(desc(blobs.uploaded))
       .limit(maxLimit);
     const descriptors = rows.map((row) => ({
-      url: `${config.publicUrl}/${row.sha256}`,
+      url: blobDescriptorUrl(row.sha256, row.type),
       sha256: row.sha256,
       size: row.size,
-      type: row.type ?? "application/octet-stream",
+      type: row.type ?? OCTET_STREAM,
       uploaded: row.uploaded,
     }));
 

@@ -94,6 +94,45 @@ func TestRouter_StripsCORSFromBackend(t *testing.T) {
 	}
 }
 
+// Gated media is fetched by header-less <img>/<video>/HLS players, so the
+// grant or music token rides in `?tk=`: the blob and HLS handlers must forward
+// the query untouched, for HEAD probes as well as GETs (docs/MEDIA_STORAGE.md §4–5).
+func TestNewBlossomHandler_ForwardsTokenQueryOnGetAndHead(t *testing.T) {
+	type seen struct{ method, path, tk, w string }
+	var got seen
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = seen{r.Method, r.URL.Path, r.URL.Query().Get("tk"), r.URL.Query().Get("w")}
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	handler := NewBlossomHandler(backend.URL)
+	hash := "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+	grant := "v1." + hash + ".1790000000." + hash
+	tests := []struct {
+		method, target string
+		want           seen
+	}{
+		{"GET", "/" + hash + ".jpg?tk=" + grant, seen{"GET", "/" + hash + ".jpg", grant, ""}},
+		{"HEAD", "/" + hash + "?tk=" + grant, seen{"HEAD", "/" + hash, grant, ""}},
+		{"GET", "/" + hash + "?w=256&tk=" + grant, seen{"GET", "/" + hash, grant, "256"}},
+		{"GET", "/hls/" + hash + "/128k/seg_00000.m4s?tk=" + grant, seen{"GET", "/hls/" + hash + "/128k/seg_00000.m4s", grant, ""}},
+	}
+	for _, tt := range tests {
+		got = seen{}
+		req := httptest.NewRequest(tt.method, "http://gateway"+tt.target, nil)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("%s %s: status %d", tt.method, tt.target, rr.Code)
+		}
+		if got != tt.want {
+			t.Errorf("%s %s: backend saw %+v, want %+v", tt.method, tt.target, got, tt.want)
+		}
+	}
+}
+
 func TestNewBlossomHandler_PassesPathThrough(t *testing.T) {
 	var receivedPath string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

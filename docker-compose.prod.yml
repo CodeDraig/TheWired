@@ -171,6 +171,16 @@ services:
       # refuses to mint with an empty secret under NODE_ENV=production, so a
       # missing value = every private/space track fails to play. Required.
       MEDIA_TOKEN_SECRET: ${MEDIA_TOKEN_SECRET:?Set MEDIA_TOKEN_SECRET in .env (openssl rand -hex 32)}
+      # Media storage (docs/MEDIA_STORAGE.md). SPACE_MEDIA_GATE: read gate for
+      # space-scoped blobs — `log` serves would-be denials and logs them,
+      # `enforce` denies, `off` skips the scope check. BLOSSOM_SERVER_NAMES:
+      # hostnames accepted in a kind-24242 `server` tag (default: PUBLIC_URL's).
+      # The upload guard caps BUD-02 uploads per pubkey: per minute and bytes
+      # per UTC day.
+      SPACE_MEDIA_GATE: ${SPACE_MEDIA_GATE:-log}
+      BLOSSOM_SERVER_NAMES: ${BLOSSOM_SERVER_NAMES:-}
+      UPLOAD_RATE_PER_MIN: ${UPLOAD_RATE_PER_MIN:-30}
+      UPLOAD_DAILY_BYTES: ${UPLOAD_DAILY_BYTES:-2147483648}
       # Transcoding pipeline — both flags on by default. Roll back by setting
       # either to "false" in .env and redeploying; the client falls back to the
       # original blob URL when HLS variants are missing. Concurrency 1 keeps a

@@ -11,6 +11,7 @@ import { escapeMsFilter } from "../lib/meiliFilter.js";
 import { verifyEvent } from "../lib/nostr/eventVerifier.js";
 import { removeCoverVariants } from "../lib/coverVariants.js";
 import { musicService } from "./musicService.js";
+import { invalidateBlobScope } from "./blobReadAccess.js";
 import { cloudflareTunnelService } from "./cloudflareTunnelService.js";
 
 /**
@@ -223,7 +224,9 @@ const STEPS: Array<[string, StepFn]> = [
       return n;
     },
   ],
-  // 7. Blobs — ownership, then any blob nobody else owns (file, HLS, cover variants, row).
+  // 7. Blobs — ownership (its blob_scopes rows cascade), then any blob nobody
+  //    else owns (file, HLS, cover variants, row). A blob other owners keep is
+  //    gated by THEIR states from now on (docs/MEDIA_STORAGE.md §6).
   [
     "blobs",
     async (pk) => {
@@ -232,6 +235,7 @@ const STEPS: Array<[string, StepFn]> = [
         .where(eq(blobOwners.pubkey, pk))
         .returning({ sha256: blobOwners.sha256 });
       for (const { sha256 } of owned) {
+        invalidateBlobScope(sha256);
         const [other] = await db.select().from(blobOwners).where(eq(blobOwners.sha256, sha256)).limit(1);
         if (other) continue;
         await unlink(join(BLOB_DIR, sha256)).catch(() => {});

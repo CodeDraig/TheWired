@@ -194,7 +194,7 @@ describe("gated covers keep their token on the sized route", () => {
     const sized = await get(`${path}&w=256`, { accept: WEBP });
     expect(sized.statusCode).toBe(200);
     expect(sized.headers["content-type"]).toBe("image/webp");
-    expect(sized.headers["cache-control"]).toBe("private, max-age=3600");
+    expect(sized.headers["cache-control"]).toBe("private, max-age=86400");
 
     expect((await get(`/${sha256}?w=256`)).statusCode).toBe(404);
     expect((await get(`/${sha256}?w=256`, { "x-auth-pubkey": JAYDEE.pubkey })).statusCode).toBe(404);

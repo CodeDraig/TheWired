@@ -186,8 +186,8 @@ Music p-tags carry a role in the 4th element: `["p", <pubkey>, <relay>, <role>]`
 | `GET /music/resolve/*` | 200 | 404 unless member/author | 404 unless author/grantee | 200 |
 | Album/playlist **child tracks** | included | dropped unless viewer authorized per child | dropped unless authorized | included |
 | Browse / search index (Meilisearch, trending) | indexed, one doc per address (§Search index) | **never indexed** (ingest, rebuild, and trending all exclude; a formerly-public version's doc is removed on privatize) | never indexed | indexed with `unlisted: true`; **filtered out** of browse/search/trending/listed-space music; not counted in genre/tag chips |
-| Raw blob `GET /<sha>` | 200, immutable cache | 404 without `?tk=` token or authorized NIP-98 pubkey; `no-store` when served | same | 200, immutable cache |
-| HLS `/hls/<sha>/…` (master, playlists, segments) | 200 | 404 without valid `?tk=` | same | 200 |
+| Raw blob `GET /<sha>` | 200, immutable cache | 404 without `?tk=` token or authorized NIP-98 pubkey; `private, max-age=86400` when served (`MEDIA_STORAGE.md` §4) | same | 200, immutable cache |
+| HLS `/hls/<sha>/…` (master, playlists, segments) | 200 | 404 without valid `?tk=`; `private, max-age=86400` when served | same | 200 |
 | `GET /music/access` | `{gated:false}` | token minted for authorized viewers only, and only when the blob layer would serve that viewer the sha (see §Blob protection — an author cannot mint for a sha they did not upload) | same | `{gated:false}` |
 | `GET /music/insights/*` | 200 | 404 unless member/author/grantee; **404 when no current event exists** (fail closed) | 404 unless author/grantee | 200 |
 | `GET /music/revisions/*` | 200 | gated by the **current** version like `/music/resolve`: 404 unless member/author/grantee, 404 when no current event | same | 200 |
@@ -211,13 +211,19 @@ events by many uploaders. `services/blobAccess.ts` decides protection like this:
    must be authorized against **at least one** of them (author / granting p-tag
    / space membership).
 4. No owner-authored referencing events (just uploaded, or referenced only from
-   NIP-44-encrypted tags) → public by URL. In that window the sha itself is the
-   capability; desktop's encrypted-private tracks rely on this (the backend
-   cannot see their sha to gate it).
+   NIP-44-encrypted tags) → public by URL **as far as the music check goes**. In
+   that window the sha itself is the capability; desktop's encrypted-private
+   tracks rely on this (the backend cannot see their sha to gate it). A blob
+   uploaded *space-scoped* through BUD-02 (`h=<spaceId>`, `MEDIA_STORAGE.md`
+   §3–4) is members-only from the moment it is uploaded: the blob layer's scope
+   check gates it independently of this music check, and a music upload of the
+   same bytes (a `neutral` owner) doesn't make it public. An owner's public
+   music release does, though: someone else scoping a public track's bytes into
+   their space can't take the track down.
 
 ## Capability tokens (`?tk=`)
 
-`lib/mediaToken.ts`: HMAC over `<sha>.<exp>`, default TTL 6h. One token unlocks
+`lib/mediaToken.ts`: HMAC over `<sha>.<exp>`, default TTL 24h. One token unlocks
 **every rendition under one sha** (raw blob + full HLS ladder) — it is not bound
 to a viewer. Policy (who may mint) lives at `/music/access`; the token is only
 the transport for `<audio>`/hls.js, which cannot send NIP-98 headers.

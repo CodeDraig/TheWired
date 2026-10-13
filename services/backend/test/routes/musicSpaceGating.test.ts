@@ -256,7 +256,7 @@ describe("h-only space tracks protect the blob + HLS ladder", () => {
       method: "GET", url: `/${SHA_SPACE}`, headers: { "x-auth-pubkey": MARCUS.pubkey },
     });
     expect(res.statusCode).toBe(200);
-    expect(res.headers["cache-control"]).toContain("no-store");
+    expect(res.headers["cache-control"]).toBe("private, max-age=86400");
   });
 
   it("denies the blob to a non-member", async () => {

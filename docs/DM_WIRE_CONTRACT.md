@@ -106,7 +106,7 @@ tags:
   ["e", parentRumorId] / ["q", …] / ["expiration", …] / ["emoji", …] as in §3.2–3.3
 ```
 Core: `encryptDMFile(bytes) → { ciphertext, key, nonce, x, ox, size }`, `decryptDMFile(ciphertext, key, nonce) → bytes`, `fileRumorTags(meta)`, and `parseDMWire` returns `{ kind: "file", url, fileType, key, nonce, x, ox, size?, dim?, blurhash? }`.
-Receivers MUST verify `sha256(ciphertext) === x` before decrypting and `sha256(plaintext) === ox` after. Upload target: the recipient's Blossom list (kind 10063) if known, else the sender's own backend Blossom (`/blossom` on thewired.app), else the public fallbacks. Caption goes in a separate kind 14 that `e`-replies to the file (or precedes it); kind 15 `content` is the URL only.
+Receivers MUST verify `sha256(ciphertext) === x` before decrypting and `sha256(plaintext) === ox` after. Upload target: the `dm` context of `MEDIA_STORAGE.md` §1 — the sender's personal media list (The Wired's server by default, or the user's custom servers), with no public fallback; receivers also try the `fallback` tags and the by-hash candidates (§5 there). Caption goes in a separate kind 14 that `e`-replies to the file (or precedes it); kind 15 `content` is the URL only.
 
 Voice notes are kind 15 with `file-type` `audio/mp4` or `audio/ogg` and an optional `["duration", seconds]` tag (our extension, harmless to others).
 

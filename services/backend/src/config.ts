@@ -1,6 +1,27 @@
+const nodeEnv = process.env.NODE_ENV ?? "development";
+const publicUrl = process.env.PUBLIC_URL ?? "http://localhost:9080";
+
+/** BUD-11 `server` tag values this backend answers to: BLOSSOM_SERVER_NAMES
+ *  (comma list) or the PUBLIC_URL hostname, plus the loopback names outside
+ *  production. Lowercase hostnames, no port. */
+function blossomServerNames(): string[] {
+  const listed = (process.env.BLOSSOM_SERVER_NAMES ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const names = listed.length > 0 ? listed : [new URL(publicUrl).hostname.toLowerCase()];
+  if (nodeEnv !== "production") names.push("localhost", "127.0.0.1");
+  return [...new Set(names)];
+}
+
+function spaceMediaGate(): "off" | "log" | "enforce" {
+  const v = (process.env.SPACE_MEDIA_GATE ?? "log").trim().toLowerCase();
+  return v === "off" || v === "enforce" ? v : "log";
+}
+
 export const config = {
-  nodeEnv: process.env.NODE_ENV ?? "development",
-  isProduction: (process.env.NODE_ENV ?? "development") === "production",
+  nodeEnv,
+  isProduction: nodeEnv === "production",
   allowedOrigins: (process.env.ALLOWED_ORIGINS ?? "").split(",").filter(Boolean),
   port: parseInt(process.env.PORT ?? "3002", 10),
   databaseUrl: process.env.DATABASE_URL ?? "postgres://thewired:thewired@localhost:5432/thewired",
@@ -23,7 +44,7 @@ export const config = {
   vapidSubject: process.env.VAPID_SUBJECT ?? "mailto:admin@thewired.app",
   /** Expo push service access token (optional; "enhanced push security"). */
   expoAccessToken: process.env.EXPO_ACCESS_TOKEN ?? "",
-  publicUrl: process.env.PUBLIC_URL ?? "http://localhost:9080",
+  publicUrl,
   livekitUrl: process.env.LIVEKIT_URL ?? "ws://localhost:7880",
   livekitApiKey: process.env.LIVEKIT_API_KEY ?? "devkey",
   livekitApiSecret: process.env.LIVEKIT_API_SECRET ?? "secret",
@@ -81,6 +102,16 @@ export const config = {
   blobDir: process.env.BLOB_DIR ?? "blobs",
   /** Max blob upload size in bytes (default 100MB) */
   maxBlobSize: parseInt(process.env.MAX_BLOB_SIZE ?? String(100 * 1024 * 1024), 10),
+  /** Hostnames accepted in a kind-24242 `server` tag (see blossomServerNames). */
+  blossomServerNames: blossomServerNames(),
+  /** Read gate for space-scoped blobs (docs/MEDIA_STORAGE.md §4): `off` skips
+   *  the scope check, `log` serves a would-be denial and logs it, `enforce`
+   *  denies. Scope rows are recorded in every mode; the music gate is always
+   *  enforced. */
+  spaceMediaGate: spaceMediaGate(),
+  /** Per-pubkey BUD-02 upload guard: uploads per minute, and bytes per UTC day. */
+  uploadRatePerMin: parseInt(process.env.UPLOAD_RATE_PER_MIN ?? "30", 10),
+  uploadDailyBytes: parseInt(process.env.UPLOAD_DAILY_BYTES ?? String(2 * 1024 * 1024 * 1024), 10),
   /** Public web origin used in share links and OG canonical URLs. */
   webBaseUrl: process.env.WEB_BASE_URL ?? "https://thewired.app",
   /** Where the share pages send people who don't have the app yet. The

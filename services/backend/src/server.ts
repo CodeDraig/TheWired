@@ -36,6 +36,7 @@ import { linkPreviewRoutes } from "./routes/linkPreview.js";
 import { reportsRoutes } from "./routes/reports.js";
 import { adminRoutes } from "./routes/admin.js";
 import { accountRoutes } from "./routes/account.js";
+import { mediaGrantRoutes } from "./routes/mediaGrant.js";
 import { authContext } from "./middleware/authContext.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 
@@ -119,6 +120,8 @@ export async function createServer() {
   await server.register(reportsRoutes, { prefix: "/reports" });
   await server.register(adminRoutes, { prefix: "/admin" });
   await server.register(accountRoutes, { prefix: "/account" });
+  // Viewer grants for gated space media (docs/MEDIA_STORAGE.md §4).
+  await server.register(mediaGrantRoutes, { prefix: "/media-grant" });
   // thewired.app web-root paths (proxied by Caddy): universal-links association
   // files + server-rendered OG share pages for /music/* and /profile/* links.
   await server.register(wellKnownRoutes);

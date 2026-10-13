@@ -6,6 +6,8 @@ export interface BlossomAuthOk {
   ok: true;
   pubkey: string;
   xTags: string[];
+  /** `h` tag values; an upload carries at most one (a scoped upload). */
+  hTags: string[];
 }
 
 export interface BlossomAuthErr {
@@ -72,13 +74,23 @@ export function verifyBlossomAuth(
     return { ok: false, status: 401, reason: `Expected t=${requiredAction}, got t=${action}` };
   }
 
-  // Server tag validation (if present)
+  // Server tag validation (if present): one `server` tag per server the token
+  // may be used on (BUD-11); at least one must name this server.
   const serverTags = getTagValues(tags, "server");
   if (serverTags.length > 0) {
-    const ourDomain = new URL(config.publicUrl).hostname;
-    if (!serverTags.includes(ourDomain)) {
+    const ours = config.blossomServerNames;
+    if (!serverTags.some((v) => ours.includes(serverHostname(v)))) {
       return { ok: false, status: 403, reason: "Server not authorized by auth token" };
     }
+  }
+
+  // Scope tag: a scoped upload names exactly one space (docs/MEDIA_STORAGE.md §3).
+  const hTags = getTagValues(tags, "h");
+  if (hTags.some((v) => typeof v !== "string" || v.length === 0)) {
+    return { ok: false, status: 400, reason: "Invalid h tag" };
+  }
+  if (requiredAction === "upload" && hTags.length > 1) {
+    return { ok: false, status: 400, reason: "At most one h tag per upload" };
   }
 
   // x tag validation
@@ -92,7 +104,20 @@ export function verifyBlossomAuth(
     return { ok: false, status: 401, reason: "Invalid signature" };
   }
 
-  return { ok: true, pubkey: event.pubkey as string, xTags };
+  return { ok: true, pubkey: event.pubkey as string, xTags, hTags };
+}
+
+/** A `server` tag value as a bare lowercase hostname: BUD-11 sends just the
+ *  hostname, older clients sent an origin URL; a port is ignored either way. */
+function serverHostname(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const v = value.trim().toLowerCase();
+  try {
+    if (v.includes("://")) return new URL(v).hostname;
+  } catch {
+    return "";
+  }
+  return v.replace(/\/.*$/, "").replace(/:\d+$/, "");
 }
 
 function getTagValue(tags: string[][], name: string): string | undefined {
