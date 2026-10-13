@@ -186,6 +186,7 @@ function ConfigSection({
       <ImageUpload
         value={config?.welcomeImage ?? ""}
         onChange={(url) => handleUpdate({ welcomeImage: url || null })}
+        context={{ kind: "spaceAsset" }}
         label="Welcome Banner"
         placeholder="Upload a banner image or paste URL"
         shape="banner"

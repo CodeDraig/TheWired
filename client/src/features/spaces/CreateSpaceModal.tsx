@@ -548,6 +548,7 @@ export function CreateSpaceModal({
           <ImageUpload
             value={picture}
             onChange={setPicture}
+            context={{ kind: "spaceAsset" }}
             label="Picture"
             placeholder="Drop space image or click to upload"
             shape="square"

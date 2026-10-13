@@ -64,12 +64,21 @@ export const MediaGallery = memo(function MediaGallery({
           dim={imeta?.[images[0].url]?.dim}
           density={density}
           onOpen={openFirst}
+          fallbacks={images[0].fallbacks}
+          author={images[0].author}
+          gated={images[0].gated}
         />
       )}
 
       {images.length >= 2 && (
         <MediaGrid
-          images={images.map((m) => ({ url: m.url, dim: imeta?.[m.url]?.dim }))}
+          images={images.map((m) => ({
+            url: m.url,
+            dim: imeta?.[m.url]?.dim,
+            fallbacks: m.fallbacks,
+            author: m.author,
+            gated: m.gated,
+          }))}
           onOpen={openLightbox}
         />
       )}
@@ -81,6 +90,9 @@ export const MediaGallery = memo(function MediaGallery({
           poster={imeta?.[m.url]?.poster}
           dim={imeta?.[m.url]?.dim}
           density={density}
+          fallbacks={m.fallbacks}
+          author={m.author}
+          gated={m.gated}
         />
       ))}
 

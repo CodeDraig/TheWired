@@ -22,6 +22,16 @@ export function isBackendBacked(space: Pick<Space, "spaceType">): boolean {
   return t === "platform" || t === "decentralized-alite";
 }
 
+/**
+ * True when media posted in this space can be members-only on our server
+ * (docs/MEDIA_STORAGE.md §1): the backend knows its membership. NIP-29-native
+ * groups are also joined from other clients that can't present a media grant,
+ * so their media is stored unscoped.
+ */
+export function canGateSpaceMedia(space: Pick<Space, "spaceType">): boolean {
+  return isBackendBacked(space);
+}
+
 /** True when the space is a relay-authoritative NIP-29 group (no backend). */
 export function isNip29Native(space: Pick<Space, "spaceType">): boolean {
   return getSpaceType(space) === "nip29-native";

@@ -7,7 +7,8 @@ import { useMarkdownShortcuts } from "@/hooks/useMarkdownShortcuts";
 import { useAppSelector } from "@/store/hooks";
 import { buildArticle } from "@/lib/nostr/eventBuilder";
 import { signAndPublish } from "@/lib/nostr/publish";
-import { blossomUpload } from "@/lib/api/blossom";
+import { uploadContextKey, type UploadContext } from "@ishtarservices/core";
+import { uploadWithContext } from "@/lib/media/uploadPlan";
 import { ArticleToolbar } from "./ArticleToolbar";
 import { ArticleVisibilityPicker } from "./ArticleVisibilityPicker";
 import { ArticleMarkdown } from "./ArticleMarkdown";
@@ -20,6 +21,18 @@ import type {
   ArticleVisibility,
   LongFormArticle,
 } from "@/types/media";
+
+/** Upload context per audience (docs/MEDIA_STORAGE.md §1). Article images
+ *  render as plain <img> (no media grant), so space-exclusive ones are stored
+ *  on our server unscoped. */
+const UPLOAD_CONTEXT: Record<ArticleVisibility, UploadContext> = {
+  public: { kind: "public" },
+  space: { kind: "spaceAsset" },
+};
+const VISIBILITY_BY_CONTEXT_KEY: Record<string, ArticleVisibility> = {
+  [uploadContextKey(UPLOAD_CONTEXT.public)]: "public",
+  [uploadContextKey(UPLOAD_CONTEXT.space)]: "space",
+};
 
 // ProseMirror is heavy — only load the WYSIWYG surface when the editor opens.
 const RichArticleEditor = lazy(() =>
@@ -164,6 +177,22 @@ export function ArticleEditor({
     };
   }, [resumeDraftId]);
 
+  // Images uploaded in this session keep the audience they were uploaded
+  // for. While the article still uses any of them, the audience picker is
+  // locked to that audience (re-uploading would mean rewriting the body).
+  const uploadContext = UPLOAD_CONTEXT[visibility];
+  const [sessionUploads, setSessionUploads] = useState<{ url: string; contextKey: string }[]>([]);
+  const recordUpload = useCallback((url: string, context: UploadContext) => {
+    setSessionUploads((prev) => [...prev, { url, contextKey: uploadContextKey(context) }]);
+  }, []);
+  const uploadsInUse = useMemo(
+    () => sessionUploads.filter((u) => image === u.url || content.includes(u.url)),
+    [sessionUploads, image, content],
+  );
+  const audienceLockedTo: ArticleVisibility | null =
+    uploadsInUse.length > 0 ? (VISIBILITY_BY_CONTEXT_KEY[uploadsInUse[0].contextKey] ?? null) : null;
+  const hasMismatchedUploads = uploadsInUse.some((u) => u.contextKey !== uploadContextKey(uploadContext));
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   useAutoResize(textareaRef, content, 100000);
   useMarkdownShortcuts({ textareaRef, value: content, setValue: setContent });
@@ -199,7 +228,9 @@ export function ArticleEditor({
       if (!img) return;
       e.preventDefault();
       try {
-        const res = await blossomUpload(img);
+        const ctx = uploadContext;
+        const res = await uploadWithContext(img, ctx);
+        recordUpload(res.url, ctx);
         const ta = textareaRef.current;
         const cur = ta?.value ?? content;
         const pos = ta ? ta.selectionStart : cur.length;
@@ -211,7 +242,7 @@ export function ArticleEditor({
         setError("Couldn't upload pasted image");
       }
     },
-    [content],
+    [content, uploadContext, recordUpload],
   );
 
   const handlePublish = useCallback(async () => {
@@ -225,6 +256,10 @@ export function ArticleEditor({
     }
     if (!content.trim()) {
       setError("Write something before publishing");
+      return;
+    }
+    if (hasMismatchedUploads) {
+      setError("Some images were uploaded for a different audience. Remove them and add them again.");
       return;
     }
 
@@ -279,7 +314,7 @@ export function ArticleEditor({
     }
   }, [
     pubkey, title, content, summary, image, tags, visibility, spaceId, channelId,
-    spaces, mode, initial, onPublished, ownsDraft, activeDraftId,
+    spaces, mode, initial, onPublished, ownsDraft, activeDraftId, hasMismatchedUploads,
   ]);
 
   const canPublish = title.trim().length > 0 && content.trim().length > 0 && !publishing;
@@ -351,7 +386,12 @@ export function ArticleEditor({
         {view !== "preview" ? (
           <div className="mx-auto w-full max-w-3xl px-6 py-8">
             {/* Header: cover, title, summary */}
-            <CoverImageField value={image} onChange={setImage} />
+            <CoverImageField
+              value={image}
+              onChange={setImage}
+              uploadContext={uploadContext}
+              onUploaded={recordUpload}
+            />
 
             <input
               value={title}
@@ -381,6 +421,7 @@ export function ArticleEditor({
                 onSpaceIdChange={setSpaceId}
                 channelId={channelId}
                 onChannelIdChange={setChannelId}
+                lockedTo={audienceLockedTo}
               />
             </div>
 
@@ -400,12 +441,20 @@ export function ArticleEditor({
                 <RichArticleEditor
                   value={content}
                   onChange={setContent}
+                  uploadContext={uploadContext}
+                  onUploaded={recordUpload}
                   placeholder="Write your article — use the toolbar to format, or paste images directly."
                 />
               </Suspense>
             ) : (
               <div className="overflow-hidden rounded-xl border border-border/60">
-                <ArticleToolbar textareaRef={textareaRef} value={content} setValue={setContent} />
+                <ArticleToolbar
+                  textareaRef={textareaRef}
+                  value={content}
+                  setValue={setContent}
+                  uploadContext={uploadContext}
+                  onUploaded={recordUpload}
+                />
                 <textarea
                   ref={textareaRef}
                   value={content}

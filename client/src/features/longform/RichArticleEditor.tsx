@@ -19,7 +19,8 @@ import {
   Check,
   X,
 } from "lucide-react";
-import { blossomUpload } from "@/lib/api/blossom";
+import type { UploadContext } from "@ishtarservices/core";
+import { uploadWithContext } from "@/lib/media/uploadPlan";
 import { useClickOutside } from "@/hooks/useClickOutside";
 import "./richEditor.css";
 
@@ -28,6 +29,10 @@ interface RichArticleEditorProps {
   value: string;
   onChange: (markdown: string) => void;
   placeholder?: string;
+  /** Where inserted images are stored — follows the article's audience. */
+  uploadContext: UploadContext;
+  /** Called with each uploaded image URL. */
+  onUploaded?: (url: string, context: UploadContext) => void;
 }
 
 const EDITOR_CLASS =
@@ -57,8 +62,11 @@ function imageFileFrom(list: DataTransferItemList | null | undefined): File | nu
  * never round-tripped into the article's markdown — consistent with the
  * no-`rehype-raw` rendering contract (see ArticleMarkdown / nostr-security).
  */
-export function RichArticleEditor({ value, onChange, placeholder }: RichArticleEditorProps) {
+export function RichArticleEditor({ value, onChange, placeholder, uploadContext, onUploaded }: RichArticleEditorProps) {
   const editorRef = useRef<Editor | null>(null);
+  // The editor's paste/drop handlers are bound once; read the latest audience.
+  const uploadRef = useRef({ uploadContext, onUploaded });
+  uploadRef.current = { uploadContext, onUploaded };
   const fileRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [showHeadings, setShowHeadings] = useState(false);
@@ -75,7 +83,9 @@ export function RichArticleEditor({ value, onChange, placeholder }: RichArticleE
     if (!ed || !file.type.startsWith("image/")) return;
     setUploading(true);
     try {
-      const res = await blossomUpload(file);
+      const ctx = uploadRef.current.uploadContext;
+      const res = await uploadWithContext(file, ctx);
+      uploadRef.current.onUploaded?.(res.url, ctx);
       const alt = file.name.replace(/\.[^.]+$/, "");
       ed.chain().focus().setImage({ src: res.url, alt }).run();
     } catch {

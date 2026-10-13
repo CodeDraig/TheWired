@@ -1123,7 +1123,7 @@ function indexEventIntoSpaceFeeds(event: NostrEvent): void {
           emit(trackFeedTimestamp({ contextId, createdAt: event.created_at }));
         }
         // Cross-index notes with media into media feed
-        if (event.kind === EVENT_KINDS.SHORT_TEXT && (hasMediaUrls(event.content) || hasEmbedUrls(event.content))) {
+        if (event.kind === EVENT_KINDS.SHORT_TEXT && (hasMediaUrls(event.content, event) || hasEmbedUrls(event.content))) {
           emit(indexSpaceFeed({ contextId: "__friends_feed__:media", eventId: event.id }));
           emit(trackFeedTimestamp({ contextId: "__friends_feed__:media", createdAt: event.created_at }));
         }
@@ -1196,7 +1196,7 @@ function indexEventIntoSpaceFeeds(event: NostrEvent): void {
     }
 
     // Cross-index: kind:1 notes that contain media URLs or embed links also go into the media feed
-    if (event.kind === EVENT_KINDS.SHORT_TEXT && (hasMediaUrls(event.content) || hasEmbedUrls(event.content))) {
+    if (event.kind === EVENT_KINDS.SHORT_TEXT && (hasMediaUrls(event.content, event) || hasEmbedUrls(event.content))) {
       const spaceChannels = channelsMap[space.id];
       const mediaChannel = spaceChannels?.find((c) => c.type === "media");
       if (mediaChannel) {

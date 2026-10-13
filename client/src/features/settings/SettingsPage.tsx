@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { usePlaybackBarSpacing } from "@/hooks/usePlaybackBarSpacing";
 import { ProfileSettingsTab } from "./ProfileSettingsTab";
 import { RelaySettingsTab } from "./RelaySettingsTab";
+import { StorageSettingsTab } from "./StorageSettingsTab";
 import { AppSettingsTab } from "./AppSettingsTab";
 import { NotificationSettingsTab } from "./NotificationSettingsTab";
 import { SecuritySettingsTab } from "./SecuritySettingsTab";
@@ -16,12 +17,13 @@ import { VoiceSettingsTab } from "./VoiceSettingsTab";
 import { useAppSelector } from "@/store/hooks";
 import { selectFeatureEnabled, FEATURE_AI } from "@/store/slices/featuresSlice";
 
-type Tab = "profile" | "appearance" | "relays" | "notifications" | "voice" | "security" | "wallet" | "features" | "ai" | "app";
+type Tab = "profile" | "appearance" | "relays" | "storage" | "notifications" | "voice" | "security" | "wallet" | "features" | "ai" | "app";
 
 const baseTabs: { id: Tab; label: string }[] = [
   { id: "profile", label: "Profile" },
   { id: "appearance", label: "Appearance" },
   { id: "relays", label: "Relays" },
+  { id: "storage", label: "Storage" },
   { id: "notifications", label: "Notifications" },
   { id: "voice", label: "Voice & Video" },
   { id: "security", label: "Security" },
@@ -34,11 +36,13 @@ export function SettingsPage() {
   const [searchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
   const aiEnabled = useAppSelector(selectFeatureEnabled(FEATURE_AI));
+  // AI slots in just before "App".
+  const appIndex = baseTabs.findIndex((t) => t.id === "app");
   const tabs = aiEnabled
     ? [
-        ...baseTabs.slice(0, 8),
+        ...baseTabs.slice(0, appIndex),
         { id: "ai" as Tab, label: "AI" },
-        ...baseTabs.slice(8),
+        ...baseTabs.slice(appIndex),
       ]
     : baseTabs;
   const [activeTab, setActiveTab] = useState<Tab>(() =>
@@ -81,6 +85,7 @@ export function SettingsPage() {
       {activeTab === "profile" && <ProfileSettingsTab />}
       {activeTab === "appearance" && <ThemeSettingsTab />}
       {activeTab === "relays" && <RelaySettingsTab />}
+      {activeTab === "storage" && <StorageSettingsTab />}
       {activeTab === "notifications" && <NotificationSettingsTab />}
       {activeTab === "voice" && <VoiceSettingsTab />}
       {activeTab === "security" && <SecuritySettingsTab />}

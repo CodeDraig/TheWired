@@ -18,6 +18,8 @@ import { parseLongFormEvent } from "../../features/longform/useLongForm";
 import { parseVideoEvent, selectVideoSource } from "../../features/media/imetaParser";
 import { extractMediaUrls, stripMediaUrls, type ExtractedMedia } from "../../lib/media/mediaUrlParser";
 import { EVENT_KINDS, type NostrEvent } from "../../types/nostr";
+import { hasSpaceTag, tokenizeEventMediaUrl } from "../../lib/media/eventMedia";
+import { useMediaGrant } from "../../lib/media/mediaGrant";
 
 interface EmbeddedNoteProps {
   /** A note / event reference (nevent / note / hex id). */
@@ -116,11 +118,15 @@ function NoteEmbed({ event, depth }: { event: NostrEvent; depth: number }) {
   const { profile } = useProfile(event.pubkey);
   const compact = depth >= 1;
 
-  const media = useMemo(() => embedMediaForEvent(event), [event]);
+  // Tokenized from the EMBEDDED event's own tags: a space message quoted into
+  // a public note, another space or a DM still carries its space's grant.
+  const grant = useMediaGrant();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const media = useMemo(() => embedMediaForEvent(event), [event, grant]);
   const text = useMemo(() => {
-    const stripped = media.length > 0 ? stripMediaUrls(event.content) : event.content;
+    const stripped = media.length > 0 ? stripMediaUrls(event.content, event) : event.content;
     return compact && stripped.length > 280 ? stripped.slice(0, 280) + "…" : stripped;
-  }, [event.content, media.length, compact]);
+  }, [event, media.length, compact]);
 
   const name = profile?.display_name || profile?.name || event.pubkey.slice(0, 8) + "…";
 
@@ -140,7 +146,7 @@ function NoteEmbed({ event, depth }: { event: NostrEvent; depth: number }) {
       {text && (
         <div className={`mt-1 text-sm leading-relaxed text-body ${compact ? "line-clamp-3" : ""}`}>
           <EmbedDepthContext.Provider value={depth + 1}>
-            <RichContent content={text} emojiTags={event.tags.filter((t) => t[0] === "emoji")} />
+            <RichContent content={text} emojiTags={event.tags.filter((t) => t[0] === "emoji")} event={event} />
           </EmbedDepthContext.Provider>
         </div>
       )}
@@ -273,19 +279,23 @@ function EmbedRefLink({ idRef }: EmbeddedNoteProps) {
 
 /** Build a media list for any embeddable kind (notes, picture, video posts). */
 function embedMediaForEvent(event: NostrEvent): ExtractedMedia[] {
+  const source = {
+    author: event.pubkey,
+    ...(hasSpaceTag(event.tags) ? { gated: true } : {}),
+  };
   if (VIDEO_KINDS.has(event.kind)) {
     const video = parseVideoEvent(event);
     const url = selectVideoSource(video.variants);
-    return url ? [{ url, type: "video", matchText: url }] : [];
+    return url ? [{ url, type: "video", matchText: url, ...source }] : [];
   }
   if (event.kind === EVENT_KINDS.PICTURE) {
     const tagged = event.tags.filter((t) => t[0] === "url").map((t) => t[1]).filter(Boolean);
     const urls = tagged.length ? tagged : [event.content.trim()];
     return urls
       .filter(isHttpUrl)
-      .map((url) => ({ url, type: "image" as const, matchText: url }));
+      .map((url) => ({ url: tokenizeEventMediaUrl(url, event), type: "image" as const, matchText: url, ...source }));
   }
-  return extractMediaUrls(event.content);
+  return extractMediaUrls(event.content, event);
 }
 
 /** Scheme-check an event-derived URL before placing it in `src` (security). */

@@ -20,6 +20,8 @@ import { Avatar } from "../../components/ui/Avatar";
 import { RichContent } from "../../components/content/RichContent";
 import { useProfile } from "../profile/useProfile";
 import { extractMediaUrls, stripMediaUrls } from "../../lib/media/mediaUrlParser";
+import { tokenizeEventMediaUrl } from "../../lib/media/eventMedia";
+import { useMediaGrant } from "../../lib/media/mediaGrant";
 import { matchEmbed, type EmbedMatch, type EmbedPlatform } from "../../lib/content/embedPatterns";
 import { downloadMedia } from "../../components/ui/MediaLightbox";
 import { useScrollRestore } from "../../hooks/useScrollRestore";
@@ -67,7 +69,7 @@ function eventToMediaItems(event: NostrEvent): MediaItem[] {
     const url =
       event.tags.find((t) => t[0] === "url")?.[1] ?? event.content.trim();
     if (!url || !url.startsWith("http")) return [];
-    return [{ key: `${event.id}:img`, type: "image", url, event }];
+    return [{ key: `${event.id}:img`, type: "image", url: tokenizeEventMediaUrl(url, event), event }];
   }
 
   if (VIDEO_KINDS.has(event.kind)) {
@@ -86,10 +88,10 @@ function eventToMediaItems(event: NostrEvent): MediaItem[] {
 
   if (event.kind === EVENT_KINDS.SHORT_TEXT) {
     const items: MediaItem[] = [];
-    const caption = stripMediaUrls(event.content);
+    const caption = stripMediaUrls(event.content, event);
 
     // Direct media URLs (images/videos)
-    const extracted = extractMediaUrls(event.content);
+    const extracted = extractMediaUrls(event.content, event);
     for (let i = 0; i < extracted.length; i++) {
       items.push({
         key: `${event.id}:${i}`,
@@ -586,7 +588,7 @@ function ExpandedEmbedView({
           <div className="mt-4 w-full max-w-3xl rounded-lg border border-border bg-surface p-4">
             <AuthorBadge pubkey={item.event.pubkey} />
             <div className="mt-2 text-sm leading-relaxed text-body">
-              <RichContent content={text} />
+              <RichContent content={text} event={item.event} />
             </div>
           </div>
         )}
@@ -665,7 +667,7 @@ function ExpandedVideoView({
         <div className="mt-4 w-full max-w-4xl rounded-lg border border-border bg-surface p-4">
           <AuthorBadge pubkey={item.event.pubkey} />
           <div className="mt-2 text-sm leading-relaxed text-body">
-            <RichContent content={text} />
+            <RichContent content={text} event={item.event} />
           </div>
         </div>
       )}
@@ -712,7 +714,7 @@ function ExpandedImageView({
       {text && (
         <div className="border-t border-border px-4 py-3">
           <div className="text-sm text-soft">
-            <RichContent content={text} />
+            <RichContent content={text} event={item.event} />
           </div>
         </div>
       )}
@@ -772,6 +774,8 @@ export function MediaFeed() {
   useFeedPagination("notes");
   const { scrollPaddingClass } = usePlaybackBarSpacing();
 
+  // Media URLs are tokenized at parse time; re-derive when the grant lands.
+  const mediaGrant = useMediaGrant();
   const allItems = useMemo(() => {
     const items: MediaItem[] = [];
     const seenUrls = new Set<string>();
@@ -788,7 +792,8 @@ export function MediaFeed() {
       }
     }
     return items;
-  }, [mediaEvents]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mediaEvents, mediaGrant]);
 
   // NOTE: we deliberately do NOT eagerly preload every image/thumbnail here.
   // Doing so `new Image()`-loaded the entire feed at once (hundreds of requests),

@@ -40,6 +40,8 @@ interface ChatInputProps {
   /** File upload state/handlers from parent */
   attachments: UploadedAttachment[];
   onRemoveAttachment: (id: string) => void;
+  /** Retry a failed attachment upload. */
+  onRetryAttachment?: (id: string) => void;
   onClearAttachments: () => void;
   onOpenFilePicker: () => void;
   onAddFiles: (files: FileList | File[]) => void;
@@ -78,6 +80,7 @@ export function ChatInput({
   spaceId,
   attachments,
   onRemoveAttachment,
+  onRetryAttachment,
   onClearAttachments,
   onOpenFilePicker,
   onAddFiles,
@@ -436,7 +439,7 @@ export function ChatInput({
       </AnchoredPopover>
 
       {/* Attachment previews */}
-      <AttachmentPreview attachments={attachments} onRemove={onRemoveAttachment} />
+      <AttachmentPreview attachments={attachments} onRemove={onRemoveAttachment} onRetry={onRetryAttachment} />
 
       {/* GIF preview */}
       {pendingGif && (

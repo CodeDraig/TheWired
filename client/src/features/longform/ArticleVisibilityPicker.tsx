@@ -10,6 +10,9 @@ interface ArticleVisibilityPickerProps {
   onSpaceIdChange: (id: string) => void;
   channelId: string;
   onChannelIdChange: (id: string) => void;
+  /** Audience the article is pinned to because it holds images uploaded for
+   *  it; the other option is disabled until they're removed. */
+  lockedTo?: ArticleVisibility | null;
 }
 
 const OPTIONS: { value: ArticleVisibility; label: string; icon: typeof Globe }[] = [
@@ -30,6 +33,7 @@ export function ArticleVisibilityPicker({
   onSpaceIdChange,
   channelId,
   onChannelIdChange,
+  lockedTo,
 }: ArticleVisibilityPickerProps) {
   const spaces = useAppSelector((s) => s.spaces.list);
   const allChannels = useAppSelector((s) => s.spaces.channels);
@@ -64,13 +68,15 @@ export function ArticleVisibilityPicker({
         {OPTIONS.map((opt) => {
           const Icon = opt.icon;
           const active = value === opt.value;
+          const locked = !!lockedTo && opt.value !== lockedTo;
           return (
             <button
               key={opt.value}
               type="button"
               onClick={() => onChange(opt.value)}
               aria-pressed={active}
-              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+              disabled={locked}
+              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                 active ? "bg-primary/20 text-primary" : "text-soft hover:text-heading"
               }`}
             >
@@ -80,6 +86,14 @@ export function ArticleVisibilityPicker({
           );
         })}
       </div>
+
+      {lockedTo && (
+        <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
+          Images in this article were uploaded for a{" "}
+          {lockedTo === "space" ? "space-exclusive" : "public"} article. Remove them to change who
+          can see it.
+        </p>
+      )}
 
       {value === "space" && (
         <div className="mt-2.5 space-y-2">

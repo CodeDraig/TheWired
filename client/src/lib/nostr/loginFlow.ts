@@ -121,6 +121,9 @@ import { loadOnboardingState } from "../../features/onboarding/onboardingPersist
 import { createLogger, shortKey } from "../debug/logger";
 import { clearProjectKeySession, hydrateHeldProjectKeys, onProjectKeyAdded, retireMovedProjectKeys } from "../../features/music/sharedKey/projectKeys";
 import { addressOf, movedTargetOf } from "../../features/music/sharedKey/members";
+import { hydrateMediaPrefs, fetchMediaPrefs } from "../media/mediaPrefs";
+import { ensureMediaGrant, clearMediaGrant } from "../media/mediaGrant";
+import { musicTokenCache } from "../cache/tokenCache";
 
 const startupLog = createLogger("startup");
 const idLog = createLogger("identity");
@@ -791,6 +794,13 @@ export async function performLogin(
   store.dispatch(setEnabledFeatures(await loadEnabledFeatures()));
   // Hydrate the per-account Feed preferences (toggles + local hidden accounts).
   store.dispatch(setFeedPrefs(await loadFeedPrefs()));
+  // Media storage prefs (docs/MEDIA_STORAGE.md §2): the cached copy now, the
+  // relay doc in the background. Uploads use the defaults (The Wired only)
+  // until either lands. The viewer's media grant is minted alongside so
+  // members-only space media renders without a first 404.
+  await hydrateMediaPrefs();
+  void fetchMediaPrefs();
+  void ensureMediaGrant();
   let savedSpaces = await loadSpaces();
   let recoveredFromBackend = false;
 
@@ -1606,6 +1616,9 @@ export function performCleanup(): void {
   clearLastChannelCache();
   resetEventPipelineCaches();
   verifyBridge.drainPending();
+  // Media access is per account: the viewer grant and music track grants.
+  clearMediaGrant();
+  musicTokenCache.clear();
 
   // 5. Disconnect relays
   relayManager.disconnectAll();
@@ -1660,6 +1673,8 @@ export async function performLogout(): Promise<void> {
   clearLastChannelCache();
   resetEventPipelineCaches();
   verifyBridge.drainPending();
+  clearMediaGrant();
+  musicTokenCache.clear();
   setActivePubkey(null);
 
   // 5. Disconnect relays

@@ -1,7 +1,10 @@
 import type { NostrEvent } from "../../types/nostr";
 import type { ImetaVariant, VideoEvent } from "../../types/media";
+import { tokenizeEventMediaUrl } from "@/lib/media/eventMedia";
 
-/** Parse imeta tags from a video event */
+/** Parse imeta tags from a video event. URLs are as written (music tracks
+ *  read these too and carry their own access tokens); `parseVideoEvent` is
+ *  the render chokepoint that tokenizes. */
 export function parseImetaTags(event: NostrEvent): ImetaVariant[] {
   const variants: ImetaVariant[] = [];
 
@@ -58,14 +61,21 @@ export function parseImetaTags(event: NostrEvent): ImetaVariant[] {
   return variants;
 }
 
-/** Convert a video event to display data */
+/** Convert a video event to display data. A space video's own-server URLs
+ *  (variants, fallback, thumbnail) carry the viewer's media grant
+ *  (docs/MEDIA_STORAGE.md §5). */
 export function parseVideoEvent(event: NostrEvent): VideoEvent {
-  const variants = parseImetaTags(event);
+  const variants = parseImetaTags(event).map((v) => ({
+    ...v,
+    url: tokenizeEventMediaUrl(v.url, event),
+    ...(v.fallback ? { fallback: tokenizeEventMediaUrl(v.fallback, event) } : {}),
+  }));
   const title = event.tags.find((t) => t[0] === "title")?.[1];
   const summary = event.tags.find((t) => t[0] === "summary")?.[1];
-  const thumbnail =
+  const rawThumb =
     event.tags.find((t) => t[0] === "thumb")?.[1] ??
     event.tags.find((t) => t[0] === "image")?.[1];
+  const thumbnail = rawThumb ? tokenizeEventMediaUrl(rawThumb, event) : undefined;
   const durationStr = event.tags.find((t) => t[0] === "duration")?.[1];
   const duration = durationStr ? parseFloat(durationStr) : variants[0]?.duration;
 

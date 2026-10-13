@@ -93,7 +93,8 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
     isUploading,
     hasAttachments,
     addFiles,
-  } = useFileUpload();
+    retryAttachment,
+  } = useFileUpload({ context: { kind: "public" } });
 
   useAutoResize(textareaRef, value, 150);
 
@@ -436,7 +437,7 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
           {/* Attachment previews */}
           {hasAttachments && (
             <div className="px-4">
-              <AttachmentPreview attachments={attachments} onRemove={removeAttachment} />
+              <AttachmentPreview attachments={attachments} onRemove={removeAttachment} onRetry={retryAttachment} />
             </div>
           )}
 

@@ -20,7 +20,7 @@ import { useNoteEngagement } from "../spaces/useNoteEngagement";
 import { useRepostedEvent } from "./useRepostedEvent";
 import { useEngagementReporter, EngagementCollectorProvider } from "./engagementCollector";
 import { parseThreadRef, parseQuoteRef, isDirectReply } from "../spaces/noteParser";
-import { extractMediaUrls, stripMediaUrls } from "../../lib/media/mediaUrlParser";
+import { useNoteMedia } from "../../lib/media/useNoteMedia";
 import { UserPopoverCard } from "./UserPopoverCard";
 import { useZap } from "../wallet/WalletProvider";
 import { useClickOutside } from "../../hooks/useClickOutside";
@@ -216,11 +216,7 @@ function NoteCardInner({
   const quoteRef = useMemo(() => parseQuoteRef(event), [event]);
 
   // Extract media
-  const media = useMemo(() => extractMediaUrls(event.content), [event.content]);
-  const cleanedContent = useMemo(
-    () => media.length > 0 ? stripMediaUrls(event.content) : event.content,
-    [event.content, media],
-  );
+  const { media, text: cleanedContent } = useNoteMedia(event);
 
   const hasMedia = media.length > 0;
 
@@ -324,6 +320,7 @@ function NoteCardInner({
         <div className="text-sm leading-relaxed text-body">
           <RichContent
             content={cleanedContent}
+            event={event}
             onMentionClick={(pubkey, anchor) => setMentionPopover({ pubkey, anchor })}
             suppressEventIds={quoteRef ? [quoteRef.eventId] : undefined}
           />
@@ -563,7 +560,7 @@ function ParentNotePreview({ event, onCollapse }: { event: NostrEvent; onCollaps
         </button>
       </div>
       <div className="text-xs leading-relaxed text-body line-clamp-4">
-        <RichContent content={truncated} />
+        <RichContent content={truncated} event={event} />
       </div>
     </div>
   );

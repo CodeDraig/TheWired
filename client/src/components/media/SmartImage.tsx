@@ -4,6 +4,8 @@ import { MediaLightbox, downloadMedia } from "../ui/MediaLightbox";
 import { MediaBackdrop } from "./MediaBackdrop";
 import { useMediaOrientation } from "./useMediaOrientation";
 import { FEED_ASPECT_CLAMP, type MediaDensity } from "./mediaLayout";
+import { useMediaFallback, type MediaFallbackSources } from "./useMediaFallback";
+import { MediaUnavailable } from "./MediaUnavailable";
 
 /** Per-density sizing: fixed height for the fitted (portrait) card + natural-image cap. */
 const DENSITY: Record<MediaDensity, { fittedHeight: string; maxH: string }> = {
@@ -13,7 +15,7 @@ const DENSITY: Record<MediaDensity, { fittedHeight: string; maxH: string }> = {
   inline: { fittedHeight: "h-[15rem]", maxH: "max-h-60" },
 };
 
-export interface SmartImageProps {
+export interface SmartImageProps extends MediaFallbackSources {
   url: string;
   alt?: string;
   /** Click handler — e.g. a gallery lightbox opener. If omitted, opens its own lightbox. */
@@ -40,22 +42,18 @@ export const SmartImage = memo(function SmartImage({
   dim,
   downloadable = true,
   density = "feed",
+  fallbacks,
+  author,
+  gated,
 }: SmartImageProps) {
   const { aspect, onLoad } = useMediaOrientation(dim);
-  const [errored, setErrored] = useState(false);
   const [lightbox, setLightbox] = useState(false);
+  // Load-error chain: grant re-mint → by-hash fallbacks → unavailable tile.
+  const media = useMediaFallback(url, { fallbacks, author, gated });
+  const src = media.src;
 
-  if (errored) {
-    return (
-      <a
-        href={url}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="break-all text-xs text-primary underline"
-      >
-        {url}
-      </a>
-    );
+  if (media.failed) {
+    return <MediaUnavailable kind="image" className={density === "inline" ? "mt-1" : ""} />;
   }
 
   const handleClick = () => (onOpen ? onOpen() : setLightbox(true));
@@ -69,7 +67,7 @@ export const SmartImage = memo(function SmartImage({
 
   const downloadBtn = downloadable ? (
     <button
-      onClick={() => downloadMedia(url)}
+      onClick={() => src && downloadMedia(src)}
       className="absolute right-2 top-2 z-20 rounded-full bg-black/50 p-1.5 text-white/70 opacity-0 transition-all group-hover/media:opacity-100 hover:bg-black/70 hover:text-white"
       title="Download image"
     >
@@ -83,17 +81,17 @@ export const SmartImage = memo(function SmartImage({
       <>
         <span className="group/media relative inline-block max-w-xs overflow-hidden rounded-lg align-bottom">
           <img
-            src={url}
+            src={src}
             alt={alt}
             loading="lazy"
             onLoad={onLoad}
-            onError={() => setErrored(true)}
+            onError={media.onError}
             onClick={handleClick}
-            className={`max-w-full ${d.maxH} cursor-zoom-in rounded-lg object-contain`}
+            className={`max-w-full ${d.maxH} cursor-zoom-in rounded-lg object-contain ${media.retrying ? "invisible" : ""}`}
           />
           {downloadBtn}
         </span>
-        {lightbox && <MediaLightbox src={url} onClose={() => setLightbox(false)} />}
+        {lightbox && src && <MediaLightbox src={src} onClose={() => setLightbox(false)} />}
       </>
     );
   }
@@ -107,19 +105,19 @@ export const SmartImage = memo(function SmartImage({
   return (
     <>
       <div className={`group/media relative w-full overflow-hidden rounded-lg bg-surface ${boxClass}`}>
-        {fitted && <MediaBackdrop src={url} active />}
+        {fitted && src && <MediaBackdrop src={src} active />}
         <img
-          src={url}
+          src={src}
           alt={alt}
           loading="lazy"
           onLoad={onLoad}
-          onError={() => setErrored(true)}
+          onError={media.onError}
           onClick={handleClick}
-          className={`relative z-10 mx-auto block w-full ${fitted ? "h-full" : d.maxH} cursor-zoom-in object-contain`}
+          className={`relative z-10 mx-auto block w-full ${fitted ? "h-full" : d.maxH} cursor-zoom-in object-contain ${media.retrying ? "invisible" : ""} ${src ? "" : "min-h-24"}`}
         />
         {downloadBtn}
       </div>
-      {lightbox && <MediaLightbox src={url} onClose={() => setLightbox(false)} />}
+      {lightbox && src && <MediaLightbox src={src} onClose={() => setLightbox(false)} />}
     </>
   );
 });

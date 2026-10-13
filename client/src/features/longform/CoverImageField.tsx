@@ -1,6 +1,7 @@
 import { useRef, useState, useCallback } from "react";
 import { ImagePlus, Loader2, X, Link2 } from "lucide-react";
-import { blossomUpload } from "@/lib/api/blossom";
+import type { UploadContext } from "@ishtarservices/core";
+import { uploadWithContext } from "@/lib/media/uploadPlan";
 
 /**
  * Elegant cover-image control for the article editor. Empty state is a slim,
@@ -11,9 +12,15 @@ import { blossomUpload } from "@/lib/api/blossom";
 export function CoverImageField({
   value,
   onChange,
+  uploadContext,
+  onUploaded,
 }: {
   value: string;
   onChange: (url: string) => void;
+  /** Where the cover is stored — follows the article's audience. */
+  uploadContext: UploadContext;
+  /** Called with each uploaded image URL. */
+  onUploaded?: (url: string, context: UploadContext) => void;
 }) {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -30,7 +37,8 @@ export function CoverImageField({
       setUploading(true);
       setError(null);
       try {
-        const res = await blossomUpload(file);
+        const res = await uploadWithContext(file, uploadContext);
+        onUploaded?.(res.url, uploadContext);
         onChange(res.url);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Upload failed");
@@ -38,7 +46,7 @@ export function CoverImageField({
         setUploading(false);
       }
     },
-    [onChange],
+    [onChange, uploadContext, onUploaded],
   );
 
   const hiddenInput = (

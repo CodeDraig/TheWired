@@ -1,6 +1,29 @@
 import { parse } from "nostr-tools/nip27";
 import type { ProfilePointer, EventPointer, AddressPointer } from "nostr-tools/nip19";
 import { matchEmbed, type EmbedMatch } from "./embedPatterns";
+import {
+  classifyEventMediaUrl,
+  hasSpaceTag,
+  imetaByUrl,
+  imetaFor,
+  isExtensionlessBlobUrl,
+  tokenizeEventMediaUrl,
+  type ImetaInfo,
+  type ImetaMap,
+  type MediaEventContext,
+} from "@/lib/media/eventMedia";
+import { isOwnBlobUrl } from "@ishtarservices/core";
+import { ownBlossomOrigin } from "@/lib/api/blossom";
+
+/** Load-error fallback sources carried with a media segment
+ *  (docs/MEDIA_STORAGE.md §5): imeta `fallback` URLs and the author, whose
+ *  kind-10063 servers are tried by hash. */
+export interface MediaSource {
+  fallbacks?: string[];
+  author?: string;
+  /** From a space event: our server's copy is members-only (needs the grant). */
+  gated?: boolean;
+}
 
 export type ContentSegment =
   | { type: "text"; text: string }
@@ -8,19 +31,17 @@ export type ContentSegment =
   | { type: "event-ref"; id: string; relays?: string[]; author?: string; kind?: number }
   | { type: "addr-ref"; identifier: string; pubkey: string; kind: number; relays?: string[] }
   | { type: "url"; url: string }
-  | { type: "image"; url: string }
-  | { type: "video"; url: string }
-  | { type: "audio"; url: string }
-  | { type: "file"; url: string; filename: string }
+  | ({ type: "image"; url: string } & MediaSource)
+  | ({ type: "video"; url: string } & MediaSource)
+  | ({ type: "audio"; url: string } & MediaSource)
+  | ({ type: "file"; url: string; filename: string } & MediaSource)
+  /** An extensionless Blossom URL with no type hint: rendered after a HEAD probe. */
+  | ({ type: "blob"; url: string } & MediaSource)
   | { type: "embed"; embed: EmbedMatch }
   | { type: "invite"; code: string }
   | { type: "hashtag"; value: string }
   | { type: "custom-emoji"; shortcode: string; url: string };
 
-const IMAGE_EXTS = /\.(jpe?g|png|gif|webp|svg|avif|bmp)(\?.*)?$/i;
-const VIDEO_EXTS = /\.(mp4|webm|mov|m3u8|mkv|avi)(\?.*)?$/i;
-const AUDIO_EXTS = /\.(mp3|wav|ogg|flac|aac|m4a|opus)(\?.*)?$/i;
-const DOC_EXTS = /\.(pdf)(\?.*)?$/i;
 const INVITE_RE = /\/invite\/([A-Za-z0-9_-]+)/;
 /** Matches a full invite URL (localhost or any domain) embedded in text */
 const INVITE_URL_RE = /https?:\/\/[^\s]+\/invite\/([A-Za-z0-9_-]+)/g;
@@ -86,6 +107,42 @@ function expandCustomEmojis(segments: ContentSegment[], emojiMap: Map<string, st
   return result;
 }
 
+const RAW_URL_RE = /https?:\/\/[^\s<>"')\]]+/g;
+
+/**
+ * Blob URLs on our own server that the NIP-27 parser left as text: it skips
+ * hosts without a dot, which is exactly a dev build's http://localhost:9080.
+ * Only own-origin sha URLs are lifted out, as media.
+ */
+function extractOwnBlobUrls(
+  segments: ContentSegment[],
+  event: MediaEventContext | undefined,
+  imeta: ImetaMap,
+): ContentSegment[] {
+  const own = ownBlossomOrigin();
+  const result: ContentSegment[] = [];
+  for (const seg of segments) {
+    if (seg.type !== "text" || !seg.text.includes("://")) {
+      result.push(seg);
+      continue;
+    }
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+    RAW_URL_RE.lastIndex = 0;
+    while ((match = RAW_URL_RE.exec(seg.text)) !== null) {
+      const url = match[0].replace(/[),.:;!?]+$/, "");
+      if (!isOwnBlobUrl(url, own)) continue;
+      if (match.index > lastIndex) result.push({ type: "text", text: seg.text.slice(lastIndex, match.index) });
+      const info = imetaFor(imeta, url);
+      result.push(mediaSegment(classifyEventMediaUrl(url, info) ?? "blob", url, event, info));
+      lastIndex = match.index + url.length;
+    }
+    if (lastIndex === 0) result.push(seg);
+    else if (lastIndex < seg.text.length) result.push({ type: "text", text: seg.text.slice(lastIndex) });
+  }
+  return result;
+}
+
 /** Extract invite URLs from text segments that the NIP-27 parser missed (e.g. localhost URLs) */
 function extractInviteLinks(segments: ContentSegment[]): ContentSegment[] {
   const result: ContentSegment[] = [];
@@ -115,9 +172,39 @@ function extractInviteLinks(segments: ContentSegment[]): ContentSegment[] {
   return result;
 }
 
-/** Parse nostr content into typed segments using NIP-27 */
-export function parseContent(content: string, emojiTags?: string[][]): ContentSegment[] {
+/** A media segment for `url` (classified by the caller), tokenized for the
+ *  event and carrying its fallback sources. */
+function mediaSegment(
+  kind: "image" | "video" | "audio" | "file" | "blob",
+  url: string,
+  ctx: MediaEventContext | undefined,
+  imeta: ImetaInfo | undefined,
+): ContentSegment {
+  const src: MediaSource = {};
+  if (imeta?.fallbacks.length) src.fallbacks = imeta.fallbacks;
+  if (ctx?.pubkey) src.author = ctx.pubkey;
+  if (hasSpaceTag(ctx?.tags)) src.gated = true;
+  const tokened = tokenizeEventMediaUrl(url, ctx);
+  if (kind === "file") {
+    const filename = url.split("/").pop()?.split("?")[0] || "document.pdf";
+    return { type: "file", url: tokened, filename: /\.[a-z0-9]+$/i.test(filename) ? filename : `${filename}.pdf`, ...src };
+  }
+  return { type: kind, url: tokened, ...src };
+}
+
+/**
+ * Parse nostr content into typed segments using NIP-27. `event` (the tags and
+ * author of the event the content came from) drives media handling: imeta
+ * classification of extensionless blob URLs and the media-grant token for
+ * space events (docs/MEDIA_STORAGE.md §5).
+ */
+export function parseContent(
+  content: string,
+  emojiTags?: string[][],
+  event?: MediaEventContext,
+): ContentSegment[] {
   const segments: ContentSegment[] = [];
+  const imeta = imetaByUrl(event?.tags);
 
   for (const token of parse(content)) {
     switch (token.type) {
@@ -159,15 +246,12 @@ export function parseContent(content: string, emojiTags?: string[][]): ContentSe
 
       case "url": {
         const url = token.url;
-        if (IMAGE_EXTS.test(url)) {
-          segments.push({ type: "image", url });
-        } else if (VIDEO_EXTS.test(url)) {
-          segments.push({ type: "video", url });
-        } else if (AUDIO_EXTS.test(url)) {
-          segments.push({ type: "audio", url });
-        } else if (DOC_EXTS.test(url)) {
-          const filename = url.split("/").pop()?.split("?")[0] || "document.pdf";
-          segments.push({ type: "file", url, filename });
+        const info = imetaFor(imeta, url);
+        const kind = classifyEventMediaUrl(url, info);
+        if (kind) {
+          segments.push(mediaSegment(kind, url, event, info));
+        } else if (isExtensionlessBlobUrl(url)) {
+          segments.push(mediaSegment("blob", url, event, info));
         } else {
           const inviteMatch = url.match(INVITE_RE);
           if (inviteMatch) {
@@ -185,15 +269,9 @@ export function parseContent(content: string, emojiTags?: string[][]): ContentSe
       }
 
       case "image":
-        segments.push({ type: "image", url: token.url });
-        break;
-
       case "video":
-        segments.push({ type: "video", url: token.url });
-        break;
-
       case "audio":
-        segments.push({ type: "audio", url: token.url });
+        segments.push(mediaSegment(token.type, token.url, event, imetaFor(imeta, token.url)));
         break;
 
       default:
@@ -204,8 +282,9 @@ export function parseContent(content: string, emojiTags?: string[][]): ContentSe
     }
   }
 
-  // Post-process: extract invite links from text segments (localhost URLs aren't parsed by NIP-27)
-  let processed = extractInviteLinks(segments);
+  // Post-process: localhost URLs aren't parsed by NIP-27 — lift out our own
+  // blob URLs (dev builds) and invite links from the text segments.
+  let processed = extractInviteLinks(extractOwnBlobUrls(segments, event, imeta));
 
   // Post-process: replace :shortcode: patterns with custom-emoji segments (NIP-30)
   const emojiMap = buildEmojiMap(emojiTags);
