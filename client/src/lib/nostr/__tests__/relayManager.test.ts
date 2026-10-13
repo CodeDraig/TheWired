@@ -279,3 +279,67 @@ describe("relayManager — APP_RELAY stickiness + mid-handshake guard (8fcaf79 r
     expect(relayManager.getAllConnections().get("wss://n.relay")?.mode).toBe("read+write");
   });
 });
+
+describe("relayManager — publishTracked (own-message send state)", () => {
+  const event = {
+    id: "e".repeat(64), pubkey: "a".repeat(64), created_at: 1, kind: 1059,
+    tags: [], content: "", sig: "0".repeat(128),
+  };
+  const socketFor = (url: string) => mockWsInstances.find((w) => w.url.startsWith(url))!;
+  const ok = (ws: MockWebSocket, accepted: boolean, message = "") =>
+    ws.onmessage?.({ data: JSON.stringify(["OK", event.id, accepted, message]) });
+
+  function openTwo() {
+    relayManager.connect("wss://a.relay");
+    relayManager.connect("wss://b.relay");
+    const a = socketFor("wss://a.relay");
+    const b = socketFor("wss://b.relay");
+    a.simulateOpen();
+    b.simulateOpen();
+    return { a, b };
+  }
+
+  it("hands the event to every target and resolves true at the first accept", async () => {
+    const { a, b } = openTwo();
+    const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"]);
+    expect(t.sent).toBe(2);
+    expect(a.sent.some((m) => JSON.parse(m)[0] === "EVENT")).toBe(true);
+    expect(b.sent.some((m) => JSON.parse(m)[0] === "EVENT")).toBe(true);
+    ok(b, true); // a never answers
+    await expect(t.accepted).resolves.toBe(true);
+  });
+
+  it("counts a duplicate refusal as accepted (the relay already holds it)", async () => {
+    const { a } = openTwo();
+    const t = relayManager.publishTracked(event, ["wss://a.relay"]);
+    ok(a, false, "duplicate: already have this event");
+    await expect(t.accepted).resolves.toBe(true);
+  });
+
+  it("resolves false once every target refused", async () => {
+    const { a, b } = openTwo();
+    const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"]);
+    ok(a, false, "blocked: no");
+    ok(b, false, "rate-limited: slow down");
+    await expect(t.accepted).resolves.toBe(false);
+  });
+
+  it("resolves false when no relay answers in time — a queued event proves nothing", async () => {
+    vi.useFakeTimers();
+    try {
+      relayManager.connect("wss://down.relay"); // never opens: the EVENT is queued
+      const t = relayManager.publishTracked(event, ["wss://down.relay"], 10_000);
+      expect(t.sent).toBe(1);
+      vi.advanceTimersByTime(10_000);
+      await expect(t.accepted).resolves.toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("with no known target relay: nothing sent, not accepted", async () => {
+    const t = relayManager.publishTracked(event, ["wss://unknown.relay"]);
+    expect(t.sent).toBe(0);
+    await expect(t.accepted).resolves.toBe(false);
+  });
+});

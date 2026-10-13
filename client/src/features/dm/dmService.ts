@@ -33,6 +33,8 @@ import { signAndPublish } from "@/lib/nostr/publish";
 import { store } from "@/store";
 import {
   addDMMessage,
+  deleteDMMessage,
+  dmSendResolved,
   editDMMessage,
   remoteDeleteDMMessage,
   reactDMMessage,
@@ -79,10 +81,31 @@ interface PublishResult {
   rumorId: string;
   createdAt: number;
   selfWrapId: string;
-  /** Relays the recipient wrap(s) reached. */
+  /** Relay connections the recipient wrap(s) were handed to. */
   sent: number;
   /** Relays the self-wrap reached (0 = not synced to our other devices). */
   selfSent: number;
+  /** With `track`: true once a relay accepted a recipient wrap, false when
+   *  every relay refused or none answered within DM_SEND_TIMEOUT_MS. */
+  accepted?: Promise<boolean>;
+}
+
+/** How long an own message waits for a relay OK before it shows as failed
+ *  (the mobile app uses the same 10 s). */
+export const DM_SEND_TIMEOUT_MS = 10_000;
+
+/** True at the first accepted wrap; false once every one settled without. */
+function firstAccepted(acceptances: Promise<boolean>[]): Promise<boolean> {
+  if (acceptances.length === 0) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let left = acceptances.length;
+    for (const a of acceptances) {
+      void a.then((ok) => {
+        if (ok) resolve(true);
+        else if (--left === 0) resolve(false);
+      });
+    }
+  });
 }
 
 /**
@@ -93,7 +116,7 @@ async function publishRumor(
   conversationId: string,
   content: string,
   extraTags: string[][],
-  opts: { kind?: number; expiration?: number; noSelfWrap?: boolean } = {},
+  opts: { kind?: number; expiration?: number; noSelfWrap?: boolean; track?: boolean } = {},
 ): Promise<PublishResult> {
   const myPubkey = store.getState().identity.pubkey;
   if (!myPubkey) throw new Error("Not logged in");
@@ -116,16 +139,31 @@ async function publishRumor(
     let sent = 0;
     let selfSent = 0;
     let selfWrapId = "";
+    const acceptances: Promise<boolean>[] = [];
     for (const { to, wrap } of result.wraps) {
       if (to === myPubkey) {
         const own = getOwnDMRelays();
         selfSent = relayManager.publish(wrap, own.length > 0 ? own : fallbackDMRelays());
         selfWrapId = wrap.id;
       } else {
-        sent += relayManager.publish(wrap, (await getDMRelaysForPublish(to)) ?? fallbackDMRelays());
+        const targets = (await getDMRelaysForPublish(to)) ?? fallbackDMRelays();
+        if (opts.track) {
+          const t = relayManager.publishTracked(wrap, targets, DM_SEND_TIMEOUT_MS);
+          sent += t.sent;
+          acceptances.push(t.accepted);
+        } else {
+          sent += relayManager.publish(wrap, targets);
+        }
       }
     }
-    return { rumorId: result.rumorId, createdAt: nowSec(), selfWrapId, sent, selfSent };
+    return {
+      rumorId: result.rumorId,
+      createdAt: nowSec(),
+      selfWrapId,
+      sent,
+      selfSent,
+      ...(opts.track ? { accepted: firstAccepted(acceptances) } : {}),
+    };
   }
 
   const peer = resolveHexPubkey(conversationId);
@@ -133,7 +171,14 @@ async function publishRumor(
     kind: opts.kind ?? KIND_DM_MESSAGE,
   });
   const { wrap: recipientWrap } = await createGiftWrappedDM(content, peer, extraTags, sharedRumor, wrapOpts);
-  const sent = relayManager.publish(recipientWrap, (await getDMRelaysForPublish(peer)) ?? fallbackDMRelays());
+  const targets = (await getDMRelaysForPublish(peer)) ?? fallbackDMRelays();
+  let sent: number;
+  let accepted: Promise<boolean> | undefined;
+  if (opts.track) {
+    ({ sent, accepted } = relayManager.publishTracked(recipientWrap, targets, DM_SEND_TIMEOUT_MS));
+  } else {
+    sent = relayManager.publish(recipientWrap, targets);
+  }
   let selfSent = 0;
   let selfWrapId = "";
   if (!opts.noSelfWrap) {
@@ -142,7 +187,21 @@ async function publishRumor(
     selfSent = relayManager.publish(selfWrap, own.length > 0 ? own : fallbackDMRelays());
     selfWrapId = selfWrap.id;
   }
-  return { rumorId: sharedRumor.id, createdAt: sharedRumor.created_at, selfWrapId, sent, selfSent };
+  return {
+    rumorId: sharedRumor.id,
+    createdAt: sharedRumor.created_at,
+    selfWrapId,
+    sent,
+    selfSent,
+    ...(accepted ? { accepted } : {}),
+  };
+}
+
+/** Settle an own row's pending status once the relays answered. */
+function trackSend(partnerPubkey: string, r: PublishResult): void {
+  void r.accepted?.then((ok) => {
+    store.dispatch(dmSendResolved({ partnerPubkey, wrapId: r.selfWrapId, ok }));
+  });
 }
 
 /** Seal/wrap expiration for an ordinary message in this conversation
@@ -173,6 +232,7 @@ export async function sendDM(
   const createdAt = nowSec();
   const r = await publishRumor(target, content, extraTags, {
     expiration: messageExpiration(target, createdAt),
+    track: true,
   });
   if (r.sent === 0) throw new Error("Failed to publish DM: no write relays available.");
 
@@ -191,10 +251,12 @@ export async function sendDM(
         emojiTags: emojiTags && emojiTags.length > 0 ? emojiTags : undefined,
         expiresAt: messageExpiration(target, r.createdAt),
         syncWarning: r.selfSent === 0 ? true : undefined,
+        status: "pending",
       },
       room: room ? { participants: room.participants ?? [], subject: room.subject } : undefined,
     }),
   );
+  trackSend(target, r);
 }
 
 /**
@@ -217,6 +279,7 @@ export async function sendDMFile(
   const r = await publishRumor(target, url, fileRumorTags(rest, { replyTo: replyAnchor }), {
     kind: KIND_DM_FILE,
     expiration: messageExpiration(target, createdAt),
+    track: true,
   });
   if (r.sent === 0) throw new Error("Failed to publish file: no write relays available.");
 
@@ -236,14 +299,33 @@ export async function sendDMFile(
         attachment: meta,
         expiresAt: messageExpiration(target, r.createdAt),
         syncWarning: r.selfSent === 0 ? true : undefined,
+        status: "pending",
       },
       room: room ? { participants: room.participants ?? [], subject: room.subject } : undefined,
     }),
   );
+  trackSend(target, r);
 
   if (opts.caption && opts.caption.trim()) {
     await sendDM(target, opts.caption.trim(), { wrapId: r.selfWrapId, rumorId: r.rumorId });
   }
+}
+
+/**
+ * Send a failed own message again, as the mobile app does: the same text or
+ * file, reply anchor and emoji go out as a new message, and the failed row
+ * goes once that send is handed to a relay (a throw keeps it).
+ */
+export async function resendDM(conversationId: string, wrapId: string): Promise<void> {
+  const msg = store.getState().dm.messages[conversationId]?.find((m) => m.wrapId === wrapId);
+  if (!msg || msg.status !== "failed") return;
+  const replyTo = msg.replyToWrapId ? { wrapId: msg.replyToWrapId, rumorId: msg.replyToWrapId } : undefined;
+  if (msg.kind === KIND_DM_FILE && msg.attachment) {
+    await sendDMFile(conversationId, msg.attachment, { replyTo });
+  } else {
+    await sendDM(conversationId, msg.content, replyTo, msg.emojiTags);
+  }
+  store.dispatch(deleteDMMessage({ partnerPubkey: conversationId, wrapId }));
 }
 
 /**

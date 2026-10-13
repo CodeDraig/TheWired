@@ -6,6 +6,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const buildRumorSpy = vi.fn();
 const wrapSpy = vi.fn();
 const selfWrapSpy = vi.fn();
+/** The stub's self-wrap id — a resend needs a fresh one. */
+let selfWrapId = "w2".padEnd(64, "0");
 vi.mock("@/lib/nostr/giftWrap", () => ({
   buildRumor: async (...a: unknown[]) => {
     buildRumorSpy(...a);
@@ -18,14 +20,17 @@ vi.mock("@/lib/nostr/giftWrap", () => ({
   },
   createSelfWrap: async (...a: unknown[]) => {
     selfWrapSpy(...a);
-    return { wrap: { id: "w2".padEnd(64, "0"), kind: 1059, pubkey: "e".repeat(64), created_at: 1, tags: [], content: "", sig: "" }, rumorId: "r".repeat(64) };
+    return { wrap: { id: selfWrapId, kind: 1059, pubkey: "e".repeat(64), created_at: 1, tags: [], content: "", sig: "" }, rumorId: "r".repeat(64) };
   },
   giftWrapContext: () => ({ myPubkey: "a".repeat(64), signer: {} }),
 }));
 const publishSpy = vi.fn((_event: unknown, _relays?: unknown) => 1);
+/** What the relays answer for a tracked recipient wrap (the next send). */
+let relayAnswer: () => Promise<boolean> = async () => true;
 vi.mock("@/lib/nostr/relayManager", () => {
   const base: Record<string, unknown> = {
     publish: (event: unknown, relays?: unknown) => publishSpy(event, relays),
+    publishTracked: (event: unknown, relays?: unknown) => ({ sent: publishSpy(event, relays), accepted: relayAnswer() }),
     getWriteRelays: () => [{ url: "wss://w" }],
   };
   // Anything else the store/login modules touch at import time is a no-op.
@@ -43,7 +48,7 @@ import { store, resetAll } from "@/store";
 import { login, setFollowList } from "@/store/slices/identitySlice";
 import { addFriendRequest } from "@/store/slices/friendRequestSlice";
 import { setConversationExpireAfter } from "@/store/slices/dmSlice";
-import { sendDM, sendDMFile, reactToDM, removeDMReaction, sendTyping, sendReceipt, editDM } from "../dmService";
+import { sendDM, sendDMFile, resendDM, reactToDM, removeDMReaction, sendTyping, sendReceipt, editDM } from "../dmService";
 import { setDMPrefs, __resetDMPrefsForTest } from "../dmPrefs";
 
 const ME = "a".repeat(64);
@@ -62,6 +67,8 @@ beforeEach(() => {
   wrapSpy.mockClear();
   selfWrapSpy.mockClear();
   publishSpy.mockClear();
+  relayAnswer = async () => true;
+  selfWrapId = "w2".padEnd(64, "0");
   store.dispatch(login({ pubkey: ME, signerType: "tauri_keystore" }));
 });
 
@@ -150,5 +157,67 @@ describe("dmService — wire v1 write shapes", () => {
     publishSpy.mockClear();
     await sendReceipt(PEER, "read", [TARGET]);
     expect(publishSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("dmService — own-message send state (relay OK, as on mobile)", () => {
+  const row = () => store.getState().dm.messages[PEER][0];
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+
+  it("sendDM adds the row as pending and marks it sent when a relay accepts", async () => {
+    let accept!: (ok: boolean) => void;
+    relayAnswer = () => new Promise<boolean>((r) => { accept = r; });
+    await sendDM(PEER, "hello");
+    expect(row().status).toBe("pending");
+    accept(true);
+    await settle();
+    expect(row().status).toBe("sent");
+  });
+
+  it("marks the row failed when no relay accepted it", async () => {
+    relayAnswer = async () => false;
+    await sendDM(PEER, "hello");
+    await settle();
+    expect(row().status).toBe("failed");
+  });
+
+  it("sendDMFile tracks the file row the same way", async () => {
+    relayAnswer = async () => false;
+    await sendDMFile(PEER, {
+      url: "https://blossom/x.bin",
+      fileType: "image/png",
+      key: "1".repeat(64),
+      nonce: "2".repeat(24),
+      x: "3".repeat(64),
+      ox: "4".repeat(64),
+      size: 10,
+    });
+    await settle();
+    expect(row().status).toBe("failed");
+  });
+
+  it("resendDM sends the same text and reply anchor again and drops the failed row", async () => {
+    relayAnswer = async () => false;
+    await sendDM(PEER, "try again", { wrapId: "legacy", rumorId: TARGET });
+    await settle();
+    const failedWrapId = row().wrapId;
+    expect(row().status).toBe("failed");
+    buildRumorSpy.mockClear();
+    relayAnswer = async () => true;
+    selfWrapId = "w3".padEnd(64, "0");
+    await resendDM(PEER, failedWrapId);
+    await settle();
+    expect(lastCall(buildRumorSpy)[2]).toBe("try again");
+    expect(tagsOf(buildRumorSpy)).toContainEqual(["e", TARGET, ""]);
+    const rows = store.getState().dm.messages[PEER];
+    expect(rows.map((m) => [m.wrapId, m.content, m.status])).toEqual([[selfWrapId, "try again", "sent"]]);
+  });
+
+  it("resendDM ignores a row that did not fail", async () => {
+    await sendDM(PEER, "fine");
+    await settle();
+    buildRumorSpy.mockClear();
+    await resendDM(PEER, row().wrapId);
+    expect(buildRumorSpy).not.toHaveBeenCalled();
   });
 });

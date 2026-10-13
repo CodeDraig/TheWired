@@ -1,5 +1,5 @@
 import { useRef, useMemo, useState, useCallback, memo } from "react";
-import { SmilePlus, Check, CheckCheck, AlertTriangle, Timer } from "lucide-react";
+import { SmilePlus, Check, CheckCheck, AlertTriangle, AlertCircle, Clock, Timer } from "lucide-react";
 import { DM_EDIT_WINDOW_SECONDS } from "@ishtarservices/shared-types";
 import { DMFileAttachment } from "./DMFileAttachment";
 import { RichContent } from "@/components/content/RichContent";
@@ -29,6 +29,8 @@ interface DMMessageProps {
   onReply?: (message: DMMessageType) => void;
   /** Add (remove=false) or remove (remove=true) our emoji reaction. */
   onReact?: (message: DMMessageType, emoji: string, remove: boolean) => void;
+  /** Send a failed own message again. */
+  onResend?: (message: DMMessageType) => void;
   /** All messages in the conversation, for looking up reply targets */
   allMessages?: DMMessageType[];
   onJumpToMessage?: (wrapId: string) => void;
@@ -46,6 +48,7 @@ export const DMMessage = memo(function DMMessage({
   onDeleteForEveryone,
   onReply,
   onReact,
+  onResend,
   allMessages,
   onJumpToMessage,
   isRoom,
@@ -106,8 +109,11 @@ export const DMMessage = memo(function DMMessage({
   // Advisory edit window (docs/DM_WIRE_CONTRACT.md §2): 24 h, UI only.
   const canEdit = isMe && !message.isDeleted &&
     (Math.floor(Date.now() / 1000) - message.createdAt) <= DM_EDIT_WINDOW_SECONDS;
-  // An own row only exists once a relay took the wrap (sendDM throws first;
-  // history rows are our self-wraps), so "sent" is the floor, never blank.
+  // Own message state, as on mobile: sending (no relay has answered yet) →
+  // sent (a relay accepted it) → delivered / read (receipts); failed when
+  // every relay refused or none answered in time. Rows without a status
+  // (history, older rows) count as sent.
+  const sendStatus = message.status ?? "sent";
   const receipt: "sent" | "delivered" | "read" =
     (message.readBy?.length ?? 0) > 0 ? "read" : (message.deliveredTo?.length ?? 0) > 0 ? "delivered" : "sent";
   // Receipt / sync glyphs render even inside a grouped run (the time does not),
@@ -235,7 +241,34 @@ export const DMMessage = memo(function DMMessage({
                 <AlertTriangle size={10} />
               </span>
             )}
-            {isMe && !message.syncWarning && (
+            {isMe && sendStatus === "pending" && (
+              <span title="Sending…" className="inline-flex items-center" data-testid="dm-sending">
+                <Clock size={10} />
+              </span>
+            )}
+            {isMe && sendStatus === "failed" && (
+              <>
+                <span
+                  title="Not sent — no relay accepted this message"
+                  className="inline-flex items-center gap-0.5 text-red-400"
+                  data-testid="dm-failed"
+                >
+                  <AlertCircle size={10} />
+                  Failed
+                </span>
+                {onResend && (
+                  <button
+                    type="button"
+                    onClick={() => onResend(message)}
+                    className="text-muted underline hover:text-heading"
+                    data-testid="dm-resend"
+                  >
+                    Resend
+                  </button>
+                )}
+              </>
+            )}
+            {isMe && sendStatus === "sent" && !message.syncWarning && (
               <span
                 title={RECEIPT_TITLE[receipt]}
                 className={`inline-flex items-center ${receipt === "read" ? "text-primary" : ""}`}

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render } from "@testing-library/react";
+import { render, fireEvent } from "@testing-library/react";
 import { Provider } from "react-redux";
 import { MemoryRouter } from "react-router-dom";
 import { createTestStore } from "@/__tests__/helpers/createTestStore";
@@ -17,13 +17,18 @@ const ME = lunaVega.pubkey;
 const PEER = riverChen.pubkey;
 const ANY_GLYPH = '[data-testid="dm-sent"], [data-testid="dm-delivered"], [data-testid="dm-read"]';
 
-function renderMsg(message: DMMessageType, isGrouped: boolean, isRoom = false) {
+function renderMsg(
+  message: DMMessageType,
+  isGrouped: boolean,
+  isRoom = false,
+  onResend?: (m: DMMessageType) => void,
+) {
   const store = createTestStore();
   store.dispatch(login({ pubkey: ME, signerType: "tauri_keystore" }));
   return render(
     <MemoryRouter>
       <Provider store={store}>
-        <DMMessage message={message} partnerPubkey={PEER} isGrouped={isGrouped} isRoom={isRoom} />
+        <DMMessage message={message} partnerPubkey={PEER} isGrouped={isGrouped} isRoom={isRoom} onResend={onResend} />
       </Provider>
     </MemoryRouter>,
   );
@@ -95,6 +100,42 @@ describe("DMMessage receipt glyphs (kind 20015 → deliveredTo / readBy)", () =>
     const { container: b } = renderMsg({ ...base, syncWarning: true }, false);
     expect(b.querySelector(ANY_GLYPH)).toBeNull();
     expect(b.querySelector('[data-testid="dm-sync-warning"]')).not.toBeNull();
+  });
+});
+
+describe("DMMessage send state (relay OK → sent, as on mobile)", () => {
+  const SENDING = '[data-testid="dm-sending"]';
+  const FAILED = '[data-testid="dm-failed"]';
+  const RESEND = '[data-testid="dm-resend"]';
+
+  it("a pending own message shows Sending… and no check until a relay accepts it", () => {
+    const { container } = renderMsg({ ...base, status: "pending" }, false);
+    expect(container.querySelector(SENDING)?.getAttribute("title")).toBe("Sending…");
+    expect(container.querySelector(ANY_GLYPH)).toBeNull();
+  });
+
+  it("an accepted message shows the Sent check (explicit status and no status alike)", () => {
+    const { container } = renderMsg({ ...base, status: "sent" }, true);
+    expect(glyph(container).testId).toBe("dm-sent");
+    expect(container.querySelector(SENDING)).toBeNull();
+  });
+
+  it("a failed message shows Failed and a Resend that hands the row back", () => {
+    const onResend = vi.fn();
+    const failed: DMMessageType = { ...base, status: "failed" };
+    const { container } = renderMsg(failed, true, false, onResend);
+    expect(container.querySelector(FAILED)?.textContent).toContain("Failed");
+    expect(container.querySelector(ANY_GLYPH)).toBeNull();
+    fireEvent.click(container.querySelector(RESEND)!);
+    expect(onResend).toHaveBeenCalledWith(failed);
+  });
+
+  it("receipts never show on a failed row, and the peer's rows carry no send state", () => {
+    const { container: a } = renderMsg({ ...base, status: "failed", readBy: [PEER] }, false);
+    expect(a.querySelector(ANY_GLYPH)).toBeNull();
+    expect(a.querySelector(RESEND)).toBeNull(); // no handler → no button
+    const { container: b } = renderMsg({ ...base, senderPubkey: PEER, status: "pending" }, false);
+    expect(b.querySelector(SENDING)).toBeNull();
   });
 });
 

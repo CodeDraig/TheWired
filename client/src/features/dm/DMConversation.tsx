@@ -6,7 +6,7 @@ import { DMMessage } from "./DMMessage";
 import { DMInput } from "./DMInput";
 import { UnreadDivider } from "@/components/chat/UnreadDivider";
 import { useDMConversation } from "./useDMConversation";
-import { sendDM, sendDMFile, editDM, deleteDMForEveryone, reactToDM, removeDMReaction, sendTyping, sendReceipt } from "./dmService";
+import { sendDM, sendDMFile, resendDM, editDM, deleteDMForEveryone, reactToDM, removeDMReaction, sendTyping, sendReceipt } from "./dmService";
 import { useFileUpload, type UploadedAttachment } from "@/hooks/useFileUpload";
 import { useFriends } from "./useFriends";
 import { expireTyping } from "@/store/slices/dmSlice";
@@ -310,6 +310,18 @@ export function DMConversation({ partnerPubkey, onBack }: DMConversationProps) {
     [partnerPubkey],
   );
 
+  /** Send a failed own message again (a new message; the failed row goes). */
+  const handleResend = useCallback(
+    async (message: DMMessageType) => {
+      try {
+        await resendDM(partnerPubkey, message.wrapId);
+      } catch (err) {
+        console.error("Failed to resend DM:", err);
+      }
+    },
+    [partnerPubkey],
+  );
+
   /** Add or remove our emoji reaction on a DM (typed NIP-17 rumor). */
   const handleReact = useCallback(
     async (message: DMMessageType, emoji: string, remove: boolean) => {
@@ -486,6 +498,7 @@ export function DMConversation({ partnerPubkey, onBack }: DMConversationProps) {
                 onDeleteForEveryone={handleDeleteForEveryone}
                 onReply={(m) => { setReplyTo(m); setEditingMessage(null); }}
                 onReact={handleReact}
+                onResend={handleResend}
                 allMessages={messages}
                 onJumpToMessage={(targetWrapId) => scrollToMessage(targetWrapId, msg.wrapId)}
               />

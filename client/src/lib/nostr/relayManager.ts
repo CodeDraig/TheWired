@@ -551,6 +551,43 @@ class RelayManagerImpl {
     });
   }
 
+  /**
+   * Publish like `publish` (same targets, same count), and report whether
+   * any relay took it: `accepted` resolves true at the first OK true (or a
+   * `duplicate:` refusal — the relay already holds it), false once every
+   * target refused or `timeout` passed without one. A socket that is
+   * reconnecting queues the event, so the count alone proves nothing.
+   */
+  publishTracked(
+    event: NostrEvent,
+    targets?: string[],
+    timeout = 10_000,
+  ): { sent: number; accepted: Promise<boolean> } {
+    const relays = targets
+      ? targets
+          .map((url) => this.connections.get(this.key(url)))
+          .filter((c): c is RelayConnection => !!c)
+      : this.getWriteRelays();
+    if (relays.length === 0) return { sent: 0, accepted: Promise.resolve(false) };
+
+    const accepted = new Promise<boolean>((resolve) => {
+      const waiting = new Set(relays.map((c) => c.url));
+      const finish = (ok: boolean) => {
+        clearTimeout(timer);
+        this.publishOKCallbacks.delete(event.id);
+        resolve(ok);
+      };
+      this.publishOKCallbacks.set(event.id, (relayUrl, success, message) => {
+        if (!waiting.delete(relayUrl)) return;
+        if (success || message.startsWith("duplicate:")) finish(true);
+        else if (waiting.size === 0) finish(false);
+      });
+      const timer = setTimeout(() => finish(false), timeout);
+    });
+    for (const conn of relays) conn.publish(event);
+    return { sent: relays.length, accepted };
+  }
+
   /** Fetch NIP-11 relay info document to learn subscription limits.
    *  Non-blocking — if it fails, the default cap is used. */
   private async fetchNip11(url: string, conn: RelayConnection): Promise<void> {
