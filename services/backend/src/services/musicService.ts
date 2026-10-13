@@ -15,6 +15,8 @@ import { escapeMsFilter } from "../lib/meiliFilter.js";
 import { MS_LISTED_FILTER, isIndexableMusic, isListedPublicMusic } from "../lib/musicListing.js";
 import { suspensionService } from "./suspensionService.js";
 import { clearBlobAccessCache } from "./blobAccess.js";
+import { invalidateBlobScope } from "./blobReadAccess.js";
+import { isDenylisted, recordBlobOwner } from "./blobStore.js";
 import { canonicalAudioType } from "../lib/audioMime.js";
 import { probeDurationSec } from "../lib/transcode.js";
 import { ensureCoverVariants, removeCoverVariants } from "../lib/coverVariants.js";
@@ -100,6 +102,11 @@ export const musicService = {
     const sha256 = hash.digest("hex");
     const storagePath = join(BLOB_DIR, sha256);
 
+    if (await isDenylisted(sha256)) {
+      await unlink(tempPath).catch(() => {});
+      throw new UploadRejectedError("This file was removed by moderation", 451, "BLOB_DENYLISTED");
+    }
+
     // Dedup: if blob already exists on disk, skip the rename
     if (existsSync(storagePath)) {
       await unlink(tempPath).catch(() => {});
@@ -115,9 +122,10 @@ export const musicService = {
     // client's claim. Stored and returned in whole seconds (BIGINT column).
     const duration = wholeSeconds((await probeDurationSec(storagePath)) ?? clientDuration);
 
-    // Insert into blobs table (dedup-safe)
+    // Insert into blobs table (dedup-safe). Music owners are `neutral`: the
+    // music gate decides access, and an existing public/scoped row is kept.
     await db.insert(blobs).values({ sha256, size, type: mimeType, uploaded }).onConflictDoNothing();
-    await db.insert(blobOwners).values({ sha256, pubkey }).onConflictDoNothing();
+    await recordBlobOwner(sha256, pubkey, { state: "neutral" });
 
     // Insert into music_uploads for music-specific metadata
     const id = nanoid(16);
@@ -197,6 +205,11 @@ export const musicService = {
     const sha256 = hash.digest("hex");
     const storagePath = join(BLOB_DIR, sha256);
 
+    if (await isDenylisted(sha256)) {
+      await unlink(tempPath).catch(() => {});
+      throw new UploadRejectedError("This file was removed by moderation", 451, "BLOB_DENYLISTED");
+    }
+
     if (existsSync(storagePath)) {
       await unlink(tempPath).catch(() => {});
     } else {
@@ -206,9 +219,9 @@ export const musicService = {
     const url = `${config.publicUrl}/${sha256}`;
     const uploaded = Math.floor(Date.now() / 1000);
 
-    // Insert into blobs table (covers now tracked in DB)
+    // Insert into blobs table (covers now tracked in DB); a `neutral` owner, as above.
     await db.insert(blobs).values({ sha256, size, type: file.mimetype, uploaded }).onConflictDoNothing();
-    await db.insert(blobOwners).values({ sha256, pubkey }).onConflictDoNothing();
+    await recordBlobOwner(sha256, pubkey, { state: "neutral" });
 
     // Resized copies for `GET /<sha>?w=`; the original stays as uploaded. A
     // failed render doesn't fail the upload — sized requests fall back to it.
@@ -219,7 +232,8 @@ export const musicService = {
 
   /**
    * Move the signer's ownership of `shas` to `to` (key rotation). Per sha:
-   * the signer's blob_owners row becomes `to`'s (kept if `to` already has one),
+   * the signer's blob_owners row becomes `to`'s (merged with a row `to`
+   * already has: public > scoped > neutral), its blob_scopes rows move with it,
    * and music_uploads rows the signer holds for that sha are re-attributed.
    * Shas the signer does not own are skipped, so a replay changes nothing.
    */
@@ -227,13 +241,26 @@ export const musicService = {
     const moved: string[] = [];
     await db.transaction(async (tx) => {
       const owned = await tx
-        .select({ sha256: blobOwners.sha256 })
+        .select({ sha256: blobOwners.sha256, uploadState: blobOwners.uploadState })
         .from(blobOwners)
         .where(and(eq(blobOwners.pubkey, signer), inArray(blobOwners.sha256, shas)));
-      const ownedSet = new Set(owned.map((r) => r.sha256));
+      const ownedState = new Map(owned.map((r) => [r.sha256, r.uploadState]));
       for (const sha of shas) {
-        if (!ownedSet.has(sha)) continue;
-        await tx.insert(blobOwners).values({ sha256: sha, pubkey: to }).onConflictDoNothing();
+        const state = ownedState.get(sha);
+        if (!state) continue;
+        await tx.execute(
+          sql`INSERT INTO app.blob_owners AS o (sha256, pubkey, upload_state) VALUES (${sha}, ${to}, ${state})
+              ON CONFLICT (sha256, pubkey) DO UPDATE SET upload_state = CASE
+                WHEN 'public' IN (o.upload_state, EXCLUDED.upload_state) THEN 'public'
+                WHEN 'scoped' IN (o.upload_state, EXCLUDED.upload_state) THEN 'scoped'
+                ELSE 'neutral' END`,
+        );
+        await tx.execute(
+          sql`INSERT INTO app.blob_scopes (sha256, space_id, pubkey, created_at)
+              SELECT sha256, space_id, ${to}, created_at FROM app.blob_scopes
+              WHERE sha256 = ${sha} AND pubkey = ${signer}
+              ON CONFLICT DO NOTHING`,
+        );
         await tx.delete(blobOwners).where(and(eq(blobOwners.sha256, sha), eq(blobOwners.pubkey, signer)));
         await tx
           .update(musicUploads)
@@ -243,6 +270,7 @@ export const musicService = {
       }
     });
     if (moved.length > 0) clearBlobAccessCache();
+    for (const sha of moved) invalidateBlobScope(sha);
     return { moved, skipped: shas.filter((s) => !moved.includes(s)) };
   },
 
@@ -812,9 +840,10 @@ export const musicService = {
           await db.delete(musicUploads).where(eq(musicUploads.id, upload.id));
         }
 
-        // Remove blob ownership
+        // Remove blob ownership (its blob_scopes rows cascade)
         await db.delete(blobOwners)
           .where(and(eq(blobOwners.sha256, sha256), eq(blobOwners.pubkey, pubkey)));
+        invalidateBlobScope(sha256);
 
         // If no owners remain, purge blob from disk and DB
         const remaining = await db.select().from(blobOwners)
@@ -852,6 +881,7 @@ export const musicService = {
             const sha256 = sha256Match[1];
             await db.delete(blobOwners)
               .where(and(eq(blobOwners.sha256, sha256), eq(blobOwners.pubkey, pubkey)));
+            invalidateBlobScope(sha256);
             const remaining = await db.select().from(blobOwners)
               .where(eq(blobOwners.sha256, sha256)).limit(1);
             if (remaining.length === 0) {

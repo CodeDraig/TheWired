@@ -22,6 +22,7 @@ import { walletSlice } from "./slices/walletSlice";
 import { featuresSlice } from "./slices/featuresSlice";
 import { feedPrefsSlice } from "./slices/feedPrefsSlice";
 import { aiSlice } from "./slices/aiSlice";
+import { mediaPrefsSlice } from "./slices/mediaPrefsSlice";
 import { onboardingSlice } from "../features/onboarding/onboardingSlice";
 import { listenTogetherMiddleware } from "@/features/listenTogether/listenTogetherMiddleware";
 
@@ -53,6 +54,7 @@ const appReducer = combineReducers({
   features: featuresSlice.reducer,
   feedPrefs: feedPrefsSlice.reducer,
   ai: aiSlice.reducer,
+  mediaPrefs: mediaPrefsSlice.reducer,
   onboarding: onboardingSlice.reducer,
 });
 

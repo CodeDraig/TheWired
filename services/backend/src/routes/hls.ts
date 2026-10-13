@@ -6,8 +6,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db/connection.js";
 import { musicUploads } from "../db/schema/music.js";
 import { config } from "../config.js";
-import { getProtectedRefsForBlob } from "../services/blobAccess.js";
-import { verifyMediaTokenDetailed } from "../lib/mediaToken.js";
+import { authorizeBlobRead } from "../services/blobReadAccess.js";
 import { parseRange } from "../lib/httpRange.js";
 
 const BLOB_DIR = resolve(process.cwd(), config.blobDir);
@@ -15,10 +14,11 @@ const SHA_RE = /^[0-9a-f]{64}$/;
 const RENDITION_RE = /^(128k|256k)$/;
 const SEG_FILE_RE = /^(seg_\d{5}\.m4s|init\.mp4)$/;
 
-/** Tokened (private) ladders: cacheable by the client only, for about as long
- *  as a listening session. Was `no-store`, which made AVPlayer re-download every
- *  segment on a back-seek. Public ladders keep their immutable / short caching. */
-const TOKENED_CACHE_CONTROL = "private, max-age=3600";
+/** Gated (non-public) ladders: cacheable by the client only, never by a shared
+ *  cache (docs/MEDIA_STORAGE.md §4). Was `no-store`, which made AVPlayer
+ *  re-download every segment on a back-seek. Public ladders keep their
+ *  immutable / short caching. */
+const GATED_CACHE_CONTROL = "private, max-age=86400";
 
 function contentTypeFor(file: string): string {
   if (file.endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
@@ -28,26 +28,24 @@ function contentTypeFor(file: string): string {
 }
 
 type HlsAccess =
-  | { ok: true; tokened: boolean; token?: string }
+  | { ok: true; gated: boolean; token?: string }
   | { ok: false; reason: "denied" | "token_expired" };
 
 /**
- * Access decision for an HLS request. The HLS routes get NO `X-Auth-Pubkey` from the
- * gateway (media elements can't send NIP-98), so a protected ladder can only be served
- * with a valid capability token (`?tk=`). A present+valid token short-circuits the DB
- * lookup entirely (hot segment path). Public ladders are served without a token.
- * A protected ladder asked for with an EXPIRED (but correctly signed) token is
- * reported as such so the route can answer 401 and the client can re-mint.
+ * Access decision for an HLS request: the same read gate as the raw blob
+ * (services/blobReadAccess.ts — music + space scope). The HLS routes get NO
+ * `X-Auth-Pubkey` from the gateway (media elements can't send NIP-98), so a
+ * gated ladder is served on a valid `?tk=` — a music token or a viewer grant —
+ * which the playlists then carry into every child URI. A correctly signed but
+ * EXPIRED token is reported as such so the route can answer 401 and the client
+ * can re-mint.
  */
 async function checkHlsAccess(sha: string, request: FastifyRequest): Promise<HlsAccess> {
-  const tk = (request.query as { tk?: string }).tk;
-  const verdict = tk ? verifyMediaTokenDetailed(sha, tk) : "invalid";
-  if (verdict === "valid") return { ok: true, tokened: true, token: tk };
-  const protectedRefs = await getProtectedRefsForBlob(sha);
-  if (protectedRefs.length > 0) {
-    return { ok: false, reason: verdict === "expired" ? "token_expired" : "denied" };
-  }
-  return { ok: true, tokened: false }; // public
+  const tk = (request.query as { tk?: unknown }).tk;
+  return authorizeBlobRead(sha, {
+    tk: typeof tk === "string" ? tk : null,
+    authPubkey: (request as { pubkey?: string }).pubkey ?? null,
+  });
 }
 
 /** 401 `token_expired` for a stale token (re-mint hint); 404 otherwise, to hide existence. */
@@ -79,7 +77,7 @@ function tokenizePlaylist(body: string, token: string): string {
 
 async function servePlaylist(
   path: string,
-  access: { tokened: boolean; token?: string },
+  access: { gated: boolean; token?: string },
   request: FastifyRequest,
   reply: FastifyReply,
 ) {
@@ -94,11 +92,11 @@ async function servePlaylist(
   const etag = `"${st.size}-${Math.floor(st.mtimeMs)}"`;
   reply
     .header("Content-Type", contentTypeFor(path))
-    .header("Cache-Control", access.tokened ? TOKENED_CACHE_CONTROL : "public, max-age=60")
+    .header("Cache-Control", access.gated ? GATED_CACHE_CONTROL : "public, max-age=60")
     .header("ETag", etag);
   if (request.headers["if-none-match"] === etag) return reply.status(304).send();
   let body = await readFile(path, "utf8");
-  if (access.tokened && access.token) body = tokenizePlaylist(body, access.token);
+  if (access.gated && access.token) body = tokenizePlaylist(body, access.token);
   reply.header("Content-Length", Buffer.byteLength(body));
   if (request.method === "HEAD") return reply.send();
   return reply.send(body);
@@ -180,7 +178,7 @@ export const hlsRoutes: FastifyPluginAsync = async (server) => {
         .header("Content-Type", contentTypeFor(file))
         .header(
           "Cache-Control",
-          access.tokened ? TOKENED_CACHE_CONTROL : "public, max-age=31536000, immutable",
+          access.gated ? GATED_CACHE_CONTROL : "public, max-age=31536000, immutable",
         )
         .header("Accept-Ranges", "bytes")
         .header("ETag", etag);

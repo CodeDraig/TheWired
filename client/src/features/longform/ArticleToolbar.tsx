@@ -23,13 +23,18 @@ import {
   insertImage,
   type BlockResult,
 } from "@/lib/content/markdownBlock";
-import { blossomUpload } from "@/lib/api/blossom";
+import type { UploadContext } from "@ishtarservices/core";
+import { uploadWithContext } from "@/lib/media/uploadPlan";
 import { useClickOutside } from "@/hooks/useClickOutside";
 
 interface ArticleToolbarProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   value: string;
   setValue: (value: string) => void;
+  /** Where inserted images are stored — follows the article's audience. */
+  uploadContext: UploadContext;
+  /** Called with each uploaded image URL. */
+  onUploaded?: (url: string, context: UploadContext) => void;
 }
 
 /**
@@ -37,7 +42,7 @@ interface ArticleToolbarProps {
  * markdown for the user — they never need to know what markdown is. Pairs with
  * the live Preview tab and {@link useMarkdownShortcuts} (keyboard) in the editor.
  */
-export function ArticleToolbar({ textareaRef, value, setValue }: ArticleToolbarProps) {
+export function ArticleToolbar({ textareaRef, value, setValue, uploadContext, onUploaded }: ArticleToolbarProps) {
   const [showHeadings, setShowHeadings] = useState(false);
   const [showLink, setShowLink] = useState(false);
   const [linkUrl, setLinkUrl] = useState("");
@@ -106,7 +111,9 @@ export function ArticleToolbar({ textareaRef, value, setValue }: ArticleToolbarP
     }
     setUploading(true);
     try {
-      const res = await blossomUpload(file);
+      const ctx = uploadContext;
+      const res = await uploadWithContext(file, ctx);
+      onUploaded?.(res.url, ctx);
       // Read the freshest value so an async upload can't clobber meanwhile-typed text.
       const cur = textareaRef.current?.value ?? value;
       const alt = file.name.replace(/\.[^.]+$/, "");

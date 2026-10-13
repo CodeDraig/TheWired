@@ -16,6 +16,7 @@ import { EmojiAutocomplete } from "@/components/content/EmojiAutocomplete";
 import { AttachmentPreview } from "@/components/chat/AttachmentPreview";
 import { GifPreview } from "@/components/chat/GifPreview";
 import type { AnnotationLabel, MusicAnnotation } from "@/types/music";
+import type { UploadContext } from "@ishtarservices/core";
 import type { GifItem } from "@/types/emoji";
 import type { EmojiSelectResult } from "@/components/chat/EmojiPicker";
 
@@ -35,6 +36,14 @@ const LABELS: { value: AnnotationLabel; display: string }[] = [
 ];
 
 type VisibilityTier = "public" | "space" | "private";
+
+/** Upload context per audience (docs/MEDIA_STORAGE.md §1). Space notes take the
+ *  space-asset rules: our server, unscoped. */
+const UPLOAD_CONTEXT: Record<VisibilityTier, UploadContext> = {
+  public: { kind: "public" },
+  space: { kind: "spaceAsset" },
+  private: { kind: "private" },
+};
 
 function detectEmojiQuery(value: string, cursorPos: number): string | null {
   const before = value.slice(0, cursorPos);
@@ -84,7 +93,14 @@ export function NotesTab({ targetRef, targetName, ownerPubkey }: NotesTabProps) 
     isUploading,
     hasAttachments,
     addFiles,
-  } = useFileUpload();
+    retryAttachment,
+  } = useFileUpload({
+    context: UPLOAD_CONTEXT[visibility],
+    // Changing who can see the note re-uploads pending files under the new
+    // audience's rules instead of sending them as uploaded.
+    onContextChange: "reupload",
+  });
+  const [audienceMoved, setAudienceMoved] = useState(false);
 
   useAutoResize(textareaRef, content, 120);
 
@@ -263,6 +279,7 @@ export function NotesTab({ targetRef, targetName, ownerPubkey }: NotesTabProps) 
       setEmojiQuery(null);
       customEmojiMapRef.current.clear();
       clearAttachments();
+      setAudienceMoved(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save");
     } finally {
@@ -275,6 +292,7 @@ export function NotesTab({ targetRef, targetName, ownerPubkey }: NotesTabProps) 
   };
 
   const cycleVisibility = () => {
+    if (hasAttachments) setAudienceMoved(true);
     setVisibility((v) => {
       if (v === "public") return spaces.length > 0 ? "space" : "private";
       if (v === "space") return "private";
@@ -446,7 +464,12 @@ export function NotesTab({ targetRef, targetName, ownerPubkey }: NotesTabProps) 
           {/* Attachment previews */}
           {hasAttachments && (
             <div className="mt-1">
-              <AttachmentPreview attachments={attachments} onRemove={removeAttachment} />
+              <AttachmentPreview attachments={attachments} onRemove={removeAttachment} onRetry={retryAttachment} />
+              {audienceMoved && isUploading && (
+                <p className="px-1 text-[10px] text-muted">
+                  Re-uploading attachments for a {visibilityLabel.toLowerCase()} note…
+                </p>
+              )}
             </div>
           )}
 

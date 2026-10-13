@@ -1,11 +1,15 @@
 import { useState, useRef, useCallback } from "react";
 import { Upload, X, Link } from "lucide-react";
-import { blossomUpload } from "@/lib/api/blossom";
+import type { UploadContext } from "@ishtarservices/core";
+import { uploadWithContext } from "@/lib/media/uploadPlan";
 import { Spinner } from "./Spinner";
 
 interface ImageUploadProps {
   value: string;
   onChange: (url: string) => void;
+  /** Where the image may be stored (docs/MEDIA_STORAGE.md §1): `public` for
+   *  profile pictures, `spaceAsset` for space icons and onboarding images. */
+  context: UploadContext;
   label?: string;
   placeholder?: string;
   /** Shape of the preview */
@@ -15,6 +19,7 @@ interface ImageUploadProps {
 export function ImageUpload({
   value,
   onChange,
+  context,
   label,
   placeholder = "Upload image or paste URL",
   shape = "square",
@@ -40,7 +45,7 @@ export function ImageUpload({
       setError(null);
 
       try {
-        const result = await blossomUpload(file);
+        const result = await uploadWithContext(file, context);
         onChange(result.url);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Upload failed");
@@ -48,7 +53,7 @@ export function ImageUpload({
         setUploading(false);
       }
     },
-    [onChange],
+    [onChange, context],
   );
 
   const handleDrop = useCallback(

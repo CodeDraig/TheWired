@@ -771,6 +771,7 @@ function MediaStep({
         <ImageUpload
           value={form.picture ?? ""}
           onChange={(url) => onUpdate("picture", url)}
+          context={{ kind: "public" }}
           label="Avatar"
           placeholder="Drop avatar image or click to upload"
           shape="circle"
@@ -778,6 +779,7 @@ function MediaStep({
         <ImageUpload
           value={form.banner ?? ""}
           onChange={(url) => onUpdate("banner", url)}
+          context={{ kind: "public" }}
           label="Banner"
           placeholder="Drop banner image or click to upload"
           shape="banner"

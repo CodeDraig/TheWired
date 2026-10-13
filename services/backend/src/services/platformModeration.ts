@@ -1,20 +1,24 @@
-import { sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/connection.js";
 import { moderationAuditLog } from "../db/schema/moderation.js";
+import { blobOwners } from "../db/schema/blobs.js";
 import { config } from "../config.js";
 import { nanoid } from "../lib/id.js";
 import { getMeilisearchClient } from "../lib/meilisearch.js";
 import { parseCoordinate } from "../lib/reports/reportInput.js";
 import { musicService } from "./musicService.js";
 import { suspensionService } from "./suspensionService.js";
+import { purgeAndDenylistBlobs } from "./blobStore.js";
 
 /**
  * Operator moderation actions (App Store 1.2), shared by the admin routes and
  * the `pnpm reports:*` CLI. Each is reversible where it can be and each writes
  * `app.moderation_audit_log` (space_id NULL = platform level):
  *
- *   remove_event   tombstone + delete from relay.events + Meilisearch.
- *                  Reversible: `restoreEvent` re-publishes the kept copy.
+ *   remove_event   tombstone + delete from relay.events + Meilisearch, and
+ *                  the own-server blobs its author uploaded for it are deleted
+ *                  and denylisted. Reversible: `restoreEvent` re-publishes the
+ *                  kept copy (the blobs are not recoverable).
  *   remove_music   the existing `musicService.deleteMusic` path (blobs, HLS,
  *                  plays, counts) + tombstones. The event is restorable, the
  *                  deleted audio is not.
@@ -107,6 +111,60 @@ async function tombstone(row: RelayEventRow, ctx: ActionContext): Promise<void> 
   );
 }
 
+const HEX64_RE = /^[0-9a-f]{64}$/;
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Own-server blob shas an event references: imeta `x` and every URL inside an
+ * imeta tag, `url` / `image` / `thumb` tags, and `<PUBLIC_URL>/<sha>[.<ext>]`
+ * links in the content.
+ */
+export function referencedOwnBlobShas(event: { tags: string[][]; content: string }): string[] {
+  const origin = config.publicUrl.replace(/\/+$/, "");
+  const urlRe = new RegExp(`${escapeRegExp(origin)}/([0-9a-f]{64})(?![0-9a-f])`, "gi");
+  const shas = new Set<string>();
+  const scan = (text: unknown) => {
+    if (typeof text !== "string") return;
+    for (const m of text.matchAll(urlRe)) shas.add(m[1].toLowerCase());
+  };
+  for (const tag of event.tags) {
+    if (!Array.isArray(tag)) continue;
+    if (tag[0] === "imeta") {
+      for (const entry of tag.slice(1)) {
+        if (typeof entry !== "string") continue;
+        if (entry.startsWith("x ") && HEX64_RE.test(entry.slice(2))) shas.add(entry.slice(2));
+        else scan(entry);
+      }
+    } else if (tag[0] === "url" || tag[0] === "image" || tag[0] === "thumb") {
+      scan(tag[1]);
+    }
+  }
+  scan(event.content);
+  return [...shas];
+}
+
+/**
+ * Delete and denylist the own-server blobs a removed event carried
+ * (docs/MEDIA_STORAGE.md §6). Only blobs the event's AUTHOR owns: an event can
+ * point at anyone's blob, and removing it must not take a third party's media
+ * down with it. Returns the purged shas.
+ */
+async function purgeEventBlobs(row: RelayEventRow, ctx: ActionContext): Promise<string[]> {
+  const shas = referencedOwnBlobShas(row);
+  if (shas.length === 0) return [];
+  const owned = await db
+    .select({ sha256: blobOwners.sha256 })
+    .from(blobOwners)
+    .where(and(eq(blobOwners.pubkey, row.pubkey), inArray(blobOwners.sha256, shas)));
+  const purged = owned.map((r) => r.sha256);
+  const reason = `removed with event ${row.id}${ctx.reportId ? ` (report ${ctx.reportId})` : ""}`;
+  await purgeAndDenylistBlobs(purged, reason);
+  return purged;
+}
+
 export type RemoveResult =
   | { ok: true; removed: string[]; pubkey: string; music: boolean }
   | { ok: false; code: "EVENT_NOT_FOUND" | "NOT_MUSIC" };
@@ -138,10 +196,12 @@ export async function removeEvent(target: { eventId?: string | null; coordinate?
   } catch {
     // not indexed
   }
+  const blobsPurged = await purgeEventBlobs(row, ctx);
   await logPlatformAudit(ctx.actor, "report_remove_event", row.pubkey, {
     reportId: ctx.reportId,
     eventId: row.id,
     kind: row.kind,
+    blobs: blobsPurged.length > 0 ? blobsPurged : undefined,
     note: ctx.note ?? undefined,
   });
   return { ok: true, removed: [row.id], pubkey: row.pubkey, music: false };
@@ -267,7 +327,8 @@ export type RestoreResult =
  * be cleared first — the relay refuses a tombstoned id — and is put back if
  * the relay does not take the event, so a failed restore leaves the removal in
  * force rather than an event that is neither removed nor back. Deleted audio
- * blobs are not recoverable — a restored track needs its owner to re-upload.
+ * blobs are not recoverable — a restored track needs its owner to re-upload —
+ * and neither are the denylisted blobs a removed event took with it.
  */
 export async function restoreEvent(eventId: string, actor: string, note?: string | null): Promise<RestoreResult> {
   const tomb = await getTombstone(eventId);

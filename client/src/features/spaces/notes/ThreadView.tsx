@@ -61,7 +61,7 @@ const ThreadReply = memo(function ThreadReply({ event, rootId }: { event: NostrE
         <span className="text-xs text-muted">{timeStr}</span>
       </div>
       <div className="text-sm leading-relaxed text-body">
-        <RichContent content={event.content} onMentionClick={openUserPopover} />
+        <RichContent content={event.content} event={event} onMentionClick={openUserPopover} />
       </div>
     </div>
   );

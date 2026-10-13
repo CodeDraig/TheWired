@@ -78,7 +78,8 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
     isUploading,
     hasAttachments,
     addFiles,
-  } = useFileUpload();
+    retryAttachment,
+  } = useFileUpload({ context: { kind: "public" } });
 
   useAutoResize(textareaRef, value, 200);
 
@@ -485,7 +486,7 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
       </div>
 
       {/* Attachment previews */}
-      <AttachmentPreview attachments={attachments} onRemove={removeAttachment} />
+      <AttachmentPreview attachments={attachments} onRemove={removeAttachment} onRetry={retryAttachment} />
 
       {/* GIF preview */}
       {pendingGif && (

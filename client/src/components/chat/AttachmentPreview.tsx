@@ -1,10 +1,12 @@
-import { X, FileText, Music, Film, ImageIcon, AlertCircle } from "lucide-react";
+import { X, FileText, Music, Film, ImageIcon, AlertCircle, RotateCcw } from "lucide-react";
 import { Spinner } from "@/components/ui/Spinner";
 import type { UploadedAttachment } from "@/hooks/useFileUpload";
 
 interface AttachmentPreviewProps {
   attachments: UploadedAttachment[];
   onRemove: (id: string) => void;
+  /** Retry a failed upload. Without it the error tile only shows the failure. */
+  onRetry?: (id: string) => void;
 }
 
 function getFileCategory(file: File): "image" | "video" | "audio" | "pdf" | "other" {
@@ -24,9 +26,11 @@ function formatFileSize(bytes: number): string {
 function AttachmentItem({
   attachment,
   onRemove,
+  onRetry,
 }: {
   attachment: UploadedAttachment;
   onRemove: () => void;
+  onRetry?: () => void;
 }) {
   const category = getFileCategory(attachment.file);
   const isError = attachment.status === "error";
@@ -56,12 +60,26 @@ function AttachmentItem({
         </div>
       )}
 
-      {/* Error overlay */}
-      {isError && (
-        <div className="absolute inset-0 z-5 flex items-center justify-center rounded-lg bg-black/40">
-          <AlertCircle size={16} className="text-red-400" />
-        </div>
-      )}
+      {/* Error overlay — the upload never went anywhere outside its plan */}
+      {isError &&
+        (onRetry ? (
+          <button
+            type="button"
+            onClick={onRetry}
+            title={attachment.error ? `Upload failed: ${attachment.error}` : "Upload failed"}
+            className="absolute inset-0 z-5 flex flex-col items-center justify-center gap-1 rounded-lg bg-black/50 text-[10px] font-medium text-red-300 transition-colors hover:bg-black/60"
+          >
+            <RotateCcw size={14} />
+            Retry
+          </button>
+        ) : (
+          <div
+            className="absolute inset-0 z-5 flex items-center justify-center rounded-lg bg-black/40"
+            title={attachment.error ? `Upload failed: ${attachment.error}` : "Upload failed"}
+          >
+            <AlertCircle size={16} className="text-red-400" />
+          </div>
+        ))}
 
       {category === "image" && (
         <img
@@ -124,7 +142,7 @@ function AttachmentItem({
   );
 }
 
-export function AttachmentPreview({ attachments, onRemove }: AttachmentPreviewProps) {
+export function AttachmentPreview({ attachments, onRemove, onRetry }: AttachmentPreviewProps) {
   if (attachments.length === 0) return null;
 
   return (
@@ -134,6 +152,7 @@ export function AttachmentPreview({ attachments, onRemove }: AttachmentPreviewPr
           key={att.id}
           attachment={att}
           onRemove={() => onRemove(att.id)}
+          onRetry={onRetry ? () => onRetry(att.id) : undefined}
         />
       ))}
     </div>

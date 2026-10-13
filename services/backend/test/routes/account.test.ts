@@ -254,7 +254,9 @@ describe("DELETE /account — the purge", () => {
     // Music + blobs
     expect(await count(sql`SELECT COUNT(*)::int AS n FROM relay.events WHERE id = ${trackId}`)).toBe(0);
     expect((await db.select().from(blobs)).map((b) => b.sha256)).toEqual(["b".repeat(64)]);
-    expect(await db.select().from(blobOwners)).toEqual([{ sha256: "b".repeat(64), pubkey: other }]);
+    expect(await db.select({ sha256: blobOwners.sha256, pubkey: blobOwners.pubkey }).from(blobOwners)).toEqual([
+      { sha256: "b".repeat(64), pubkey: other },
+    ]);
 
     // Relay events
     expect(await count(sql`SELECT COUNT(*)::int AS n FROM relay.events WHERE id = ${theirNote.id}`)).toBe(0);

@@ -7,10 +7,7 @@ import { Avatar } from "../../components/ui/Avatar";
 import { RichContent } from "../../components/content/RichContent";
 import { useProfile } from "../profile/useProfile";
 import { useUserPopover } from "../profile/UserPopoverContext";
-import {
-  extractMediaUrls,
-  stripMediaUrls,
-} from "../../lib/media/mediaUrlParser";
+import { useNoteMedia } from "../../lib/media/useNoteMedia";
 import { imageCache } from "../../lib/cache/imageCache";
 import { MediaGallery } from "../../components/media";
 import { useScrollRestore } from "../../hooks/useScrollRestore";
@@ -65,16 +62,7 @@ const NoteCard = memo(function NoteCard({ event }: { event: NostrEvent }) {
     minute: "2-digit",
   });
 
-  const { cleanText, media } = useMemo(() => {
-    const extracted = extractMediaUrls(event.content);
-    return {
-      cleanText:
-        extracted.length > 0
-          ? stripMediaUrls(event.content)
-          : event.content,
-      media: extracted,
-    };
-  }, [event.content]);
+  const { text: cleanText, media } = useNoteMedia(event);
 
   useEffect(() => {
     const imageUrls = media
@@ -115,6 +103,7 @@ const NoteCard = memo(function NoteCard({ event }: { event: NostrEvent }) {
         <div className="text-sm leading-relaxed text-body">
           <RichContent
             content={cleanText}
+            event={event}
             onMentionClick={openUserPopover}
             suppressEventIds={quoteRef ? [quoteRef.eventId] : undefined}
           />

@@ -1,10 +1,21 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { blossomUpload, blossomUploadBytes, type BlossomUploadResult } from "@/lib/api/blossom";
-import { encryptDMFile } from "@ishtarservices/core";
+import { planForContext } from "@/lib/media/uploadPlan";
+import { useAppSelector } from "@/store/hooks";
+import { encryptDMFile, uploadContextKey, type UploadContext, type UploadPlan } from "@ishtarservices/core";
 import type { DMFileMeta } from "@ishtarservices/shared-types";
 
-const isTauri =
-  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+/** Evaluated per call (not at module load) so tests can stand in a Tauri window. */
+function isTauriEnv(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+/** One shared import for every mounted composer's drop listener. */
+let webviewModule: Promise<typeof import("@tauri-apps/api/webview")> | null = null;
+function loadWebview() {
+  webviewModule ??= import("@tauri-apps/api/webview");
+  return webviewModule;
+}
 
 export interface UploadedAttachment {
   id: string;
@@ -17,6 +28,9 @@ export interface UploadedAttachment {
   /** Set when uploaded encrypted (DMs): the kind-15 metadata to send.
    *  `result.url` then points at the opaque ciphertext blob. */
   dmFile?: DMFileMeta;
+  /** `uploadContextKey` of the context this was uploaded under. An attachment
+   *  is only ever sent under that same context (docs/MEDIA_STORAGE.md §1). */
+  contextKey: string;
 }
 
 /** `<w>x<h>` of an image file, or undefined for non-images / failures. */
@@ -31,11 +45,15 @@ function imageDimensions(file: File, previewUrl: string): Promise<string | undef
 }
 
 /** Encrypt (AES-256-GCM, docs/DM_WIRE_CONTRACT.md §3.4) and upload as an opaque blob. */
-async function uploadEncrypted(file: File, previewUrl: string): Promise<{ result: BlossomUploadResult; dmFile: DMFileMeta }> {
+async function uploadEncrypted(
+  file: File,
+  previewUrl: string,
+  plan: UploadPlan,
+): Promise<{ result: BlossomUploadResult; dmFile: DMFileMeta }> {
   const mime = file.type || "application/octet-stream";
   const plain = new Uint8Array(await file.arrayBuffer());
   const enc = encryptDMFile(plain);
-  const result = await blossomUploadBytes(enc.ciphertext, "application/octet-stream", { preferOwn: true, ext: "bin" });
+  const result = await blossomUploadBytes(enc.ciphertext, "application/octet-stream", { plan, ext: "bin" });
   const dim = await imageDimensions(file, previewUrl);
   const dmFile: DMFileMeta = {
     url: result.url,
@@ -79,50 +97,93 @@ function isAcceptedType(file: File): boolean {
   return ext ? ext in EXT_TO_MIME : false;
 }
 
-export function useFileUpload(opts: { encrypt?: boolean } = {}) {
+/**
+ * Does a native (Tauri) drag position land on this drop zone? Tauri reports
+ * physical pixels; the DOM works in CSS pixels. A zone that isn't laid out
+ * (a mounted-but-hidden composer: zero-size rect) never matches, and when
+ * something else is painted on top at that point (a modal), it owns the drop.
+ */
+export function dropZoneContains(zone: HTMLElement | null, position: { x: number; y: number }): boolean {
+  if (!zone) return false;
+  const scale = window.devicePixelRatio || 1;
+  const x = position.x / scale;
+  const y = position.y / scale;
+  const r = zone.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return false;
+  if (x < r.left || x > r.right || y < r.top || y > r.bottom) return false;
+  const top = typeof document.elementFromPoint === "function" ? document.elementFromPoint(x, y) : null;
+  return !top || zone.contains(top);
+}
+
+export interface UseFileUploadOptions {
+  /** Where these uploads may go (docs/MEDIA_STORAGE.md §1). Required: there is
+   *  no default context. */
+  context: UploadContext;
+  /** Encrypt before upload (DM attachments, kind 15). */
+  encrypt?: boolean;
+  /**
+   * What happens to attachments uploaded under a previous context when
+   * `context` changes (space switched, visibility changed): `drop` removes
+   * them (default), `reupload` uploads them again under the new context,
+   * `manual` leaves it to the caller (`dropStaleAttachments` /
+   * `reuploadStaleAttachments`). A stale attachment is never sent as-is.
+   */
+  onContextChange?: "drop" | "reupload" | "manual";
+}
+
+export function useFileUpload(opts: UseFileUploadOptions) {
   const encrypt = !!opts.encrypt;
+  const policy = opts.onContextChange ?? "drop";
+  const contextKey = uploadContextKey(opts.context);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const context = useMemo(() => opts.context, [contextKey]);
+  const contextRef = useRef(context);
+  contextRef.current = context;
+
+  const prefs = useAppSelector((s) => s.mediaPrefs.prefs);
+  const prefsRef = useRef(prefs);
+  prefsRef.current = prefs;
+
   const [attachments, setAttachments] = useState<UploadedAttachment[]>([]);
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
   const dragCounterRef = useRef(0);
+  /** Upload attempt per attachment id: a superseded attempt's result is ignored. */
+  const attemptRef = useRef(new Map<string, number>());
 
-  const addFiles = useCallback(async (files: FileList | File[]) => {
-    const fileArray = Array.from(files);
+  /** (Re)upload one attachment under the current context. */
+  const startUpload = useCallback(
+    (id: string, file: File, previewUrl: string) => {
+      const ctx = contextRef.current;
+      const key = uploadContextKey(ctx);
+      const attempt = (attemptRef.current.get(id) ?? 0) + 1;
+      attemptRef.current.set(id, attempt);
+      const plan = planForContext(ctx, prefsRef.current);
 
-    for (const file of fileArray) {
-      if (!isAcceptedType(file)) {
-        console.warn(`[Upload] Rejected file type: ${file.type || file.name}`);
-        continue;
-      }
-      if (file.size > MAX_FILE_SIZE) {
-        console.warn(`[Upload] File too large: ${file.name} (${file.size} bytes)`);
-        continue;
-      }
-
-      const id = `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      const previewUrl = URL.createObjectURL(file);
-
-      const attachment: UploadedAttachment = {
-        id,
-        file,
-        result: null,
-        status: "uploading",
-        previewUrl,
-      };
-
-      setAttachments((prev) => [...prev, attachment]);
+      setAttachments((prev) =>
+        prev.map((a) =>
+          a.id === id
+            ? { ...a, status: "uploading", error: undefined, result: null, dmFile: undefined, contextKey: key }
+            : a,
+        ),
+      );
 
       const upload = encrypt
-        ? uploadEncrypted(file, previewUrl)
-        : blossomUpload(file).then((result) => ({ result, dmFile: undefined as DMFileMeta | undefined }));
+        ? uploadEncrypted(file, previewUrl, plan)
+        : blossomUpload(file, plan).then((result) => ({ result, dmFile: undefined as DMFileMeta | undefined }));
+      const current = () => attemptRef.current.get(id) === attempt;
       upload
         .then(({ result, dmFile }) => {
+          if (!current()) return;
           setAttachments((prev) =>
             prev.map((a) => (a.id === id ? { ...a, result, dmFile, status: "done" } : a)),
           );
         })
         .catch((err) => {
+          if (!current()) return;
           setAttachments((prev) =>
             prev.map((a) =>
               a.id === id
@@ -131,12 +192,84 @@ export function useFileUpload(opts: { encrypt?: boolean } = {}) {
             ),
           );
         });
+    },
+    [encrypt],
+  );
+
+  const addFiles = useCallback(
+    (files: FileList | File[]) => {
+      for (const file of Array.from(files)) {
+        if (!isAcceptedType(file)) {
+          console.warn(`[Upload] Rejected file type: ${file.type || file.name}`);
+          continue;
+        }
+        if (file.size > MAX_FILE_SIZE) {
+          console.warn(`[Upload] File too large: ${file.name} (${file.size} bytes)`);
+          continue;
+        }
+
+        const id = `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const previewUrl = URL.createObjectURL(file);
+        const attachment: UploadedAttachment = {
+          id,
+          file,
+          result: null,
+          status: "uploading",
+          previewUrl,
+          contextKey: uploadContextKey(contextRef.current),
+        };
+        setAttachments((prev) => [...prev, attachment]);
+        startUpload(id, file, previewUrl);
+      }
+    },
+    [startUpload],
+  );
+
+  /** Remove attachments uploaded under a context other than the current one. */
+  const dropStaleAttachments = useCallback(() => {
+    const key = uploadContextKey(contextRef.current);
+    setAttachments((prev) => {
+      const keep: UploadedAttachment[] = [];
+      for (const a of prev) {
+        if (a.contextKey === key) keep.push(a);
+        else {
+          attemptRef.current.delete(a.id);
+          URL.revokeObjectURL(a.previewUrl);
+        }
+      }
+      return keep.length === prev.length ? prev : keep;
+    });
+  }, []);
+
+  /** Upload stale attachments again under the current context. */
+  const reuploadStaleAttachments = useCallback(() => {
+    const key = uploadContextKey(contextRef.current);
+    for (const a of attachmentsRef.current) {
+      if (a.contextKey !== key) startUpload(a.id, a.file, a.previewUrl);
     }
-  }, [encrypt]);
+  }, [startUpload]);
+
+  /** Retry a failed upload (under the current context). */
+  const retryAttachment = useCallback(
+    (id: string) => {
+      const a = attachmentsRef.current.find((x) => x.id === id);
+      if (a && a.status !== "uploading") startUpload(a.id, a.file, a.previewUrl);
+    },
+    [startUpload],
+  );
+
+  // Context changed: never let an attachment ride along under the new target.
+  const prevKeyRef = useRef(contextKey);
+  useEffect(() => {
+    if (prevKeyRef.current === contextKey) return;
+    prevKeyRef.current = contextKey;
+    if (policy === "drop") dropStaleAttachments();
+    else if (policy === "reupload") reuploadStaleAttachments();
+  }, [contextKey, policy, dropStaleAttachments, reuploadStaleAttachments]);
 
   // ---- Tauri native file drop ----
   useEffect(() => {
-    if (!isTauri) return;
+    if (!isTauriEnv()) return;
 
     // Use a cancelled flag so the async listener can check if this effect
     // was cleaned up (fixes React StrictMode double-mount leak)
@@ -145,33 +278,36 @@ export function useFileUpload(opts: { encrypt?: boolean } = {}) {
 
     (async () => {
       try {
-        const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+        const { getCurrentWebview } = await loadWebview();
         if (cancelled) return;
 
         const webview = getCurrentWebview();
+        // Every mounted composer hears every native drop; only the one under
+        // the cursor takes it.
         unlisten = await webview.onDragDropEvent(async (event) => {
           if (cancelled) return;
+          const payload = event.payload;
 
-          if (event.payload.type === "over") {
-            setDragOver(true);
-          } else if (event.payload.type === "leave") {
+          if (payload.type === "enter" || payload.type === "over") {
+            setDragOver(dropZoneContains(dropZoneRef.current, payload.position));
+          } else if (payload.type === "leave") {
             setDragOver(false);
-          } else if (event.payload.type === "drop") {
+          } else if (payload.type === "drop") {
             setDragOver(false);
-            const paths: string[] = event.payload.paths;
+            if (!dropZoneContains(dropZoneRef.current, payload.position)) return;
+            const paths: string[] = payload.paths;
             if (!paths.length) return;
 
             try {
               const { readFile } = await import("@tauri-apps/plugin-fs");
               const files: File[] = [];
               for (const path of paths) {
-                const name = path.split("/").pop() ?? path.split("\\").pop() ?? "file";
+                const name = path.split(/[\\/]/).pop() || "file";
                 const ext = name.split(".").pop()?.toLowerCase() ?? "";
-                const mime = EXT_TO_MIME[ext] ?? "application/octet-stream";
                 if (!(ext in EXT_TO_MIME)) continue;
 
                 const data = await readFile(path);
-                const file = new File([data], name, { type: mime });
+                const file = new File([data], name, { type: EXT_TO_MIME[ext] });
                 if (file.size <= MAX_FILE_SIZE) {
                   files.push(file);
                 }
@@ -202,7 +338,7 @@ export function useFileUpload(opts: { encrypt?: boolean } = {}) {
   useEffect(() => {
     // In Tauri, native onDragDropEvent handles file drops. Skip HTML5 listeners
     // to avoid double-processing.
-    if (isTauri) return;
+    if (isTauriEnv()) return;
 
     const zone = dropZoneRef.current;
     if (!zone) return;
@@ -255,6 +391,7 @@ export function useFileUpload(opts: { encrypt?: boolean } = {}) {
   }, [addFiles]);
 
   const removeAttachment = useCallback((id: string) => {
+    attemptRef.current.delete(id);
     setAttachments((prev) => {
       const att = prev.find((a) => a.id === id);
       if (att) URL.revokeObjectURL(att.previewUrl);
@@ -263,6 +400,7 @@ export function useFileUpload(opts: { encrypt?: boolean } = {}) {
   }, []);
 
   const clearAttachments = useCallback(() => {
+    attemptRef.current.clear();
     setAttachments((prev) => {
       for (const a of prev) URL.revokeObjectURL(a.previewUrl);
       return [];
@@ -285,12 +423,19 @@ export function useFileUpload(opts: { encrypt?: boolean } = {}) {
 
   const isUploading = attachments.some((a) => a.status === "uploading");
   const hasAttachments = attachments.length > 0;
+  const staleCount = attachments.filter((a) => a.contextKey !== contextKey).length;
 
   return {
     attachments,
+    /** The current context's key; an attachment with another key is stale. */
+    contextKey,
+    staleCount,
     addFiles,
     removeAttachment,
     clearAttachments,
+    retryAttachment,
+    dropStaleAttachments,
+    reuploadStaleAttachments,
     openFilePicker,
     handleFileInputChange,
     fileInputRef,

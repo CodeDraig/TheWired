@@ -13,6 +13,7 @@ import { clearUnreadDivider } from "../../store/slices/notificationSlice";
 import { useUserPopover } from "../../features/profile/UserPopoverContext";
 import { usePermissions } from "../../features/spaces/usePermissions";
 import { parseChannelIdPart } from "../../features/spaces/spaceSelectors";
+import { canGateSpaceMedia } from "../../features/spaces/spaceType";
 import { RichContent } from "../../components/content/RichContent";
 import { profileCache } from "../../lib/nostr/profileCache";
 import { usePollVotesSub } from "../polls/usePollVotesSub";
@@ -28,6 +29,10 @@ export function ChatView() {
   const spaceMode = useAppSelector(
     (s) => s.spaces.list.find((sp) => sp.id === s.spaces.activeSpaceId)?.mode,
   );
+  const mediaGateable = useAppSelector((s) => {
+    const space = s.spaces.list.find((sp) => sp.id === s.spaces.activeSpaceId);
+    return space ? canGateSpaceMedia(space) : false;
+  });
   const memberPubkeys = useAppSelector(
     (s) => s.spaces.list.find((sp) => sp.id === s.spaces.activeSpaceId)?.memberPubkeys,
   );
@@ -44,8 +49,13 @@ export function ChatView() {
   const isAdmin = !!(myPubkey && adminPubkeys?.includes(myPubkey));
   const { openUserPopover } = useUserPopover();
 
-  // File upload — owned here so dropZoneRef covers the entire chat view
-  const upload = useFileUpload();
+  // File upload — owned here so dropZoneRef covers the entire chat view.
+  // ChannelPanel keeps one ChatView alive across spaces: the context key
+  // includes the space, so switching spaces drops pending attachments.
+  const upload = useFileUpload({
+    context: { kind: "space", spaceId: activeSpaceId ?? "", gateable: mediaGateable },
+    onContextChange: "drop",
+  });
   const { scrollPaddingClass } = usePlaybackBarSpacing();
 
   // Unread divider: timestamp of old lastRead for this channel
@@ -76,6 +86,12 @@ export function ChatView() {
     editMessage,
     canEdit,
   } = useChat();
+
+  // A message still sending renders its own just-uploaded space media.
+  const pendingMediaContext = useMemo(
+    () => ({ tags: activeSpaceId ? [["h", activeSpaceId]] : [], pubkey: myPubkey ?? undefined }),
+    [activeSpaceId, myPubkey],
+  );
 
   // Batch one #e votes sub for all polls visible in this channel
   const pollIds = useMemo(
@@ -213,7 +229,7 @@ export function ChatView() {
                 className="flex items-center gap-2 px-4 py-1.5 opacity-60"
               >
                 <div className="min-w-0 flex-1 text-sm text-soft">
-                  <RichContent content={msg.content} />
+                  <RichContent content={msg.content} event={pendingMediaContext} />
                 </div>
                 {msg.status === "pending" && <Spinner size="sm" />}
                 {msg.status === "failed" && (
@@ -269,6 +285,7 @@ export function ChatView() {
           spaceId={activeSpaceId}
           attachments={upload.attachments}
           onRemoveAttachment={upload.removeAttachment}
+          onRetryAttachment={upload.retryAttachment}
           onClearAttachments={upload.clearAttachments}
           onOpenFilePicker={upload.openFilePicker}
           onAddFiles={upload.addFiles}

@@ -14,7 +14,7 @@ import { useProfileNoteActions } from "./useProfileNoteActions";
 import { useNoteEngagement } from "../spaces/useNoteEngagement";
 import { EngagementCollectorProvider, useEngagementReporter } from "./engagementCollector";
 import { parseQuoteRef } from "../spaces/noteParser";
-import { extractMediaUrls, stripMediaUrls } from "../../lib/media/mediaUrlParser";
+import { useNoteMedia } from "../../lib/media/useNoteMedia";
 import { MediaGallery } from "../../components/media";
 import { useAppSelector } from "../../store/hooks";
 import { eventsSelectors } from "../../store/slices/eventsSlice";
@@ -179,11 +179,7 @@ function RootNoteExpanded({ event }: { event: NostrEvent }) {
 
   const displayName = profile?.display_name || profile?.name || event.pubkey.slice(0, 12) + "...";
   const quoteRef = useMemo(() => parseQuoteRef(event), [event]);
-  const media = useMemo(() => extractMediaUrls(event.content), [event.content]);
-  const cleanedContent = useMemo(
-    () => media.length > 0 ? stripMediaUrls(event.content) : event.content,
-    [event.content, media],
-  );
+  const { media, text: cleanedContent } = useNoteMedia(event);
 
   const engagementRef = useEngagementReporter(event.id, 0);
 
@@ -215,6 +211,7 @@ function RootNoteExpanded({ event }: { event: NostrEvent }) {
         <div className="text-[15px] leading-relaxed text-body mb-3">
           <RichContent
             content={cleanedContent}
+            event={event}
             suppressEventIds={quoteRef ? [quoteRef.eventId] : undefined}
           />
         </div>
@@ -283,11 +280,7 @@ function ReplyCard({ event, index, animationDelay }: { event: NostrEvent; index:
 
   const displayName = profile?.display_name || profile?.name || event.pubkey.slice(0, 12) + "...";
 
-  const media = useMemo(() => extractMediaUrls(event.content), [event.content]);
-  const cleanedContent = useMemo(
-    () => media.length > 0 ? stripMediaUrls(event.content) : event.content,
-    [event.content, media],
-  );
+  const { media, text: cleanedContent } = useNoteMedia(event);
 
   const engagementRef = useEngagementReporter(event.id, index);
 
@@ -315,7 +308,7 @@ function ReplyCard({ event, index, animationDelay }: { event: NostrEvent; index:
 
       {cleanedContent && (
         <div className="text-sm leading-relaxed text-body mb-2">
-          <RichContent content={cleanedContent} />
+          <RichContent content={cleanedContent} event={event} />
         </div>
       )}
 

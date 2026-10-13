@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { Download, FileText, Lock, AlertTriangle } from "lucide-react";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
-import { decryptDMFile } from "@ishtarservices/core";
+import { blobFallbackCandidates, decryptDMFile, parseBlobUrl } from "@ishtarservices/core";
 import type { DMFileMeta } from "@ishtarservices/shared-types";
+import { ownBlossomOrigin } from "@/lib/api/blossom";
+import { fetchAuthorServers } from "@/lib/media/authorServers";
 
 /** Tauri's HTTP plugin bypasses CORS in the desktop app; the plain browser
  *  preview has no `invoke` bridge, so fall back to window.fetch there. */
@@ -14,6 +16,8 @@ const AUTO_LOAD_MAX_BYTES = 8 * 1024 * 1024;
 
 interface DMFileAttachmentProps {
   meta: DMFileMeta;
+  /** Sender: their kind-10063 servers are tried by hash if the URL fails. */
+  author?: string;
   isMe: boolean;
   /** Auto-load without a click (friends / own messages). */
   autoLoad?: boolean;
@@ -27,13 +31,48 @@ type LoadState =
 
 const objectUrlCache = new Map<string, string>();
 
-async function fetchAndDecrypt(meta: DMFileMeta): Promise<string> {
+/** Download one candidate and decrypt it. `decryptDMFile` checks
+ *  sha256(ciphertext) against `x` first, so a fallback server can't swap the
+ *  bytes (docs/MEDIA_STORAGE.md §5). */
+async function downloadAndDecrypt(url: string, meta: DMFileMeta): Promise<Uint8Array> {
+  const res = await httpFetch(url, { method: "GET" });
+  if (!res.ok) throw new Error(`download failed (${res.status})`);
+  return decryptDMFile(new Uint8Array(await res.arrayBuffer()), meta);
+}
+
+/** Where else the same ciphertext may live, by hash: the rumor's `fallback`
+ *  mirrors, our server, then the sender's kind-10063 servers. */
+async function candidateUrls(meta: DMFileMeta, author?: string): Promise<string[]> {
+  const x = meta.x.toLowerCase();
+  const own = ownBlossomOrigin();
+  // A non-Blossom primary URL still has a hash: retry it on our server.
+  const base = parseBlobUrl(meta.url)?.sha256 === x ? meta.url : `${own}/${x}`;
+  const authorServers = author ? await fetchAuthorServers(author) : [];
+  const rest = blobFallbackCandidates(base, { fallbacks: meta.fallback, ownOrigin: own, authorServers });
+  return base === meta.url ? rest : [base, ...rest];
+}
+
+async function fetchAndDecrypt(meta: DMFileMeta, author?: string): Promise<string> {
   const cached = objectUrlCache.get(meta.x);
   if (cached) return cached;
-  const res = await httpFetch(meta.url, { method: "GET" });
-  if (!res.ok) throw new Error(`download failed (${res.status})`);
-  const ciphertext = new Uint8Array(await res.arrayBuffer());
-  const plain = decryptDMFile(ciphertext, meta);
+  let plain: Uint8Array;
+  try {
+    plain = await downloadAndDecrypt(meta.url, meta);
+  } catch (firstErr) {
+    // By-hash retries are only safe with a hash to check them against.
+    if (!/^[0-9a-f]{64}$/i.test(meta.x ?? "")) throw firstErr;
+    let recovered: Uint8Array | null = null;
+    for (const url of await candidateUrls(meta, author)) {
+      try {
+        recovered = await downloadAndDecrypt(url, meta);
+        break;
+      } catch {
+        // next candidate
+      }
+    }
+    if (!recovered) throw firstErr;
+    plain = recovered;
+  }
   const blob = new Blob([plain as BlobPart], { type: meta.fileType });
   const url = URL.createObjectURL(blob);
   objectUrlCache.set(meta.x, url);
@@ -45,7 +84,7 @@ async function fetchAndDecrypt(meta: DMFileMeta): Promise<string> {
  * opaque blob, verifies both hashes, decrypts with the key from the rumor and
  * renders it from an object URL. Nothing decrypted touches disk.
  */
-export function DMFileAttachment({ meta, isMe, autoLoad }: DMFileAttachmentProps) {
+export function DMFileAttachment({ meta, author, isMe, autoLoad }: DMFileAttachmentProps) {
   const small = (meta.size ?? 0) <= AUTO_LOAD_MAX_BYTES;
   const [state, setState] = useState<LoadState>(() =>
     objectUrlCache.has(meta.x) ? { status: "ready", objectUrl: objectUrlCache.get(meta.x)! } : { status: "idle" },
@@ -54,7 +93,7 @@ export function DMFileAttachment({ meta, isMe, autoLoad }: DMFileAttachmentProps
   const load = () => {
     if (state.status === "loading" || state.status === "ready") return;
     setState({ status: "loading" });
-    fetchAndDecrypt(meta)
+    fetchAndDecrypt(meta, author)
       .then((objectUrl) => setState({ status: "ready", objectUrl }))
       .catch((err) => setState({ status: "error", message: err instanceof Error ? err.message : "failed" }));
   };

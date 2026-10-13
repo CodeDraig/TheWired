@@ -5,7 +5,7 @@ import { addEmojiSet } from "@/store/slices/emojiSlice";
 import { buildEmojiSetEvent } from "./emojiSetBuilder";
 import { parseEmojiSetEvent } from "./emojiSetParser";
 import { signAndPublish } from "@/lib/nostr/publish";
-import { blossomUpload } from "@/lib/api/blossom";
+import { uploadWithContext } from "@/lib/media/uploadPlan";
 import type { CustomEmoji } from "@/types/emoji";
 
 interface EmojiSetManagerProps {
@@ -57,8 +57,9 @@ export function EmojiSetManager({ spaceId }: EmojiSetManagerProps) {
       setUploading(true);
 
       try {
-        // Upload to Blossom
-        const result = await blossomUpload(file);
+        // Space emoji render in every member's client with no grant: our
+        // server, unscoped.
+        const result = await uploadWithContext(file, { kind: "spaceAsset" });
 
         // Build updated emoji list
         const newEmoji: CustomEmoji = {

@@ -169,7 +169,8 @@ describe("blob GET token gating", () => {
     const tk = await tokenFor(SLUG_PRIV);
     const res = await server.inject({ method: "GET", url: `/${SHA_PRIV}?tk=${tk}` });
     expect(res.statusCode).toBe(200);
-    expect(res.headers["cache-control"]).toContain("no-store");
+    // Gated: the viewer's own cache only, never a shared one (MEDIA_STORAGE.md §4).
+    expect(res.headers["cache-control"]).toBe("private, max-age=86400");
   });
 
   it("serves a private blob to an authorized NIP-98 pubkey (no token)", async () => {
@@ -237,9 +238,9 @@ describe("HLS token gating", () => {
     const tk = await tokenFor(SLUG_PRIV);
     const res = await server.inject({ method: "GET", url: `/hls/${SHA_PRIV}/master.m3u8?tk=${tk}` });
     expect(res.statusCode).toBe(200);
-    // Private, but cacheable by the client for a session — NOT no-store, which
-    // forced AVPlayer to re-download on every back-seek.
-    expect(res.headers["cache-control"]).toBe("private, max-age=3600");
+    // Private, but cacheable by the client — NOT no-store, which forced
+    // AVPlayer to re-download on every back-seek.
+    expect(res.headers["cache-control"]).toBe("private, max-age=86400");
     expect(res.headers["content-length"]).toBe(String(Buffer.byteLength(res.payload)));
     expect(res.payload).toContain(`128k/index.m3u8?tk=${tk}`);
   });
@@ -258,7 +259,7 @@ describe("HLS token gating", () => {
     const tk = await tokenFor(SLUG_PRIV);
     const res = await server.inject({ method: "GET", url: `/hls/${SHA_PRIV}/128k/seg_00000.m4s?tk=${tk}` });
     expect(res.statusCode).toBe(200);
-    expect(res.headers["cache-control"]).toBe("private, max-age=3600");
+    expect(res.headers["cache-control"]).toBe("private, max-age=86400");
     expect(res.headers["content-length"]).toBe("8");
     expect(res.headers.etag).toBe(`"${SHA_PRIV}-seg_00000.m4s"`);
     expect(res.headers["accept-ranges"]).toBe("bytes");

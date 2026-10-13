@@ -6,6 +6,8 @@ import { downloadMedia } from "../ui/MediaLightbox";
 import { MediaBackdrop } from "./MediaBackdrop";
 import { useMediaOrientation } from "./useMediaOrientation";
 import { FEED_ASPECT_CLAMP, type MediaDensity } from "./mediaLayout";
+import { useMediaFallback, type MediaFallbackSources } from "./useMediaFallback";
+import { MediaUnavailable } from "./MediaUnavailable";
 
 // Keep video heights in sync with SmartImage's density map.
 const DENSITY: Record<MediaDensity, { fittedHeight: string; maxH: string }> = {
@@ -15,7 +17,7 @@ const DENSITY: Record<MediaDensity, { fittedHeight: string; maxH: string }> = {
   inline: { fittedHeight: "h-[16rem]", maxH: "max-h-60" },
 };
 
-export interface SmartVideoProps {
+export interface SmartVideoProps extends MediaFallbackSources {
   url: string;
   poster?: string;
   /** Optional imeta `dim` ("WxH") for up-front orientation (video kinds). */
@@ -44,8 +46,15 @@ export const SmartVideo = memo(function SmartVideo({
   dim,
   downloadable = true,
   density = "feed",
+  fallbacks,
+  author,
+  gated,
 }: SmartVideoProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  // Load-error chain: grant re-mint → by-hash fallbacks → unavailable tile.
+  const media = useMediaFallback(url, { fallbacks, author, gated });
+  const src = media.src;
+  const onMediaError = media.onError;
   const hlsRef = useRef<Hls | null>(null);
   const [playbackRate, setPlaybackRate] = usePlaybackSpeed();
   const [showSpeedMenu, setShowSpeedMenu] = useState(false);
@@ -71,16 +80,19 @@ export const SmartVideo = memo(function SmartVideo({
   // Source / HLS setup
   useEffect(() => {
     const video = videoRef.current;
-    if (!video) return;
+    if (!video || !src) return;
 
-    if (isHlsUrl(url) && Hls.isSupported()) {
+    if (isHlsUrl(src) && Hls.isSupported()) {
       const hls = new Hls({ enableWorker: true, lowLatencyMode: false });
       hlsRef.current = hls;
-      hls.loadSource(url);
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) onMediaError();
+      });
+      hls.loadSource(src);
       hls.attachMedia(video);
     } else {
       // Native MP4/WebM, or native HLS (Safari/WebKit)
-      video.src = url;
+      video.src = src;
     }
 
     return () => {
@@ -89,11 +101,15 @@ export const SmartVideo = memo(function SmartVideo({
         hlsRef.current = null;
       }
     };
-  }, [url]);
+  }, [src, onMediaError]);
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = playbackRate;
   }, [playbackRate]);
+
+  if (media.failed) {
+    return <MediaUnavailable kind="video" />;
+  }
 
   const d = DENSITY[density];
   const inline = density === "inline";
@@ -105,7 +121,7 @@ export const SmartVideo = memo(function SmartVideo({
     <div className="absolute right-2 top-2 z-20 flex items-center gap-1">
       {downloadable && (
         <button
-          onClick={() => downloadMedia(url)}
+          onClick={() => src && downloadMedia(src)}
           className="flex items-center rounded-md bg-black/50 px-1.5 py-0.5 text-[11px] font-medium text-white/70 opacity-0 backdrop-blur-sm transition-all group-hover/video:opacity-100 hover:bg-black/70 hover:text-white"
           title="Download video"
         >
@@ -160,6 +176,7 @@ export const SmartVideo = memo(function SmartVideo({
           playsInline
           preload="metadata"
           onLoadedMetadata={handleLoadedMetadata}
+          onError={onMediaError}
           onRateChange={(e) => {
             const rate = (e.target as HTMLVideoElement).playbackRate;
             if (rate !== playbackRate) setPlaybackRate(rate);
@@ -186,6 +203,7 @@ export const SmartVideo = memo(function SmartVideo({
         playsInline
         preload="metadata"
         onLoadedMetadata={handleLoadedMetadata}
+        onError={onMediaError}
         onRateChange={(e) => {
           const rate = (e.target as HTMLVideoElement).playbackRate;
           if (rate !== playbackRate) setPlaybackRate(rate);

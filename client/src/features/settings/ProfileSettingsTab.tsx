@@ -116,6 +116,7 @@ export function ProfileSettingsTab() {
         <ImageUpload
           value={form.picture ?? ""}
           onChange={(url) => updateField("picture", url)}
+          context={{ kind: "public" }}
           label="Avatar"
           placeholder="Drop avatar image or click to upload"
           shape="circle"
@@ -124,6 +125,7 @@ export function ProfileSettingsTab() {
         <ImageUpload
           value={form.banner ?? ""}
           onChange={(url) => updateField("banner", url)}
+          context={{ kind: "public" }}
           label="Banner"
           placeholder="Drop banner image or click to upload"
           shape="banner"

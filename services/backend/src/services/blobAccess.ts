@@ -32,8 +32,16 @@ export interface ProtectedEventRef {
   tags: string[][];
 }
 
-interface CacheEntry {
+/** The music check's verdict for a sha: `refs` are the protected owner-authored
+ *  references (empty = public); `publicRef` is true when an owner published a
+ *  PUBLIC reference, which is what made `refs` empty (blobReadAccess uses it —
+ *  an owner's public release isn't gated by someone else's scoped upload). */
+export interface MusicBlobStatus {
   refs: ProtectedEventRef[];
+  publicRef: boolean;
+}
+
+interface CacheEntry extends MusicBlobStatus {
   at: number;
 }
 
@@ -89,8 +97,14 @@ export function pTagGrantsAccess(tag: string[], pubkey: string): boolean {
  * Cached for CACHE_TTL_MS.
  */
 export async function getProtectedRefsForBlob(sha256: string): Promise<ProtectedEventRef[]> {
+  return (await getMusicBlobStatus(sha256)).refs;
+}
+
+/** {@link getProtectedRefsForBlob} plus whether an owner-authored PUBLIC
+ *  reference exists. Shares its cache. */
+export async function getMusicBlobStatus(sha256: string): Promise<MusicBlobStatus> {
   const cached = cache.get(sha256);
-  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.refs;
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return { refs: cached.refs, publicRef: cached.publicRef };
 
   // Owner-authored music events that mention the sha anywhere in their tags.
   // `visibility` and `h_tag` are populated by the relay at insert time
@@ -124,8 +138,8 @@ export async function getProtectedRefsForBlob(sha256: string): Promise<Protected
   const refs = anyPublicRef ? [] : protectedRefs;
 
   if (cache.size >= CACHE_MAX) cache.clear();
-  cache.set(sha256, { refs, at: Date.now() });
-  return refs;
+  cache.set(sha256, { refs, publicRef: anyPublicRef, at: Date.now() });
+  return { refs, publicRef: anyPublicRef };
 }
 
 /**

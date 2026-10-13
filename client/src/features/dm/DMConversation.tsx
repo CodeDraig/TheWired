@@ -73,7 +73,7 @@ export function DMConversation({ partnerPubkey, onBack }: DMConversationProps) {
 
   // File upload — owned here so dropZoneRef covers the entire DM view.
   // DM attachments are AES-GCM encrypted before upload (kind 15).
-  const upload = useFileUpload({ encrypt: true });
+  const upload = useFileUpload({ context: { kind: "dm" }, encrypt: true });
   const contact = useAppSelector((s) => s.dm.contacts.find((c) => c.pubkey === partnerPubkey));
   const isRoom = !!contact?.isRoom;
   const friends = useFriends();
@@ -575,6 +575,7 @@ export function DMConversation({ partnerPubkey, onBack }: DMConversationProps) {
         onTyping={() => void sendTyping(partnerPubkey)}
         attachments={upload.attachments}
         onRemoveAttachment={upload.removeAttachment}
+        onRetryAttachment={upload.retryAttachment}
         onClearAttachments={upload.clearAttachments}
         onOpenFilePicker={upload.openFilePicker}
         onAddFiles={upload.addFiles}

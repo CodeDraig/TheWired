@@ -38,9 +38,19 @@ var mediaPrefixes = []string{
 	"/api/music/access/",
 }
 
+// mediaPaths are exact-path media lookups: the viewer-grant mint for gated
+// space media (docs/MEDIA_STORAGE.md §4), fetched once per session and again
+// after a media load error.
+var mediaPaths = map[string]bool{
+	"/api/media-grant": true,
+}
+
 func isMediaPath(method, path string) bool {
 	if method != http.MethodGet && method != http.MethodHead {
 		return false
+	}
+	if mediaPaths[strings.TrimRight(path, "/")] {
+		return true
 	}
 	for _, p := range mediaPrefixes {
 		if strings.HasPrefix(path, p) {

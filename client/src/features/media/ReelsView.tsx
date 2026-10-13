@@ -4,10 +4,13 @@ import { eventsSelectors } from "../../store/slices/eventsSlice";
 import { VideoCard } from "./VideoCard";
 import { VideoPlayer } from "./VideoPlayer";
 import { parseVideoEvent, selectVideoSource } from "./imetaParser";
+import { useMediaGrant } from "@/lib/media/mediaGrant";
 import type { NostrEvent } from "../../types/nostr";
 import { X } from "lucide-react";
 
 export function ReelsView() {
+  // Re-render (re-tokenize video URLs) when the media grant arrives.
+  useMediaGrant();
   const activeSpaceId = useAppSelector((s) => s.spaces.activeSpaceId);
   const events = useAppSelector((s) => s.events);
   const [activeVideo, setActiveVideo] = useState<NostrEvent | null>(null);

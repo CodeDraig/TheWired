@@ -256,7 +256,7 @@ export function useProfileFeed(pubkey: string) {
         replyList.push(item);
       } else {
         roots.push(item);
-        if (hasMediaUrls(item.event.content) || hasEmbedUrls(item.event.content)) {
+        if (hasMediaUrls(item.event.content, item.event) || hasEmbedUrls(item.event.content)) {
           mediaList.push(item);
         }
       }

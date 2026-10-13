@@ -27,6 +27,13 @@ func TestClassify_MediaLookupsGetTheirOwnBucket(t *testing.T) {
 		{"POST", "/api/music/access/" + sha + "/my-track", "write"},
 		{"GET", "/api/music/search?q=x", "search"},
 		{"GET", "/api/music/variants/" + sha + "/search", "search"}, // search still wins
+		// The viewer-grant mint for gated space media.
+		{"GET", "/api/media-grant", "media"},
+		{"GET", "/api/media-grant/", "media"},
+		{"HEAD", "/api/media-grant", "media"},
+		{"POST", "/api/media-grant", "write"},
+		{"GET", "/api/media-grants", "read"},
+		{"GET", "/api/media-grant/other", "read"},
 	}
 	for _, tt := range tests {
 		if got := classify(tt.method, tt.path); got != tt.want {
@@ -99,6 +106,37 @@ func TestMiddleware_MediaBucketIsIndependentOfReads(t *testing.T) {
 	}
 	if c := get("/api/music/variants/" + sha); c != http.StatusTooManyRequests {
 		t.Fatalf("3rd media lookup should be 429, got %d", c)
+	}
+	if c := get("/api/spaces"); c != http.StatusOK {
+		t.Fatalf("a read must not be throttled by the media bucket, got %d", c)
+	}
+}
+
+// The viewer-grant mint shares the media bucket: a client re-minting after
+// media load errors can't drain the read budget, and the mint is still capped.
+func TestMiddleware_MediaGrantUsesTheMediaBucket(t *testing.T) {
+	limits := DefaultLimits
+	limits.MediaPerMin = 1
+	limits.ReadPerMin = 100
+	l := reportLimiter(t, limits)
+	const pk = "media-grant-middleware-test-pubkey"
+	l.client.Del(context.Background(), "ratelimit:media:"+pk, "ratelimit:read:"+pk)
+
+	handler := RateLimitMiddleware(l, true, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	get := func(path string) int {
+		req := httptest.NewRequest("GET", "http://localhost:9080"+path, nil)
+		req.Header.Set("X-Auth-Pubkey", pk)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		return rr.Code
+	}
+	if c := get("/api/media-grant"); c != http.StatusOK {
+		t.Fatalf("1st grant mint: %d", c)
+	}
+	if c := get("/api/media-grant"); c != http.StatusTooManyRequests {
+		t.Fatalf("2nd grant mint should be 429 under a media limit of 1, got %d", c)
 	}
 	if c := get("/api/spaces"); c != http.StatusOK {
 		t.Fatalf("a read must not be throttled by the media bucket, got %d", c)

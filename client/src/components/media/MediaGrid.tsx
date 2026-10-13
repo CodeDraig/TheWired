@@ -1,7 +1,8 @@
-import { useState } from "react";
 import { galleryLayout } from "./mediaLayout";
+import { useMediaFallback, type MediaFallbackSources } from "./useMediaFallback";
+import { MediaUnavailable } from "./MediaUnavailable";
 
-export interface MediaGridImage {
+export interface MediaGridImage extends MediaFallbackSources {
   url: string;
   dim?: string;
 }
@@ -13,30 +14,32 @@ export interface MediaGridProps {
 }
 
 function GridTile({
-  url,
+  image,
   overflow,
   spanClass,
   onOpen,
 }: {
-  url: string;
+  image: MediaGridImage;
   /** When > 0, render a "+N more" overlay (last visible tile). */
   overflow: number;
   spanClass?: string;
   onOpen: () => void;
 }) {
-  const [errored, setErrored] = useState(false);
+  const media = useMediaFallback(image.url, image);
   return (
     <button
       onClick={onOpen}
       className={`group relative h-full w-full overflow-hidden bg-surface ${spanClass ?? ""}`}
     >
-      {!errored ? (
+      {media.failed ? (
+        <MediaUnavailable kind="image" compact className="rounded-none border-0" />
+      ) : media.src ? (
         <img
-          src={url}
+          src={media.src}
           alt=""
           loading="lazy"
-          onError={() => setErrored(true)}
-          className="h-full w-full object-cover transition-transform group-hover:scale-[1.03]"
+          onError={media.onError}
+          className={`h-full w-full object-cover transition-transform group-hover:scale-[1.03] ${media.retrying ? "invisible" : ""}`}
         />
       ) : (
         <div className="h-full w-full bg-surface" />
@@ -81,7 +84,7 @@ export function MediaGrid({ images, onOpen }: MediaGridProps) {
           return (
             <GridTile
               key={img.url}
-              url={img.url}
+              image={img}
               overflow={isLast ? layout.overflow : 0}
               spanClass={isThree && i === 0 ? "row-span-2" : undefined}
               onOpen={() => onOpen(i)}

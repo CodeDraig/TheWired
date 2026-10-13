@@ -25,3 +25,4 @@ export * from "./nostr/thread";
 export * from "./nostr/profileSettings";
 export * from "./nostr/profileShowcase";
 export * from "./listenTogether";
+export * from "./media";

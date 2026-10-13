@@ -92,7 +92,8 @@ describe("cover art referenced only by an `image` tag", () => {
     const granted = await getBlob(SHA_PRIVATE, SAGE.pubkey);
     expect(granted.statusCode).toBe(200);
     expect(granted.headers["content-type"]).toContain("image/jpeg");
-    expect(granted.headers["cache-control"]).toContain("no-store");
+    // Gated: the viewer's own cache only (docs/MEDIA_STORAGE.md §4).
+    expect(granted.headers["cache-control"]).toBe("private, max-age=86400");
     expect((await getBlob(SHA_PRIVATE, JAYDEE.pubkey)).statusCode).toBe(404);
     expect((await getBlob(SHA_PRIVATE, null)).statusCode).toBe(404);
   });
