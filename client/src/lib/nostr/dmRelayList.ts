@@ -99,10 +99,16 @@ export function fetchDMRelayList(pubkey: string): Promise<string[]> {
 export async function getDMRelaysForPublish(
   recipientPubkey: string,
 ): Promise<string[] | undefined> {
-  const relays = await fetchDMRelayList(recipientPubkey);
-  if (relays.length === 0) return undefined;
+  const inbox = await fetchDMRelayList(recipientPubkey);
+  if (inbox.length === 0) return undefined;
 
-  // Connect to any relays we're not already connected to
+  // The platform relay always gets a copy, even when the recipient's list
+  // omits it: our push pipeline only ingests wraps from it, and it is the relay
+  // that AUTH-gates wraps to their recipient (docs/DM_WIRE_CONTRACT.md §7, §8).
+  const relays = [...new Set([...inbox, APP_RELAY_URL])];
+
+  // Connect to any relays we're not already connected to (APP_RELAY is
+  // normally already up; dialing it again is a no-op)
   for (const url of relays) {
     relayManager.connect(url);
   }
@@ -112,10 +118,7 @@ export async function getDMRelaysForPublish(
     relays.map((url) => relayManager.waitForConnection(url, 3000)),
   );
 
-  // The platform relay always gets a copy, even when the recipient's list
-  // omits it: our push pipeline only ingests wraps from it, and it is the relay
-  // that AUTH-gates wraps to their recipient (docs/DM_WIRE_CONTRACT.md §7, §8).
-  return [...new Set([...relays, APP_RELAY_URL])];
+  return relays;
 }
 
 /** Get the current user's own DM relay list from Redux state. Empty when the

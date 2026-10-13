@@ -67,9 +67,12 @@ describe("getDMRelaysForPublish — recipient wraps always reach the platform re
     lists.set(PEER, ["wss://inbox.example", "wss://inbox2.example"]);
     const targets = await recipientTargets(PEER);
     expect(targets).toEqual(["wss://inbox.example", "wss://inbox2.example", APP]);
-    // Their own inbox relays are still dialed before publishing.
+    // Their own inbox relays are still dialed before publishing — and so is
+    // the platform relay, so its copy is not lost mid-reconnect.
     expect(connectMock).toHaveBeenCalledWith("wss://inbox.example");
     expect(connectMock).toHaveBeenCalledWith("wss://inbox2.example");
+    expect(connectMock).toHaveBeenCalledWith(APP);
+    expect(relayManager.waitForConnection).toHaveBeenCalledWith(APP, 3000);
   });
 
   it("does not duplicate APP_RELAY when the list already names it (any trailing-slash form)", async () => {
