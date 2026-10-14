@@ -10,7 +10,8 @@
 //!
 //! Each test calls [`setup_test_pool`] in a `#[tokio::test]`. The first call
 //! per process applies the relay's own migrations and creates the minimum
-//! `app.*` tables the relay reads (`spaces`, `space_members`). Subsequent
+//! `app.*` tables the relay reads (`spaces`, `space_members`, and the role
+//! model behind 9005 authority). Subsequent
 //! calls TRUNCATE all per-test data — they DON'T re-run migrations.
 //!
 //! ## Running locally
@@ -65,8 +66,10 @@ pub async fn try_connect_pool() -> Result<PgPool, String> {
 /// We apply BOTH the relay's own migrations (`relay.events` etc.) AND a small
 /// subset of the backend's `app.*` schema that the relay reads. We don't
 /// import the backend's full migration set — that would couple the relay
-/// test crate to the Node service. Only `app.spaces` (FK target) and
-/// `app.space_members` (the membership source of truth) are needed.
+/// test crate to the Node service. Only `app.spaces` (FK target),
+/// `app.space_members` (the membership source of truth) and the role tables
+/// (`space_roles`, `role_permissions`, `channel_overrides`, `member_roles`,
+/// `space_channels`, `bans`) are needed.
 ///
 /// Schemas `relay` and `app` are dropped + recreated on first call. The DB
 /// is exclusively for relay tests (default `thewired_relay_test`); we don't
@@ -101,6 +104,7 @@ pub async fn setup_test_pool() -> Result<PgPool, String> {
             CREATE TABLE app.spaces (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL DEFAULT '',
+                creator_pubkey TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             CREATE TABLE app.space_members (
@@ -108,6 +112,48 @@ pub async fn setup_test_pool() -> Result<PgPool, String> {
                 pubkey TEXT NOT NULL,
                 joined_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (space_id, pubkey)
+            );
+            -- The backend's role model, read for 9005 authority on platform spaces.
+            CREATE TABLE app.space_channels (
+                id TEXT PRIMARY KEY,
+                space_id TEXT NOT NULL REFERENCES app.spaces(id) ON DELETE CASCADE,
+                type TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                position INTEGER NOT NULL DEFAULT 0,
+                is_default BOOLEAN NOT NULL DEFAULT false
+            );
+            CREATE TABLE app.space_roles (
+                id TEXT PRIMARY KEY,
+                space_id TEXT NOT NULL REFERENCES app.spaces(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                is_default BOOLEAN NOT NULL DEFAULT false,
+                is_admin BOOLEAN NOT NULL DEFAULT false
+            );
+            CREATE TABLE app.role_permissions (
+                role_id TEXT NOT NULL REFERENCES app.space_roles(id) ON DELETE CASCADE,
+                permission TEXT NOT NULL,
+                PRIMARY KEY (role_id, permission)
+            );
+            CREATE TABLE app.channel_overrides (
+                role_id TEXT NOT NULL REFERENCES app.space_roles(id) ON DELETE CASCADE,
+                channel_id TEXT NOT NULL,
+                permission TEXT NOT NULL,
+                effect TEXT NOT NULL,
+                PRIMARY KEY (role_id, channel_id, permission)
+            );
+            CREATE TABLE app.member_roles (
+                space_id TEXT NOT NULL,
+                pubkey TEXT NOT NULL,
+                role_id TEXT NOT NULL,
+                PRIMARY KEY (space_id, pubkey, role_id)
+            );
+            CREATE TABLE app.bans (
+                id TEXT PRIMARY KEY,
+                space_id TEXT NOT NULL REFERENCES app.spaces(id) ON DELETE CASCADE,
+                pubkey TEXT NOT NULL,
+                banned_by TEXT NOT NULL,
+                expires_at BIGINT
             );
             "#,
         )
@@ -139,6 +185,12 @@ async fn truncate_all(pool: &PgPool) -> sqlx::Result<()> {
             relay.suspended_pubkeys,
             relay.tombstones,
             app.space_members,
+            app.member_roles,
+            app.role_permissions,
+            app.channel_overrides,
+            app.space_roles,
+            app.space_channels,
+            app.bans,
             app.spaces
         RESTART IDENTITY CASCADE;
         "#,
@@ -162,6 +214,105 @@ pub async fn insert_space(pool: &PgPool, space_id: &str) -> sqlx::Result<()> {
         "INSERT INTO relay.groups (group_id, name) VALUES ($1, $1) ON CONFLICT DO NOTHING",
     )
     .bind(space_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A platform space the way production has it: an `app.spaces` row (with its
+/// owner) and NO `relay.groups` mirror — the relay refuses a 9007 whose id
+/// collides with `app.spaces`, so platform spaces never get relay admins.
+pub async fn insert_platform_space(pool: &PgPool, space_id: &str, creator: &str) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO app.spaces (id, name, creator_pubkey) VALUES ($1, $1, $2)")
+        .bind(space_id)
+        .bind(creator)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Insert an `app.space_channels` row.
+pub async fn insert_channel(
+    pool: &PgPool,
+    space_id: &str,
+    channel_id: &str,
+    kind: &str,
+    is_default: bool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO app.space_channels (id, space_id, type, label, is_default) VALUES ($1, $2, $3, $1, $4)",
+    )
+    .bind(channel_id)
+    .bind(space_id)
+    .bind(kind)
+    .bind(is_default)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Create a role with base `permissions` and assign it to each of `holders`.
+pub async fn insert_role(
+    pool: &PgPool,
+    space_id: &str,
+    role_id: &str,
+    is_admin: bool,
+    permissions: &[&str],
+    holders: &[&str],
+) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO app.space_roles (id, space_id, name, is_admin) VALUES ($1, $2, $1, $3)")
+        .bind(role_id)
+        .bind(space_id)
+        .bind(is_admin)
+        .execute(pool)
+        .await?;
+    for permission in permissions {
+        sqlx::query("INSERT INTO app.role_permissions (role_id, permission) VALUES ($1, $2)")
+            .bind(role_id)
+            .bind(permission)
+            .execute(pool)
+            .await?;
+    }
+    for pubkey in holders {
+        sqlx::query("INSERT INTO app.member_roles (space_id, pubkey, role_id) VALUES ($1, $2, $3)")
+            .bind(space_id)
+            .bind(pubkey)
+            .bind(role_id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Insert an `allow` / `deny` channel override for a role.
+pub async fn insert_override(
+    pool: &PgPool,
+    role_id: &str,
+    channel_id: &str,
+    permission: &str,
+    effect: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO app.channel_overrides (role_id, channel_id, permission, effect) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(role_id)
+    .bind(channel_id)
+    .bind(permission)
+    .bind(effect)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Ban `pubkey` from the space (`expires_at` unix seconds, `None` = permanent).
+pub async fn insert_ban(pool: &PgPool, space_id: &str, pubkey: &str, expires_at: Option<i64>) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO app.bans (id, space_id, pubkey, banned_by, expires_at) VALUES ($1, $2, $3, 'test', $4)",
+    )
+    .bind(format!("ban-{space_id}-{pubkey}"))
+    .bind(space_id)
+    .bind(pubkey)
+    .bind(expires_at)
     .execute(pool)
     .await?;
     Ok(())

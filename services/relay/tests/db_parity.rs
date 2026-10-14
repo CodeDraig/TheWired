@@ -21,6 +21,9 @@ mod common;
 use common::{sign_event, TestIdentity};
 use thewired_relay::db::{sqlite, Db};
 
+/// Both tests truncate the shared Postgres test DB; run them one at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Everything observable from running the standard op sequence. `PartialEq` so
 /// we can assert the two backends agree field-for-field.
 #[derive(Debug, PartialEq)]
@@ -206,6 +209,7 @@ fn expected(alice: &TestIdentity, bob: &TestIdentity, note_a_id: &str, note_b_id
 
 #[tokio::test]
 async fn sqlite_matches_expected_and_postgres() {
+    let _serial = SERIAL.lock().await;
     let alice = TestIdentity::from_seed(1);
     let bob = TestIdentity::from_seed(2);
     let note_a_id = sign_event(&alice, 1, vec![], "hello from alice", 100).id;
@@ -230,5 +234,65 @@ async fn sqlite_matches_expected_and_postgres() {
         Err(e) => {
             eprintln!("⚠ skipping Postgres parity arm (DB unreachable): {e}");
         }
+    }
+}
+
+/// What a relay-native group admin's 9005s did, in order (see
+/// `mod_delete_scope`). `(accepted, target still stored)` per attempt.
+type ScopeObs = Vec<(bool, bool)>;
+
+/// Kind-9005 scope (relay-native semantics, the only kind the embedded relay
+/// has): a group admin may delete their group's events and nothing else.
+async fn mod_delete_scope(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> ScopeObs {
+    use thewired_relay::nostr::nip29::moderation::handle_delete_event;
+
+    db.create_group("g-scope", "Scope", &alice.pubkey).await.unwrap();
+    db.create_group("g-other", "Other", &bob.pubkey).await.unwrap();
+    let h = |g: &str| vec![vec!["h".to_string(), g.to_string()]];
+    let in_group = sign_event(bob, 9, h("g-scope"), "in scope", 500);
+    let other_group = sign_event(bob, 9, h("g-other"), "other group", 501);
+    let note = sign_event(bob, 1, vec![], "public note", 502);
+    for e in [&in_group, &other_group, &note] {
+        db.store_event(e).await.unwrap();
+    }
+
+    let mut obs = Vec::new();
+    let attempts: [(&TestIdentity, Vec<&str>); 5] = [
+        (alice, vec![&note.id]),                    // not in any group
+        (alice, vec![&other_group.id]),             // another group
+        (alice, vec![&in_group.id, &note.id]),      // mixed → all-or-nothing
+        (bob, vec![&in_group.id]),                  // not an admin of g-scope
+        (alice, vec![&in_group.id]),                // the legitimate delete
+    ];
+    for (i, (who, targets)) in attempts.iter().enumerate() {
+        let mut tags = h("g-scope");
+        tags.extend(targets.iter().map(|id| vec!["e".to_string(), id.to_string()]));
+        let del = sign_event(who, 9005, tags, &format!("attempt {i}"), 600 + i as i64);
+        let reply = handle_delete_event(db, &del).await.unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&reply[0]).unwrap();
+        let accepted = frame.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
+        let still_there = db.get_event_by_id(targets[0]).await.unwrap().is_some();
+        obs.push((accepted, still_there));
+    }
+    obs
+}
+
+#[tokio::test]
+async fn mod_delete_scope_matches_across_backends() {
+    let _serial = SERIAL.lock().await;
+    let alice = TestIdentity::from_seed(1);
+    let bob = TestIdentity::from_seed(2);
+    let want: ScopeObs = vec![(false, true), (false, true), (false, true), (false, true), (true, false)];
+
+    let sqlite_db = Db::Sqlite(sqlite::connect_memory().await.unwrap());
+    let sqlite_obs = mod_delete_scope(&sqlite_db, &alice, &bob).await;
+    assert_eq!(sqlite_obs, want, "SQLite: 9005 scope diverged from expected");
+
+    match common::setup_test_pool().await {
+        Ok(pool) => {
+            let pg_obs = mod_delete_scope(&Db::Pg(pool), &alice, &bob).await;
+            assert_eq!(pg_obs, sqlite_obs, "Postgres and SQLite disagree on 9005 scope");
+        }
+        Err(e) => eprintln!("⚠ skipping Postgres arm of the 9005 scope parity test: {e}"),
     }
 }
