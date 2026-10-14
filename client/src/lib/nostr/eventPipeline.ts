@@ -1,7 +1,7 @@
 import type { NostrEvent } from "../../types/nostr";
 import { EVENT_KINDS } from "../../types/nostr";
 import { EventDeduplicator } from "./dedup";
-import { verifySpaceModAuthority } from "./mutationAuthority";
+import { inModGroup, verifySpaceModAuthority } from "./mutationAuthority";
 import { trackPendingDeletion, clearPendingDeletion } from "../../store/slices/eventsSlice";
 import { isValidEventStructure } from "./validation";
 import { verifyBridge } from "./verifyWorkerBridge";
@@ -516,7 +516,7 @@ async function processIncomingEvent(
   }
 
   // Step 5: Index by kind (may await NIP-44 decryption for private music events)
-  await indexEvent(event);
+  await indexEvent(event, relayUrl);
 
   // Step 6: Evaluate for notifications (unread badges, toasts)
   evaluateNotification(event);
@@ -556,7 +556,7 @@ function indexIntoChatChannel(event: NostrEvent, hTag: string): void {
   }
 }
 
-async function indexEvent(event: NostrEvent): Promise<void> {
+async function indexEvent(event: NostrEvent, relayUrl: string): Promise<void> {
   const hTag = event.tags.find((t) => t[0] === "h")?.[1];
 
   switch (event.kind) {
@@ -1024,13 +1024,22 @@ async function indexEvent(event: NostrEvent): Promise<void> {
 
       // #5 — authority check. The chat read set includes non-enforcing mirrors and
       // imported relays, so anyone could publish a 9005 to wipe arbitrary messages.
-      // Require the author to be in the space's pinned authority set.
+      // Require the author to be in the space's pinned authority set, or (platform
+      // spaces) the event to come from the space's own host relay, which enforces
+      // the backend's MANAGE_MESSAGES roles.
       const space = getState().spaces.list.find((s) => s.id === groupId);
-      const verdict = verifySpaceModAuthority(event, space);
+      const verdict = verifySpaceModAuthority(event, space, relayUrl);
       if (verdict === "defer-unknown-space") {
         // Space not loaded yet (rare race: spaces hydrate before chat subs open).
         // Drop without persisting and unmark so a relay redelivery can retry once
         // the space metadata is present.
+        dedup.unmarkSeen(event.id);
+        break;
+      }
+      if (verdict === "defer-host-relay") {
+        // A platform space's role-holding moderator is vouched for only by the
+        // host relay's delivery. Leave the id unseen so that copy is processed
+        // even when a mirror delivered this one first.
         dedup.unmarkSeen(event.id);
         break;
       }
@@ -1046,9 +1055,8 @@ async function indexEvent(event: NostrEvent): Promise<void> {
           if (refEvent) {
             // Scope hardening: only delete messages that actually belong to THIS
             // group, so an admin of one (e.g. self-imported) group can't delete
-            // another group's messages via a forged h-tag mismatch.
-            const refHTag = refEvent.tags.find((t) => t[0] === "h")?.[1];
-            if (refHTag && refHTag !== groupId) continue;
+            // another group's messages, or an untagged public note, by id.
+            if (!inModGroup(refEvent, groupId)) continue;
             const refChannelTag = refEvent.tags.find((t) => t[0] === "channel")?.[1];
             const contextId = refChannelTag ? `${groupId}:${refChannelTag}` : groupId;
             dispatch(removeChatMessage({ contextId, eventId: tag[1] }));

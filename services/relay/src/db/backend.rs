@@ -24,6 +24,7 @@
 use crate::nostr::event::Event;
 use crate::nostr::filter::Filter;
 use crate::nostr::membership_gate::SpaceMembership;
+use crate::nostr::mod_delete::{ChannelRef, ManageMessagesFacts};
 use crate::nostr::wrap_gate::ReadCtx;
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -31,7 +32,7 @@ use std::collections::HashSet;
 #[cfg(feature = "embedded")]
 use sqlx::SqlitePool;
 
-use super::{event_store, group_store, membership_source, moderation};
+use super::{event_store, group_store, membership_source, moderation, space_permissions};
 use crate::protocol::nip50;
 
 #[cfg(feature = "embedded")]
@@ -331,6 +332,24 @@ impl Db {
             Db::Pg(p) => group_store::platform_space_exists(p, group_id).await,
             #[cfg(feature = "embedded")]
             Db::Sqlite(_) => Ok(false),
+        }
+    }
+
+    /// Platform-space permission facts for a moderator (9005 authority). The
+    /// embedded relay has no `app.*` role tables and no platform spaces, so it
+    /// answers "no grants" (its 9005s go through `is_admin`).
+    pub async fn permission_facts(
+        &self,
+        space_id: &str,
+        pubkey: &str,
+        permission: &str,
+        channel: &ChannelRef,
+        now: i64,
+    ) -> anyhow::Result<ManageMessagesFacts> {
+        match self {
+            Db::Pg(p) => space_permissions::permission_facts(p, space_id, pubkey, permission, channel, now).await,
+            #[cfg(feature = "embedded")]
+            Db::Sqlite(_) => Ok(ManageMessagesFacts::default()),
         }
     }
 

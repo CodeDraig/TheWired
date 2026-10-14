@@ -1,12 +1,15 @@
 import { useCallback, useMemo, useState } from "react";
 import { useAppSelector, useAppDispatch } from "../../store/hooks";
 import { resolveRelaySet } from "../spaces/relaySet";
-import { addEvent, indexChatMessage, hideMessage, removeChatMessage, indexEditedMessage } from "../../store/slices/eventsSlice";
+import { addEvent, indexChatMessage, hideMessage, removeChatMessage, removeEvent, indexEditedMessage } from "../../store/slices/eventsSlice";
 import { selectChatMessages } from "./chatSelectors";
 import { parseChannelIdPart } from "../spaces/spaceSelectors";
 import { buildChatMessage, buildDeletionEvent, buildModDeletionEvent, buildChatEditEvent, buildPollEvent, type AttachmentMeta } from "../../lib/nostr/eventBuilder";
-import { signAndPublish } from "../../lib/nostr/publish";
+import { signAndPublish, signWithAccount } from "../../lib/nostr/publish";
 import { relayManager } from "../../lib/nostr/relayManager";
+import { deleteEvent, putEvent } from "../../lib/db/eventStore";
+import { hostVerdict, modDeleteRefusal } from "./modDelete";
+import { removePoll } from "../../store/slices/pollsSlice";
 import { saveUserState, getUserState } from "../../lib/db/userStateStore";
 import { EVENT_KINDS, type NostrEvent } from "../../types/nostr";
 import type { PollDraft } from "../polls/PollComposer";
@@ -201,19 +204,33 @@ export function useChat() {
     [pubkey, activeSpaceId, relayTargets, dispatch, activeChannelId],
   );
 
-  /** Publish a kind:9005 moderator deletion event */
+  /** Publish a kind:9005 moderator deletion event. Only the space's host relay
+   *  knows who may moderate, so its verdict decides: the message is hidden once
+   *  that relay accepts, and a refusal throws (nothing is hidden) instead of
+   *  removing the message on this screen alone. */
   const modDeleteMessage = useCallback(
     async (eventId: string) => {
       if (!pubkey || !activeSpaceId) return;
-      const unsigned = buildModDeletionEvent(pubkey, activeSpaceId, [eventId]);
-      await signAndPublish(unsigned, relayTargets.length ? relayTargets : undefined);
-      // Also hide locally
+      if (!hostRelay) throw new Error("This space has no relay to delete from.");
+      const signed = await signWithAccount(buildModDeletionEvent(pubkey, activeSpaceId, [eventId]));
+      for (const url of relayTargets) relayManager.connect(url, "read+write");
+      const results = await relayManager.publishWithConfirmation(signed, relayTargets);
+      const verdict = hostVerdict(results, hostRelay);
+      if (!verdict) throw new Error("The space's relay didn't answer. Try again.");
+      if (!verdict.success) throw new Error(modDeleteRefusal(verdict.message));
+
       dispatch(hideMessage(eventId));
+      dispatch(removeEvent(eventId));
+      // A no-op unless it was a poll. The relay's echo of this 9005 finds the
+      // entity already gone, so the inbound path won't clear the votes for us.
+      dispatch(removePoll(eventId));
       if (activeChannelId) {
         dispatch(removeChatMessage({ contextId: activeChannelId, eventId }));
       }
+      deleteEvent(eventId).catch(() => {});
+      putEvent(signed).catch(() => {});
     },
-    [pubkey, activeSpaceId, relayTargets, dispatch, activeChannelId],
+    [pubkey, activeSpaceId, hostRelay, relayTargets, dispatch, activeChannelId],
   );
 
   /** Edit a chat message (within 15-min window) */

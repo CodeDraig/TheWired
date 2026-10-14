@@ -12,7 +12,7 @@ interface ChatMessageContextMenuProps {
   position: { x: number; y: number };
   content: string;
   isOwnMessage: boolean;
-  isAdmin: boolean;
+  canModDelete: boolean;
   canEdit: boolean;
   onDeleteForMe: () => void;
   onDeleteForEveryone: () => void;
@@ -26,7 +26,7 @@ export function ChatMessageContextMenu({
   position,
   content,
   isOwnMessage,
-  isAdmin,
+  canModDelete,
   canEdit,
   onDeleteForMe,
   onDeleteForEveryone,
@@ -92,7 +92,7 @@ export function ChatMessageContextMenu({
             variant="danger"
           />
         )}
-        {!isOwnMessage && isAdmin && (
+        {!isOwnMessage && canModDelete && (
           <PopoverMenuItem
             icon={<Shield size={14} />}
             label="Delete message"

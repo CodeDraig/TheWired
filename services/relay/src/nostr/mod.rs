@@ -2,6 +2,7 @@ pub mod access;
 pub mod event;
 pub mod filter;
 pub mod membership_gate;
+pub mod mod_delete;
 pub mod moderation_gate;
 pub mod nip29;
 pub mod report_gate;

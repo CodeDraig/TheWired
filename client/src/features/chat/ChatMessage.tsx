@@ -23,7 +23,8 @@ interface ChatMessageProps {
   displayContent: string;
   isEdited: boolean;
   isOwnMessage: boolean;
-  isAdmin: boolean;
+  /** May delete other members' messages (admin or MANAGE_MESSAGES). */
+  canModDelete: boolean;
   canEdit: boolean;
   /** Whether the logged-in user is @mentioned in this message */
   isMentioned?: boolean;
@@ -41,7 +42,7 @@ export function ChatMessage({
   displayContent,
   isEdited,
   isOwnMessage,
-  isAdmin,
+  canModDelete,
   canEdit,
   isMentioned,
   onReply,
@@ -215,7 +216,7 @@ export function ChatMessage({
         position={ctxMenu ?? { x: 0, y: 0 }}
         content={displayContent}
         isOwnMessage={isOwnMessage}
-        isAdmin={isAdmin}
+        canModDelete={canModDelete}
         canEdit={canEdit}
         onDeleteForMe={() => onDeleteForMe(event.id)}
         onDeleteForEveryone={() => onDeleteForEveryone(event.id, event.kind)}
