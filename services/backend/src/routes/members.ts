@@ -10,6 +10,7 @@ import { eq, and, sql, asc } from "drizzle-orm";
 import { onboardingService } from "../services/onboardingService.js";
 import { profileCacheService, toMemberProfile, PROFILE_JOIN_CAP } from "../services/profileCacheService.js";
 import { notifySpaceChanged } from "../services/spaceSignalService.js";
+import { requirePubkey, requireSpace, requireSpacePermission } from "../lib/authz.js";
 
 const idParams = z.object({ id: nonEmptyString });
 const memberListQuery = z.object({
@@ -176,10 +177,15 @@ export const membersRoutes: FastifyPluginAsync = async (server) => {
     return { data: rows.map((r) => r.pubkey) };
   });
 
-  /** POST /:id/feed-sources — Add feed source pubkeys (admin only) */
+  /**
+   * POST /:id/feed-sources — Add feed source pubkeys (MANAGE_SPACE; the Admin
+   * role and the creator pass through permissionService's admin bypass, the
+   * same gate as PATCH /:id). Creator-only used to refuse every other admin
+   * while the clients offered them the editor.
+   */
   server.post<{ Params: { id: string } }>("/:id/feed-sources", async (request, reply) => {
-    const pubkey = (request as any).pubkey as string | undefined;
-    if (!pubkey) return reply.status(401).send({ error: "Authentication required", code: "UNAUTHORIZED" });
+    const pubkey = requirePubkey(request, reply);
+    if (!pubkey) return;
 
     const params = validate(idParams, request.params, reply);
     if (!params) return;
@@ -187,15 +193,11 @@ export const membersRoutes: FastifyPluginAsync = async (server) => {
     const body = validate(feedSourcesBody, request.body, reply);
     if (!body) return;
 
-    // Verify caller is space creator or admin
-    const [space] = await db.select().from(spaces).where(eq(spaces.id, id)).limit(1);
-    if (!space) return reply.status(404).send({ error: "Space not found", code: "NOT_FOUND" });
-    if (space.creatorPubkey !== pubkey) {
-      return reply.status(403).send({ error: "Only the space creator can manage feed sources", code: "FORBIDDEN" });
-    }
+    if (!(await requireSpace(id, reply))) return;
+    if (!(await requireSpacePermission(id, pubkey, "MANAGE_SPACE", reply))) return;
 
     // Insert feed sources (ignore duplicates)
-    for (const pk of body.pubkeys) {
+    for (const pk of new Set(body.pubkeys)) {
       await db
         .insert(spaceFeedSources)
         .values({ spaceId: id, pubkey: pk })
@@ -207,29 +209,28 @@ export const membersRoutes: FastifyPluginAsync = async (server) => {
       .select()
       .from(spaceFeedSources)
       .where(eq(spaceFeedSources.spaceId, id));
+    notifySpaceChanged(id, "feed");
     return { data: rows.map((r) => r.pubkey) };
   });
 
-  /** DELETE /:id/feed-sources/:pubkey — Remove a feed source (admin only) */
+  /** DELETE /:id/feed-sources/:pubkey — Remove a feed source (MANAGE_SPACE, as above) */
   server.delete<{ Params: { id: string; pubkey: string } }>("/:id/feed-sources/:pubkey", async (request, reply) => {
-    const callerPubkey = (request as any).pubkey as string | undefined;
-    if (!callerPubkey) return reply.status(401).send({ error: "Authentication required", code: "UNAUTHORIZED" });
+    const callerPubkey = requirePubkey(request, reply);
+    if (!callerPubkey) return;
 
     const params = validate(feedSourceDeleteParams, request.params, reply);
     if (!params) return;
     const { id, pubkey: targetPubkey } = params;
 
-    // Verify caller is space creator
-    const [space] = await db.select().from(spaces).where(eq(spaces.id, id)).limit(1);
-    if (!space) return reply.status(404).send({ error: "Space not found", code: "NOT_FOUND" });
-    if (space.creatorPubkey !== callerPubkey) {
-      return reply.status(403).send({ error: "Only the space creator can manage feed sources", code: "FORBIDDEN" });
-    }
+    if (!(await requireSpace(id, reply))) return;
+    if (!(await requireSpacePermission(id, callerPubkey, "MANAGE_SPACE", reply))) return;
 
-    await db
+    const removed = await db
       .delete(spaceFeedSources)
-      .where(and(eq(spaceFeedSources.spaceId, id), eq(spaceFeedSources.pubkey, targetPubkey)));
+      .where(and(eq(spaceFeedSources.spaceId, id), eq(spaceFeedSources.pubkey, targetPubkey)))
+      .returning({ pubkey: spaceFeedSources.pubkey });
 
+    if (removed.length > 0) notifySpaceChanged(id, "feed");
     return { data: { removed: true } };
   });
 };
