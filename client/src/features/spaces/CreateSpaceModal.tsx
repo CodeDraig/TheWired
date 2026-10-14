@@ -119,6 +119,7 @@ export function CreateSpaceModal({
   const [name, setName] = useState("");
   const [about, setAbout] = useState("");
   const [picture, setPicture] = useState("");
+  const [pictureUploading, setPictureUploading] = useState(false);
   const [mode, setMode] = useState<"read" | "read-write">("read-write");
   const [spaceKind, setSpaceKind] = useState<SpaceKind>("platform");
   const [decentralizedFlavor, setDecentralizedFlavor] = useState<DecentralizedFlavor>("alite");
@@ -218,7 +219,7 @@ export function CreateSpaceModal({
   const [creating, setCreating] = useState(false);
 
   async function handleCreate() {
-    if (!name.trim() || !pubkey || creating) return;
+    if (!name.trim() || !pubkey || creating || pictureUploading) return;
     setCreating(true);
 
     const spaceId = generateId();
@@ -548,6 +549,7 @@ export function CreateSpaceModal({
           <ImageUpload
             value={picture}
             onChange={setPicture}
+            onUploadingChange={setPictureUploading}
             context={{ kind: "spaceAsset" }}
             label="Picture"
             placeholder="Drop space image or click to upload"
@@ -718,9 +720,9 @@ export function CreateSpaceModal({
             variant="primary"
             size="md"
             onClick={handleCreate}
-            disabled={!name.trim() || creating}
+            disabled={!name.trim() || creating || pictureUploading}
           >
-            {creating ? "Creating..." : "Create Space"}
+            {creating ? "Creating..." : pictureUploading ? "Uploading..." : "Create Space"}
           </Button>
         </div>
       </div>

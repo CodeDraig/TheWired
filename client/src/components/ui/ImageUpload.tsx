@@ -4,12 +4,48 @@ import type { UploadContext } from "@ishtarservices/core";
 import { uploadWithContext } from "@/lib/media/uploadPlan";
 import { Spinner } from "./Spinner";
 
+/** Formats every webview we ship on renders (WebKit, WebView2, WebKitGTK). */
+const WEB_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+
+/**
+ * Re-encode an image other platforms can't render (HEIC dragged in from
+ * Photos, TIFF, BMP …) as JPEG. macOS WebKit decodes HEIC, so without this an
+ * icon set on a Mac shows everywhere else as a broken image. Throws when this
+ * webview can't decode it either.
+ */
+async function toWebImage(file: File): Promise<File> {
+  if (WEB_IMAGE_TYPES.includes(file.type)) return file;
+  const unsupported = new Error("Unsupported image format. Use JPEG, PNG, WebP or GIF.");
+  const src = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.src = src;
+    await img.decode().catch(() => {
+      throw unsupported;
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw unsupported;
+    ctx.drawImage(img, 0, 0);
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
+    if (!blob) throw unsupported;
+    return new File([blob], `${file.name.replace(/\.[^.]*$/, "") || "image"}.jpg`, { type: "image/jpeg" });
+  } finally {
+    URL.revokeObjectURL(src);
+  }
+}
+
 interface ImageUploadProps {
   value: string;
   onChange: (url: string) => void;
   /** Where the image may be stored (docs/MEDIA_STORAGE.md §1): `public` for
    *  profile pictures, `spaceAsset` for space icons and onboarding images. */
   context: UploadContext;
+  /** Reports an upload in flight. Parents disable Save/Create while it's true:
+   *  `value` only becomes the URL when the upload finishes. */
+  onUploadingChange?: (uploading: boolean) => void;
   label?: string;
   placeholder?: string;
   /** Shape of the preview */
@@ -20,6 +56,7 @@ export function ImageUpload({
   value,
   onChange,
   context,
+  onUploadingChange,
   label,
   placeholder = "Upload image or paste URL",
   shape = "square",
@@ -42,18 +79,20 @@ export function ImageUpload({
       }
 
       setUploading(true);
+      onUploadingChange?.(true);
       setError(null);
 
       try {
-        const result = await uploadWithContext(file, context);
+        const result = await uploadWithContext(await toWebImage(file), context);
         onChange(result.url);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Upload failed");
       } finally {
         setUploading(false);
+        onUploadingChange?.(false);
       }
     },
-    [onChange, context],
+    [onChange, onUploadingChange, context],
   );
 
   const handleDrop = useCallback(
@@ -159,7 +198,7 @@ export function ImageUpload({
           <input
             ref={fileRef}
             type="file"
-            accept="image/jpeg,image/png,image/webp,image/gif"
+            accept={WEB_IMAGE_TYPES.join(",")}
             className="hidden"
             onChange={(e) => {
               const file = e.target.files?.[0];

@@ -7,7 +7,10 @@ import { updateSpace } from "../../../store/slices/spacesSlice";
 import { updateSpaceInStore } from "../../../lib/db/spaceStore";
 import { useAutoResize } from "../../../hooks/useAutoResize";
 import { getSpace, updateSpaceApi } from "../../../lib/api/spaces";
-import { isBackendBacked } from "../spaceType";
+import { signAndPublish } from "../../../lib/nostr/publish";
+import { buildEditGroupMetadata } from "../../../lib/nostr/eventBuilder";
+import { isBackendBacked, isNip29Native } from "../spaceType";
+import { resolveRelaySet } from "../relaySet";
 import {
   getDiscoverCategories,
   submitListingRequest,
@@ -23,22 +26,30 @@ interface GeneralTabProps {
 export function GeneralTab({ spaceId }: GeneralTabProps) {
   const dispatch = useAppDispatch();
   const space = useAppSelector((s) => s.spaces.list.find((sp) => sp.id === spaceId));
+  const myPubkey = useAppSelector((s) => s.identity.pubkey);
 
   const [name, setName] = useState("");
   const [about, setAbout] = useState("");
   const [picture, setPicture] = useState("");
+  const [uploading, setUploading] = useState(false);
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const aboutRef = useRef<HTMLTextAreaElement>(null);
   useAutoResize(aboutRef, about, 200);
 
+  // Re-seed the form only when the stored metadata changes (our own save, or
+  // another admin's edit). Keying on the space object would also fire on every
+  // member sync, which replaces it, and wipe an uploaded-but-unsaved picture.
+  const storedName = space?.name;
+  const storedAbout = space?.about;
+  const storedPicture = space?.picture;
   useEffect(() => {
-    if (!space) return;
-    setName(space.name);
-    setAbout(space.about ?? "");
-    setPicture(space.picture ?? "");
-  }, [space]);
+    if (storedName === undefined) return;
+    setName(storedName);
+    setAbout(storedAbout ?? "");
+    setPicture(storedPicture ?? "");
+  }, [spaceId, storedName, storedAbout, storedPicture]);
 
   if (!space) return null;
 
@@ -50,24 +61,38 @@ export function GeneralTab({ spaceId }: GeneralTabProps) {
       picture: picture.trim() || undefined,
     };
     setSaveError(null);
-    // Backend-backed spaces persist through PATCH /spaces/:id so every member
-    // and device sees the edit; the local write follows the
-    // backend's answer. Native (NIP-29) spaces have no backend row — local only.
-    if (isBackendBacked(space!)) {
-      setSaving(true);
-      try {
+    setSaving(true);
+    try {
+      // Backend-backed spaces persist through PATCH /spaces/:id so every member
+      // and device sees the edit; the local write follows the backend's answer.
+      // NIP-29-native spaces have no backend row: the host relay holds the
+      // metadata, so publish a kind:9002 edit (admin-only; the relay re-emits
+      // 39000, which nip29SpaceSync applies on every member's client).
+      if (isBackendBacked(space!)) {
         await updateSpaceApi(space!.id, {
           name: updated.name,
           about: updated.about ?? null,
           picture: updated.picture ?? null,
         });
-      } catch (err) {
-        setSaving(false);
-        setSaveError(err instanceof Error ? err.message : "Couldn't save the space.");
-        return;
+      } else if (isNip29Native(space!)) {
+        if (!myPubkey || !space!.adminPubkeys.includes(myPubkey)) {
+          throw new Error("Only the group's admins can edit it.");
+        }
+        await signAndPublish(
+          buildEditGroupMetadata(myPubkey, space!.id, {
+            name: updated.name,
+            about: updated.about,
+            picture: updated.picture,
+          }),
+          resolveRelaySet(space!),
+        );
       }
+    } catch (err) {
       setSaving(false);
+      setSaveError(err instanceof Error ? err.message : "Couldn't save the space.");
+      return;
     }
+    setSaving(false);
     dispatch(updateSpace(updated));
     updateSpaceInStore(updated);
     setSaved(true);
@@ -103,6 +128,7 @@ export function GeneralTab({ spaceId }: GeneralTabProps) {
         <ImageUpload
           value={picture}
           onChange={setPicture}
+          onUploadingChange={setUploading}
           context={{ kind: "spaceAsset" }}
           label="Picture"
           placeholder="Drop space image or click to upload"
@@ -110,8 +136,8 @@ export function GeneralTab({ spaceId }: GeneralTabProps) {
         />
 
         <div className="flex items-center gap-3">
-          <Button variant="primary" size="md" onClick={handleSave} disabled={saving}>
-            {saving ? "Saving…" : "Save Changes"}
+          <Button variant="primary" size="md" onClick={handleSave} disabled={saving || uploading}>
+            {saving ? "Saving…" : uploading ? "Uploading…" : "Save Changes"}
           </Button>
           {saved && <span className="text-xs text-green-400">Saved!</span>}
           {saveError && <span className="text-xs text-red-400">{saveError}</span>}
