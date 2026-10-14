@@ -11,10 +11,10 @@
  */
 import type { AppDispatch, RootState } from "../index";
 import type { NostrEvent } from "../../types/nostr";
-import { updateSpace, setChannels } from "../slices/spacesSlice";
+import { updateSpace, setChannels, updateSpaceFeedSources } from "../slices/spacesSlice";
 import { setRoles, setBans, setMutes, setMyPermissions, setMyChannelOverrides } from "../slices/spaceConfigSlice";
 import { addNotification } from "../slices/notificationSlice";
-import { getSpace } from "../../lib/api/spaces";
+import { getSpace, fetchFeedSources } from "../../lib/api/spaces";
 import { fetchChannels } from "../../lib/api/channels";
 import { fetchRoles, fetchMyChannelPermissions } from "../../lib/api/roles";
 import { fetchBans, fetchMutes } from "../../lib/api/moderation";
@@ -22,10 +22,11 @@ import { updateSpaceInStore } from "../../lib/db/spaceStore";
 import { saveChannels } from "../../lib/db/channelStore";
 import { isBackendBacked } from "../../features/spaces/spaceType";
 import { cleanupSpaceState } from "../../features/spaces/spaceCleanup";
+import { resubscribeActiveChannel } from "../../features/spaces/resubscribeActiveChannel";
 import { syncSpaceMembers } from "./spaceMembers";
 import type { SpaceRole, Ban, Mute } from "../../types/space";
 
-export const SPACE_CHANGE_KINDS = ["meta", "channels", "roles", "members", "moderation", "deleted"] as const;
+export const SPACE_CHANGE_KINDS = ["meta", "channels", "roles", "members", "moderation", "feed", "deleted"] as const;
 export type SpaceChange = (typeof SPACE_CHANGE_KINDS)[number];
 
 /** `{ spaceId, changes }` from a nudge, or null when it isn't one we read. */
@@ -101,6 +102,20 @@ export function syncSpaceConfig(spaceId: string, changes: readonly SpaceChange[]
 
     if (wants.has("members")) {
       jobs.push(dispatch(syncSpaceMembers(spaceId)));
+    }
+
+    // Curated feed sources moved: the open feed channel's author filter with them.
+    if (wants.has("feed")) {
+      jobs.push(
+        fetchFeedSources(spaceId).then((res) => {
+          const current = getState().spaces.list.find((s) => s.id === spaceId);
+          if (!current || !Array.isArray(res.data)) return;
+          const updated = { ...current, feedPubkeys: res.data };
+          dispatch(updateSpaceFeedSources({ spaceId, pubkeys: res.data }));
+          void updateSpaceInStore(updated).catch(() => {});
+          resubscribeActiveChannel(getState(), updated);
+        }),
+      );
     }
 
     // My own standing may have moved with roles or member-roles.

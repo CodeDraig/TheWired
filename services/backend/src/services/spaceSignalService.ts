@@ -39,6 +39,7 @@ export type SpaceChange =
   | "roles" // role rows, permissions, channel overrides
   | "members" // roster or a member's roles
   | "moderation" // bans / mutes
+  | "feed" // curated feed-source pubkeys
   | "deleted";
 
 export const SPACE_CHANGE_KINDS: readonly SpaceChange[] = [
@@ -47,6 +48,7 @@ export const SPACE_CHANGE_KINDS: readonly SpaceChange[] = [
   "roles",
   "members",
   "moderation",
+  "feed",
   "deleted",
 ];
 

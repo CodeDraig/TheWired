@@ -4,7 +4,8 @@ import { createTestStore } from "@/__tests__/helpers/createTestStore";
 import type { NostrEvent } from "@/types/nostr";
 import type { Space } from "@/types/space";
 
-vi.mock("@/lib/api/spaces", () => ({ getSpace: vi.fn() }));
+vi.mock("@/lib/api/spaces", () => ({ getSpace: vi.fn(), fetchFeedSources: vi.fn() }));
+vi.mock("@/lib/nostr/groupSubscriptions", () => ({ switchSpaceChannel: vi.fn() }));
 vi.mock("@/lib/api/channels", () => ({ fetchChannels: vi.fn() }));
 vi.mock("@/lib/api/roles", () => ({
   fetchRoles: vi.fn(),
@@ -19,6 +20,7 @@ import * as channelsApi from "@/lib/api/channels";
 import * as rolesApi from "@/lib/api/roles";
 import * as moderationApi from "@/lib/api/moderation";
 import { cleanupSpaceState } from "@/features/spaces/spaceCleanup";
+import { switchSpaceChannel } from "@/lib/nostr/groupSubscriptions";
 import {
   parseSpaceConfigChanged,
   scheduleSpaceConfigSync,
@@ -29,6 +31,7 @@ import {
 import { _resetInFlight } from "../spaceMembers";
 
 const getSpace = vi.mocked(spacesApi.getSpace);
+const fetchFeedSources = vi.mocked(spacesApi.fetchFeedSources);
 const fetchChannels = vi.mocked(channelsApi.fetchChannels);
 const fetchRoles = vi.mocked(rolesApi.fetchRoles);
 const fetchMyChannelPermissions = vi.mocked(rolesApi.fetchMyChannelPermissions);
@@ -64,14 +67,14 @@ function makeSpace(overrides: Partial<Space> = {}): Space {
   };
 }
 
-function storeWith(space: Space | null) {
+function storeWith(space: Space | null, active?: { channelId: string; channels: unknown[] }) {
   return createTestStore({
     spaces: {
       list: space ? [space] : [],
-      activeSpaceId: null,
-      activeChannelId: null,
+      activeSpaceId: active && space ? space.id : null,
+      activeChannelId: active && space ? `${space.id}:${active.channelId}` : null,
       subscriptions: {},
-      channels: {},
+      channels: active && space ? { [space.id]: active.channels as never } : {},
       channelsLoading: {},
       pendingInvites: [],
     },
@@ -128,6 +131,29 @@ describe("syncSpaceConfig", () => {
     expect(fetchAllMemberRoles).toHaveBeenCalledWith("space-1");
     expect(store.getState().spaceConfig.myPermissions["space-1"]).toEqual(["MANAGE_SPACE"]);
     expect(store.getState().spaces.list[0].memberPubkeys).toEqual(["c".repeat(64)]);
+  });
+
+  it("refetches feed sources on 'feed' and re-subscribes the open channel with them", async () => {
+    const space = makeSpace({ mode: "read", feedPubkeys: ["d".repeat(64)] });
+    const notes = { id: "c-notes", spaceId: "space-1", type: "notes", label: "#notes", position: 0 };
+    const store = storeWith(space, { channelId: "c-notes", channels: [notes] });
+    fetchFeedSources.mockResolvedValue({ data: ["d".repeat(64), "e".repeat(64)] } as never);
+    await store.dispatch(syncSpaceConfig("space-1", ["feed"]) as never);
+    expect(fetchFeedSources).toHaveBeenCalledWith("space-1");
+    expect(store.getState().spaces.list[0].feedPubkeys).toEqual(["d".repeat(64), "e".repeat(64)]);
+    expect(switchSpaceChannel).toHaveBeenCalledTimes(1);
+    const [resubscribed, type, channelId] = vi.mocked(switchSpaceChannel).mock.calls[0];
+    expect(resubscribed.feedPubkeys).toEqual(["d".repeat(64), "e".repeat(64)]);
+    expect([type, channelId]).toEqual(["notes", "c-notes"]);
+    expect(getSpace).not.toHaveBeenCalled();
+  });
+
+  it("'feed' for a space that isn't open updates the list without touching subscriptions", async () => {
+    const store = storeWith(makeSpace({ mode: "read" }));
+    fetchFeedSources.mockResolvedValue({ data: ["e".repeat(64)] } as never);
+    await store.dispatch(syncSpaceConfig("space-1", ["feed"]) as never);
+    expect(store.getState().spaces.list[0].feedPubkeys).toEqual(["e".repeat(64)]);
+    expect(switchSpaceChannel).not.toHaveBeenCalled();
   });
 
   it("fetches bans/mutes on 'moderation' only when the viewer moderates", async () => {

@@ -10,9 +10,8 @@ import { useUserSearch } from "../../search/useUserSearch";
 import { addFeedSources, removeFeedSource as removeFeedSourceApi } from "../../../lib/api/spaces";
 import { updateSpaceFeedSources } from "../../../store/slices/spacesSlice";
 import { updateSpaceInStore } from "../../../lib/db/spaceStore";
-import { switchSpaceChannel } from "../../../lib/nostr/groupSubscriptions";
 import { store } from "../../../store";
-import { parseChannelIdPart } from "../spaceSelectors";
+import { resubscribeActiveChannel } from "../resubscribeActiveChannel";
 import type { Space, SpaceRole } from "../../../types/space";
 
 interface MembersTabProps {
@@ -214,7 +213,8 @@ function FeedSourceRow({
   onRemove,
 }: {
   pubkey: string;
-  onRemove: () => void;
+  /** Absent for viewers who can't edit the list. */
+  onRemove?: () => void;
 }) {
   const { profile } = useProfile(pubkey);
   const name = profile?.display_name || profile?.name || pubkey.slice(0, 8) + "...";
@@ -227,13 +227,15 @@ function FeedSourceRow({
         <div className="truncate text-[10px] text-muted font-mono">{pubkey.slice(0, 16)}...</div>
       </div>
       <Rss size={12} className="text-primary/60 shrink-0" />
-      <button
-        onClick={onRemove}
-        className="rounded p-1 text-muted opacity-0 hover:bg-red-500/10 hover:text-red-400 transition-all group-hover:opacity-100"
-        title="Remove from feed"
-      >
-        <X size={14} />
-      </button>
+      {onRemove && (
+        <button
+          onClick={onRemove}
+          className="rounded p-1 text-muted opacity-0 hover:bg-red-500/10 hover:text-red-400 transition-all group-hover:opacity-100"
+          title="Remove from feed"
+        >
+          <X size={14} />
+        </button>
+      )}
     </div>
   );
 }
@@ -248,66 +250,59 @@ export function MembersTab({ spaceId }: MembersTabProps) {
   const { roles: allRoles } = useRoles(spaceId);
   const { can } = usePermissions(spaceId);
 
+  const [feedError, setFeedError] = useState<string | null>(null);
+
   const isFeedMode = space?.mode === "read";
-  const canManageFeed = !!currentPubkey && (
-    space?.creatorPubkey === currentPubkey ||
-    !!space?.adminPubkeys.includes(currentPubkey)
+  // The backend gates feed-source writes on MANAGE_SPACE (the Admin role and
+  // the creator pass through the admin bypass) — offer the editor to exactly
+  // the viewers it will accept.
+  const canManageFeed = can("MANAGE_SPACE");
+
+  /** Apply a feed-source list locally (store, IndexedDB, open channel's sub). */
+  const applyFeedSources = useCallback(
+    (base: Space, pubkeys: string[]) => {
+      dispatch(updateSpaceFeedSources({ spaceId, pubkeys }));
+      const updatedSpace: Space = { ...base, feedPubkeys: pubkeys };
+      updateSpaceInStore(updatedSpace);
+      resubscribeActiveChannel(store.getState(), updatedSpace);
+    },
+    [dispatch, spaceId],
   );
 
-  /** Re-subscribe the active channel after feed source changes */
-  const resubscribeActiveChannel = useCallback(
-    (updatedSpace: Space) => {
-      const state = store.getState();
-      if (state.spaces.activeSpaceId !== spaceId || !state.spaces.activeChannelId) return;
-      const spaceChannels = state.spaces.channels[spaceId];
-      const channelIdPart = parseChannelIdPart(state.spaces.activeChannelId);
-      const channel = spaceChannels?.find((c) => c.id === channelIdPart);
-      if (channel) {
-        switchSpaceChannel(updatedSpace, channel.type, channel.id);
-      }
+  /** Optimistic write; on failure roll back and say why (it used to revert silently). */
+  const writeFeedSources = useCallback(
+    (pubkeys: string[], request: () => Promise<unknown>, verb: string) => {
+      if (!space) return;
+      setFeedError(null);
+      applyFeedSources(space, pubkeys);
+      request().catch((err) => {
+        console.error(`[FeedSources] Failed to ${verb}:`, err);
+        applyFeedSources(space, space.feedPubkeys);
+        setFeedError(err instanceof Error && err.message ? err.message : `Couldn't ${verb} that feed source.`);
+      });
     },
-    [spaceId],
+    [space, applyFeedSources],
   );
 
   const handleAddFeedSource = useCallback(
-    async (pubkey: string) => {
-      if (!space) return;
-
-      const updatedPubkeys = [...space.feedPubkeys, pubkey];
-      dispatch(updateSpaceFeedSources({ spaceId, pubkeys: updatedPubkeys }));
-      const updatedSpace: Space = { ...space, feedPubkeys: updatedPubkeys };
-      updateSpaceInStore(updatedSpace);
-      resubscribeActiveChannel(updatedSpace);
+    (pubkey: string) => {
+      if (!space || space.feedPubkeys.includes(pubkey)) return;
       setQuery("");
-
-      addFeedSources(spaceId, [pubkey]).catch((err) => {
-        console.error("[FeedSources] Failed to add:", err);
-        dispatch(updateSpaceFeedSources({ spaceId, pubkeys: space.feedPubkeys }));
-        updateSpaceInStore(space);
-        resubscribeActiveChannel(space);
-      });
+      writeFeedSources([...space.feedPubkeys, pubkey], () => addFeedSources(spaceId, [pubkey]), "add");
     },
-    [dispatch, space, spaceId, setQuery, resubscribeActiveChannel],
+    [space, spaceId, setQuery, writeFeedSources],
   );
 
   const handleRemoveFeedSource = useCallback(
     (pubkey: string) => {
       if (!space) return;
-
-      const updatedPubkeys = space.feedPubkeys.filter((pk) => pk !== pubkey);
-      dispatch(updateSpaceFeedSources({ spaceId, pubkeys: updatedPubkeys }));
-      const updatedSpace: Space = { ...space, feedPubkeys: updatedPubkeys };
-      updateSpaceInStore(updatedSpace);
-      resubscribeActiveChannel(updatedSpace);
-
-      removeFeedSourceApi(spaceId, pubkey).catch((err) => {
-        console.error("[FeedSources] Failed to remove:", err);
-        dispatch(updateSpaceFeedSources({ spaceId, pubkeys: space.feedPubkeys }));
-        updateSpaceInStore(space);
-        resubscribeActiveChannel(space);
-      });
+      writeFeedSources(
+        space.feedPubkeys.filter((pk) => pk !== pubkey),
+        () => removeFeedSourceApi(spaceId, pubkey),
+        "remove",
+      );
     },
-    [dispatch, space, spaceId, resubscribeActiveChannel],
+    [space, spaceId, writeFeedSources],
   );
 
   if (!space) return null;
@@ -336,6 +331,7 @@ export function MembersTab({ spaceId }: MembersTabProps) {
           <p className="text-xs text-muted">
             Users whose content appears in this feed. Only admins can manage this list.
           </p>
+          {feedError && <p className="text-xs text-red-400">{feedError}</p>}
 
           {canManageFeed && (
             <div className="relative">
@@ -391,7 +387,7 @@ export function MembersTab({ spaceId }: MembersTabProps) {
                 <FeedSourceRow
                   key={pubkey}
                   pubkey={pubkey}
-                  onRemove={() => handleRemoveFeedSource(pubkey)}
+                  onRemove={canManageFeed ? () => handleRemoveFeedSource(pubkey) : undefined}
                 />
               ))
             )}

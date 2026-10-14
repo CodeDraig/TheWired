@@ -310,3 +310,118 @@ describe("moderation hierarchy with the creator at the top", () => {
     expect(published).toHaveLength(1);
   });
 });
+
+describe("feed sources", () => {
+  const SOURCE = "a".repeat(64);
+  const OTHER = "b".repeat(64);
+  const url = (id = SPACE_ID) => `/spaces/${id}/feed-sources`;
+  const list = async () => (await server.inject({ method: "GET", url: url() })).json().data as string[];
+
+  it("401s anonymously and 404s an unknown space", async () => {
+    await seedSpace();
+    const anon = await server.inject({ method: "POST", url: url(), payload: { pubkeys: [SOURCE] } });
+    expect(anon.statusCode).toBe(401);
+    const anonDel = await server.inject({ method: "DELETE", url: `${url()}/${SOURCE}` });
+    expect(anonDel.statusCode).toBe(401);
+    const missing = await server.inject({
+      method: "POST",
+      url: url("nope"),
+      headers: { "x-auth-pubkey": LUNA.pubkey },
+      payload: { pubkeys: [SOURCE] },
+    });
+    expect(missing.statusCode).toBe(404);
+  });
+
+  it("lets the creator add (deduped) and remove, queueing a feed nudge each time", async () => {
+    await seedSpace();
+    const add = await server.inject({
+      method: "POST",
+      url: url(),
+      headers: { "x-auth-pubkey": LUNA.pubkey },
+      payload: { pubkeys: [SOURCE, SOURCE, OTHER] },
+    });
+    expect(add.statusCode).toBe(200);
+    expect([...add.json().data].sort()).toEqual([SOURCE, OTHER]);
+    expect(await whats()).toEqual(["feed"]);
+
+    published = [];
+    const del = await server.inject({
+      method: "DELETE",
+      url: `${url()}/${SOURCE}`,
+      headers: { "x-auth-pubkey": LUNA.pubkey },
+    });
+    expect(del.statusCode).toBe(200);
+    expect(await list()).toEqual([OTHER]);
+    expect(await whats()).toEqual(["feed"]);
+  });
+
+  it("lets a non-creator Admin manage the list (it used to 403 every admin but the creator)", async () => {
+    await seedSpace();
+    const admin = (await roles()).find((r) => r.isAdmin)!;
+    await addMember(MARCUS.pubkey, admin.id);
+    const add = await server.inject({
+      method: "POST",
+      url: url(),
+      headers: { "x-auth-pubkey": MARCUS.pubkey },
+      payload: { pubkeys: [SOURCE] },
+    });
+    expect(add.statusCode).toBe(200);
+    expect(await list()).toEqual([SOURCE]);
+    const del = await server.inject({
+      method: "DELETE",
+      url: `${url()}/${SOURCE}`,
+      headers: { "x-auth-pubkey": MARCUS.pubkey },
+    });
+    expect(del.statusCode).toBe(200);
+    expect(await list()).toEqual([]);
+  });
+
+  it("refuses a plain member both ways and leaves the list and the relay alone", async () => {
+    await seedSpace();
+    await server.inject({
+      method: "POST",
+      url: url(),
+      headers: { "x-auth-pubkey": LUNA.pubkey },
+      payload: { pubkeys: [SOURCE] },
+    });
+    await whats();
+    published = [];
+    const member = (await roles()).find((r) => r.isDefault)!;
+    await addMember(MARCUS.pubkey, member.id);
+    const add = await server.inject({
+      method: "POST",
+      url: url(),
+      headers: { "x-auth-pubkey": MARCUS.pubkey },
+      payload: { pubkeys: [OTHER] },
+    });
+    expect(add.statusCode).toBe(403);
+    expect(add.json().error).toBe("Missing MANAGE_SPACE permission");
+    const del = await server.inject({
+      method: "DELETE",
+      url: `${url()}/${SOURCE}`,
+      headers: { "x-auth-pubkey": MARCUS.pubkey },
+    });
+    expect(del.statusCode).toBe(403);
+    // A stranger (not even a member) is refused the same way.
+    const stranger = await server.inject({
+      method: "POST",
+      url: url(),
+      headers: { "x-auth-pubkey": ZARA.pubkey },
+      payload: { pubkeys: [OTHER] },
+    });
+    expect(stranger.statusCode).toBe(403);
+    expect(await list()).toEqual([SOURCE]);
+    expect(await whats()).toEqual([]);
+  });
+
+  it("removing a pubkey that isn't a source succeeds without a nudge", async () => {
+    await seedSpace();
+    const del = await server.inject({
+      method: "DELETE",
+      url: `${url()}/${OTHER}`,
+      headers: { "x-auth-pubkey": LUNA.pubkey },
+    });
+    expect(del.statusCode).toBe(200);
+    expect(await whats()).toEqual([]);
+  });
+});
