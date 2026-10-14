@@ -47,6 +47,15 @@ export function ChatView() {
   const canAttachFiles = !permissionsLoaded || can("ATTACH_FILES", channelIdPart);
   const canEmbedLinks = !permissionsLoaded || can("EMBED_LINKS", channelIdPart);
   const isAdmin = !!(myPubkey && adminPubkeys?.includes(myPubkey));
+  // Deleting other members' messages: admins, plus any role granted
+  // MANAGE_MESSAGES here (the relay checks the same roles).
+  const canModDelete = isAdmin || can("MANAGE_MESSAGES", channelIdPart);
+  const [actionError, setActionError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!actionError) return;
+    const t = setTimeout(() => setActionError(null), 6000);
+    return () => clearTimeout(t);
+  }, [actionError]);
   const { openUserPopover } = useUserPopover();
 
   // File upload — owned here so dropZoneRef covers the entire chat view.
@@ -206,7 +215,7 @@ export function ChatView() {
                   displayContent={displayContent}
                   isEdited={isEdited}
                   isOwnMessage={event.pubkey === myPubkey}
-                  isAdmin={isAdmin}
+                  canModDelete={canModDelete}
                   canEdit={canEdit(event)}
                   isMentioned={!!(myPubkey && event.pubkey !== myPubkey && event.tags.some((t) => t[0] === "p" && t[1] === myPubkey))}
                   onReply={
@@ -217,7 +226,12 @@ export function ChatView() {
                   onMentionClick={openUserPopover}
                   onDeleteForMe={deleteMessageForMe}
                   onDeleteForEveryone={deleteMessageForEveryone}
-                  onModDelete={modDeleteMessage}
+                  onModDelete={(eventId) => {
+                    setActionError(null);
+                    modDeleteMessage(eventId).catch((err: unknown) =>
+                      setActionError(err instanceof Error ? err.message : "Couldn't delete that message."),
+                    );
+                  }}
                   onEdit={(ev) => setEditingMessage({ event: ev, displayContent })}
                   onJumpToMessage={(targetId) => scrollToMessage(targetId, event.id)}
                 />
@@ -258,6 +272,16 @@ export function ChatView() {
           <ArrowDown size={12} />
           Jump back
         </button>
+      )}
+
+      {actionError && (
+        <div role="alert" className="flex items-center gap-2 border-t border-border px-4 py-2 text-xs text-red-400">
+          <AlertCircle size={14} />
+          <span className="flex-1">{actionError}</span>
+          <button onClick={() => setActionError(null)} className="text-muted hover:text-soft">
+            Dismiss
+          </button>
+        </div>
       )}
 
       {replyTo && !editingMessage && (
