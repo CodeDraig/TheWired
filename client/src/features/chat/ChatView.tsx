@@ -14,6 +14,7 @@ import { useUserPopover } from "../../features/profile/UserPopoverContext";
 import { usePermissions } from "../../features/spaces/usePermissions";
 import { parseChannelIdPart } from "../../features/spaces/spaceSelectors";
 import { canGateSpaceMedia } from "../../features/spaces/spaceType";
+import { mayModDelete } from "../../lib/nostr/mutationAuthority";
 import { RichContent } from "../../components/content/RichContent";
 import { profileCache } from "../../lib/nostr/profileCache";
 import { usePollVotesSub } from "../polls/usePollVotesSub";
@@ -36,8 +37,8 @@ export function ChatView() {
   const memberPubkeys = useAppSelector(
     (s) => s.spaces.list.find((sp) => sp.id === s.spaces.activeSpaceId)?.memberPubkeys,
   );
-  const adminPubkeys = useAppSelector(
-    (s) => s.spaces.list.find((sp) => sp.id === s.spaces.activeSpaceId)?.adminPubkeys,
+  const activeSpace = useAppSelector(
+    (s) => s.spaces.list.find((sp) => sp.id === s.spaces.activeSpaceId),
   );
   const { can, permissions } = usePermissions(activeSpaceId);
   const isReadOnly = spaceMode === "read";
@@ -46,10 +47,9 @@ export function ChatView() {
   const canSend = isLoggedIn && !isReadOnly && (!permissionsLoaded || can("SEND_MESSAGES", channelIdPart));
   const canAttachFiles = !permissionsLoaded || can("ATTACH_FILES", channelIdPart);
   const canEmbedLinks = !permissionsLoaded || can("EMBED_LINKS", channelIdPart);
-  const isAdmin = !!(myPubkey && adminPubkeys?.includes(myPubkey));
-  // Deleting other members' messages: admins, plus any role granted
-  // MANAGE_MESSAGES here (the relay checks the same roles).
-  const canModDelete = isAdmin || can("MANAGE_MESSAGES", channelIdPart);
+  // Deleting other members' messages: admins and the creator, plus (platform
+  // spaces) any role granted MANAGE_MESSAGES here — the relay checks the same roles.
+  const canModDelete = mayModDelete(activeSpace, myPubkey, can("MANAGE_MESSAGES", channelIdPart));
   const [actionError, setActionError] = useState<string | null>(null);
   useEffect(() => {
     if (!actionError) return;

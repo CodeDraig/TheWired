@@ -25,13 +25,15 @@ export function spaceAuthoritySet(
   return set;
 }
 
-export type ModAuthorityVerdict = "apply" | "drop-unauthorized" | "defer-unknown-space";
+export type ModAuthorityVerdict = "apply" | "drop-unauthorized" | "defer-unknown-space" | "defer-host-relay";
 
 /**
  * Authority check for h-tag-scoped moderation events (kind:9005 today).
  *  - space unknown (not yet loaded)              → defer (caller drops + unmarks for retry)
  *  - event.pubkey ∈ authority set                → apply
  *  - platform space, delivered by its host relay → apply
+ *  - platform space, delivered by any other relay → defer-host-relay (caller drops +
+ *    unmarks, so the host relay's copy of the same id is still processed)
  *  - otherwise                                   → drop (forged / mirror-injected)
  *
  * Moderators outside the admin set (roles granting MANAGE_MESSAGES) are only
@@ -47,10 +49,27 @@ export function verifySpaceModAuthority(
 ): ModAuthorityVerdict {
   if (!space) return "defer-unknown-space";
   if (spaceAuthoritySet(space).has(event.pubkey)) return "apply";
-  if (deliveredBy && (space.spaceType ?? "platform") === "platform" && sameRelay(deliveredBy, space.hostRelay)) {
-    return "apply";
+  if ((space.spaceType ?? "platform") === "platform") {
+    return deliveredBy && sameRelay(deliveredBy, space.hostRelay) ? "apply" : "defer-host-relay";
   }
   return "drop-unauthorized";
+}
+
+/**
+ * Outbound twin of {@link verifySpaceModAuthority}: offer "Delete message" only
+ * where other members' clients will apply the 9005. The authority set always;
+ * a MANAGE_MESSAGES role only on a platform space, whose host relay checks it.
+ * On A-lite / NIP-29-native spaces peers drop a role-holder's 9005, so the
+ * message would vanish on the moderator's screen alone.
+ */
+export function mayModDelete(
+  space: Pick<Space, "adminPubkeys" | "creatorPubkey" | "relayPubkey" | "spaceType"> | undefined,
+  pubkey: string | null | undefined,
+  holdsManageMessages: boolean,
+): boolean {
+  if (!space || !pubkey) return false;
+  if (spaceAuthoritySet(space).has(pubkey)) return true;
+  return holdsManageMessages && (space.spaceType ?? "platform") === "platform";
 }
 
 function sameRelay(a: string, b: string | undefined): boolean {

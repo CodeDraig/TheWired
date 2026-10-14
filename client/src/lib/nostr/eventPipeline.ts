@@ -1036,6 +1036,13 @@ async function indexEvent(event: NostrEvent, relayUrl: string): Promise<void> {
         dedup.unmarkSeen(event.id);
         break;
       }
+      if (verdict === "defer-host-relay") {
+        // A platform space's role-holding moderator is vouched for only by the
+        // host relay's delivery. Leave the id unseen so that copy is processed
+        // even when a mirror delivered this one first.
+        dedup.unmarkSeen(event.id);
+        break;
+      }
       if (verdict === "drop-unauthorized") {
         break;
       }

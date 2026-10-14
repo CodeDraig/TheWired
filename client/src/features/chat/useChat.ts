@@ -9,6 +9,7 @@ import { signAndPublish, signWithAccount } from "../../lib/nostr/publish";
 import { relayManager } from "../../lib/nostr/relayManager";
 import { deleteEvent, putEvent } from "../../lib/db/eventStore";
 import { hostVerdict, modDeleteRefusal } from "./modDelete";
+import { removePoll } from "../../store/slices/pollsSlice";
 import { saveUserState, getUserState } from "../../lib/db/userStateStore";
 import { EVENT_KINDS, type NostrEvent } from "../../types/nostr";
 import type { PollDraft } from "../polls/PollComposer";
@@ -220,6 +221,9 @@ export function useChat() {
 
       dispatch(hideMessage(eventId));
       dispatch(removeEvent(eventId));
+      // A no-op unless it was a poll. The relay's echo of this 9005 finds the
+      // entity already gone, so the inbound path won't clear the votes for us.
+      dispatch(removePoll(eventId));
       if (activeChannelId) {
         dispatch(removeChatMessage({ contextId: activeChannelId, eventId }));
       }
