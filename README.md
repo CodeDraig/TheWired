@@ -2,7 +2,7 @@
 
 Decentralized Nostr-native media platform -- streaming, messaging, music, voice/video calls, long-form content, zaps, an AI assistant, and self-hostable spaces in a desktop app. Built with Tauri v2, React 19, and the Nostr protocol.
 
-Current version: **v0.6.0**. Auto-updating Tauri desktop app with macOS, Windows, and Linux builds.
+Current version: **v0.7.2**. Auto-updating Tauri desktop app with macOS, Windows, and Linux builds.
 
 ## Architecture
 
@@ -12,21 +12,22 @@ Current version: **v0.6.0**. Auto-updating Tauri desktop app with macOS, Windows
 | Relay | Rust (axum + sqlx) | 7777 | Custom NIP-29 relay with PostgreSQL storage |
 | Backend | Node.js/TypeScript (Fastify + Drizzle) | 3002 | Business logic, RBAC, search, feeds, push, Blossom blobs |
 | Gateway | Go | 9080 | NIP-98 auth, rate limiting, request routing |
-| Landing | Astro + React | - | Marketing site (`services/landing/`) |
+| Landing | Astro + React | 8080 | Marketing site, legal pages (`services/landing/`) |
+| Proxy | Caddy | 80/443 | Production reverse proxy for api / relay / LiveKit / share pages (`services/proxy/`) |
 | PostgreSQL | - | 5432 | Shared database (relay + app schemas) |
 | Redis | - | 6380 | Rate limits, caching, trending feeds |
 | Meilisearch | - | 7700 | Full-text search engine |
 | LiveKit | - | 7880 | WebRTC SFU for voice/video channels |
 | Embedded Relay | Rust (in-client) | 7787 | Optional self-hosted NIP-29 relay running in-process (SQLite), exposed via Cloudflare tunnel |
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full design document. Feature deep-dives: [docs/AI_ENGINE.md](./docs/AI_ENGINE.md), [docs/DECENTRALIZED_SPACES.md](./docs/DECENTRALIZED_SPACES.md), [docs/NIP17_GROUP_ROOMS.md](./docs/NIP17_GROUP_ROOMS.md).
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full design document. Feature deep-dives: [docs/AI_ENGINE.md](./docs/AI_ENGINE.md), [docs/DECENTRALIZED_SPACES.md](./docs/DECENTRALIZED_SPACES.md), [docs/NIP17_GROUP_ROOMS.md](./docs/NIP17_GROUP_ROOMS.md), [docs/DM_WIRE_CONTRACT.md](./docs/DM_WIRE_CONTRACT.md), [docs/E2EE_CALLS.md](./docs/E2EE_CALLS.md), [docs/MEDIA_STORAGE.md](./docs/MEDIA_STORAGE.md), [docs/MUSIC_VISIBILITY.md](./docs/MUSIC_VISIBILITY.md), [docs/MUSIC_LIBRARY_SYNC.md](./docs/MUSIC_LIBRARY_SYNC.md).
 
 ## Requirements
 
 ### System
 - **Node.js** >= 22
 - **pnpm** >= 10
-- **Rust** >= 1.77.2 (with cargo)
+- **Rust** >= 1.88 (with cargo; current dependency versions need it)
 - **Go** >= 1.22 (for gateway)
 - **Docker** + **Docker Compose** (for infrastructure services)
 - **LiveKit server** (`brew install livekit`) -- runs natively in dev for voice/video
@@ -126,28 +127,40 @@ DX, so `pnpm dev` is preferred for active development.
 | `pnpm dev:backend` | Backend service with hot reload (port 3002) |
 | `pnpm dev:gateway` | Go API gateway (port 9080) |
 | `pnpm dev:relay` | Rust NIP-29 relay (port 7777) |
-| `pnpm dev:infra` | Start PostgreSQL + Redis + Meilisearch (Docker) |
-| `pnpm dev:services` | Start all Docker services |
+| `pnpm dev:landing` | Astro landing site dev server |
+| `pnpm dev:tauri` | Full Tauri desktop app with hot reload (same as `cd client && pnpm tauri dev`) |
+| `pnpm dev:tauri:2` / `dev:tauri:3` | Extra Tauri instances with their own Vite port, keychain accounts and embedded-relay data, for multi-user testing on one machine |
+| `pnpm dev:infra` | Start PostgreSQL + Redis + Meilisearch + LiveKit (Docker) |
+| `pnpm dev:services` | Start all Docker services (includes the landing and Caddy proxy containers) |
 | `pnpm dev:down` | Stop the managed app processes (infra stays up) |
 | `pnpm dev:down:infra` | Stop Postgres + Redis + Meilisearch |
+| `pnpm reports:list` / `show` / `resolve` / `lift` / `restore` | Operator CLI for the user-report queue (same service functions as the admin routes) |
 | `pnpm build` | Build all packages |
 | `pnpm typecheck` | TypeScript check all packages |
-| `cd client && pnpm tauri dev` | Full Tauri desktop app with hot reload |
 | `cd client && pnpm tauri build` | Production desktop app bundle |
 
 ## Testing
 
-The project has a comprehensive test suite covering all four services.
+The project has a test suite covering every service plus the shared `core` package. Approximate sizes as of v0.7.2:
+
+| Suite | Tests | Needs |
+|-------|-------|-------|
+| `packages/core` (Vitest) | ~260 | Nothing |
+| Client (Vitest) | ~1,950 | Nothing |
+| Backend (Vitest + Fastify inject) | ~790 | PostgreSQL |
+| Gateway (Go) | 84 | Nothing |
+| Relay (Rust) | ~140 unit + ~60 integration | Integration tests need PostgreSQL |
+| Client E2E (Playwright) | 11 | Full stack |
 
 ### Quick Start
 
 ```bash
 # Run all tests that need no infrastructure
-pnpm test:client                         # 229 Vitest tests (no deps)
-pnpm test:gateway                        # 49 Go tests (no deps)
-pnpm test:relay                          # 33 Rust tests (no deps)
+pnpm test:core
+pnpm test:client
+pnpm test:gateway
 
-# Run everything (backend needs PostgreSQL)
+# Run everything (backend and relay integration tests need PostgreSQL)
 pnpm test:all
 ```
 
@@ -170,8 +183,8 @@ No setup required -- uses `jsdom`, `fake-indexeddb`, and MSW mocks. Covers:
 #### Client E2E (Playwright)
 
 ```bash
-pnpm test:e2e               # Run Playwright tests (headless)
-pnpm test:e2e:headed        # Run with visible browser
+pnpm test:e2e                                    # Run Playwright tests (headless)
+pnpm --filter @thewired/client test:e2e:headed   # Run with visible browser
 
 # First time: install Playwright browsers
 npx playwright install chromium
@@ -208,19 +221,26 @@ No setup required -- uses Go stdlib `testing` + `net/http/httptest`. Covers NIP-
 pnpm test:relay             # or: cd services/relay && cargo test
 ```
 
-No setup required -- inline `#[cfg(test)]` modules with unit tests. Covers event serialization, schnorr signature verification, and filter matching.
+Unit tests (inline `#[cfg(test)]` modules) need no setup. They cover event serialization, schnorr verification, filter matching, the membership / moderation / gift-wrap gates, NIP-42 and the SQLite backend. The integration tests in `services/relay/tests/` need PostgreSQL (default test DB, or `TEST_DATABASE_URL`) and skip with a printed warning when it is unreachable. `db_parity.rs` runs the same operations through the SQLite and Postgres backends and checks they agree; its SQLite half always runs.
+
+#### Core package (Vitest)
+
+```bash
+pnpm test:core              # @ishtarservices/core: gift wrap, NIP-17 rooms, file crypto, dedup, negentropy, DM wire, media + music sync
+```
 
 ### Test Scripts Reference
 
 | Command | Description |
 |---------|-------------|
+| `pnpm test:core` | `@ishtarservices/core` package tests (Vitest) |
 | `pnpm test:client` | Client unit tests (Vitest) |
 | `pnpm test:client:watch` | Client tests in watch mode |
 | `pnpm test:client:coverage` | Client tests with coverage |
 | `pnpm test:backend` | Backend route + service tests (needs PostgreSQL) |
 | `pnpm test:gateway` | Gateway Go tests |
-| `pnpm test:relay` | Relay Rust tests |
-| `pnpm test:all` | Run client + backend + gateway + relay tests |
+| `pnpm test:relay` | Relay Rust tests (integration tests need PostgreSQL) |
+| `pnpm test:all` | Run core + client + backend + gateway + relay tests |
 | `pnpm test:e2e` | Playwright E2E tests (needs full stack) |
 
 ### Test Users
@@ -242,13 +262,15 @@ Tests run automatically on push and pull request via GitHub Actions (`.github/wo
 
 | Job | What runs | Infrastructure |
 |-----|-----------|----------------|
-| **Client** | `pnpm test:client` (229 Vitest tests) | None |
-| **Gateway** | `go test ./...` (49 Go tests) | None |
-| **Relay** | `cargo test` (33 Rust tests) | None |
+| **Client** | `pnpm test:client` + coverage | None |
+| **Gateway** | `go test ./... -v -count=1` | None |
+| **Relay** | `cargo test` (unit + integration) | PostgreSQL (service container) |
 | **Backend** | `pnpm test:backend` (Fastify inject) | PostgreSQL (service container) |
 | **Typecheck** | `pnpm typecheck` | None |
 
-All jobs run in parallel. Backend tests get a fresh PostgreSQL 16 container per run.
+All jobs run in parallel. Backend and relay tests get a fresh PostgreSQL 16 container per run. The `core` package tests and Playwright E2E are not in CI yet.
+
+Other workflows: `build-images.yml` (Docker images, built only after Tests pass on `main`), `release.yml` (multi-platform Tauri builds + signed updates on `v*` tags), `linux-smoke-test.yml` (manual AppImage smoke test).
 
 ## Project Structure
 
@@ -260,43 +282,54 @@ TheWiredV1/
 │   │   ├── components/
 │   │   │   ├── layout/            # Sidebar, CenterPanel, RightPanel, TopBar, ThemeBackground
 │   │   │   └── ui/                # Button, Avatar, Spinner, Modal, PopoverMenu, MagicCard, etc.
-│   │   ├── contexts/              # React contexts (theme, toast, etc.)
+│   │   ├── contexts/              # React contexts (theme)
+│   │   ├── hooks/                 # Shared hooks (scroll restore, shortcuts, uploads, updater, …)
 │   │   ├── features/
 │   │   │   ├── ai/                # Toggleable AI assistant: chat, multi-provider LLM, gated tools, artifacts
-│   │   │   ├── calling/           # 1:1 WebRTC DM calls (peer connection, signaling, ringtone)
+│   │   │   ├── calling/           # 1:1 DM calls over a private LiveKit room (invite, controller, ringtone; frame E2EE)
 │   │   │   ├── chat/              # Kind:9 real-time chat, edits, context menu, GIFs, emoji
-│   │   │   ├── discover/          # /discover page: spaces, relays, communities, people
-│   │   │   ├── dm/                # NIP-17 encrypted DMs, contacts, conversations, friend list
-│   │   │   ├── emoji/             # Emoji picker / reactions
-│   │   │   ├── friends/           # Friends Feed virtual space (follow list aggregation)
+│   │   │   ├── discover/          # /discover page: Spaces, Music, People segments + space preview panel
+│   │   │   ├── dm/                # NIP-17 encrypted DMs + group rooms, contacts, typing/receipts, friend list
+│   │   │   ├── emoji/             # Emoji picker, custom emoji sets
+│   │   │   ├── friends/           # Friends Feed virtual space (follow list aggregation, feed prefs)
 │   │   │   ├── identity/          # Login, multi-account switcher, profile card
 │   │   │   ├── listenTogether/    # Synced playback sessions (now playing, vote-skip, DJ transfer)
-│   │   │   ├── longform/          # Kind:30023 Markdown article rendering
-│   │   │   ├── media/             # Kind:22 video playback (HLS via hls.js)
+│   │   │   ├── longform/          # Kind:30023 article reader + rich editor (drafts stay local in IndexedDB)
+│   │   │   ├── media/             # Video playback (HLS via hls.js) + shared MediaStage tile layout for calls/voice
 │   │   │   ├── music/             # Music library, player, upload, revisions, proposals, insights
 │   │   │   │   ├── views/         # MusicHome, SongList, AlbumGrid, ArtistDetail, Explore, etc.
 │   │   │   │   ├── panel/         # Side panel (Actions, Audio, History, Notes tabs, waveform)
-│   │   │   │   └── playbackBar/   # MiniBar, ExpandedBar, NowPlayingOverlay, progress bar
+│   │   │   │   ├── playbackBar/   # MiniBar, ExpandedBar, NowPlayingOverlay, progress bar
+│   │   │   │   └── sharedKey/     # Co-owned projects: shared project keys (kind-20017 key DMs)
 │   │   │   ├── notifications/     # Toast stack, bell dropdown, browser/push, service worker
 │   │   │   ├── onboarding/        # Profile wizard, app tour, welcome flow
+│   │   │   ├── polls/             # NIP-88 polls (composer, card, voting)
 │   │   │   ├── profile/           # Profile page, edit, follow cards, pinned notes, showcase
+│   │   │   ├── reactions/         # Reaction toggle / un-react
 │   │   │   ├── relay/             # Relay connection status panel
-│   │   │   ├── search/            # Command palette, user/message search
-│   │   │   ├── settings/          # Notification preferences, theme picker, account
+│   │   │   ├── search/            # User/message search panels
+│   │   │   ├── settings/          # Profile, relays, notifications, wallet, storage/media servers, features, AI, security
 │   │   │   ├── spaces/            # NIP-29 spaces, channels, members, moderation, settings
-│   │   │   │   ├── moderation/    # Ban/mute/kick, member context menu
+│   │   │   │   ├── moderation/    # Ban/mute/kick, member context menu, audit log
 │   │   │   │   ├── notes/         # Thread view, quoted notes, reply composer
-│   │   │   │   └── settings/      # Tabbed Space Settings modal
-│   │   │   ├── voice/             # LiveKit voice/video channels, screen share, pre-join
+│   │   │   │   └── settings/      # Tabbed Space Settings modal (incl. discovery listing request)
+│   │   │   ├── voice/             # LiveKit voice/video channels, screen share, pre-join, device picker
 │   │   │   └── wallet/            # NIP-47 NWC wallet + NIP-57 zaps (ZapModal, walletManager, zap totals)
 │   │   ├── lib/
 │   │   │   ├── api/               # Backend API client (25 modules; NIP-98 auth, request queue)
+│   │   │   ├── audio/             # Audio unlock helper (autoplay policies)
+│   │   │   ├── cache/             # Image, media-token and video-poster caches
+│   │   │   ├── content/           # Rich content parsing (inline markdown, note/music embeds, previews)
 │   │   │   ├── db/                # IndexedDB persistence (events, profiles, music, audio cache, AI conversations)
+│   │   │   ├── debug/             # wiredDebug gated logger + perf monitors
 │   │   │   ├── lightning/         # NIP-57 zaps, LNURL, NIP-47 NWC client
+│   │   │   ├── media/             # Upload planning, media-server prefs, media grants, note media parsing
 │   │   │   ├── relay/             # Embedded relay control (in-process Tauri relay)
+│   │   │   ├── security/          # SSRF guard for untrusted URLs
+│   │   │   ├── webrtc/            # LiveKit client wrapper, media prefs, frame E2EE key providers
 │   │   │   └── nostr/             # Protocol: relay, subscription, event pipeline, signers (NIP-07 / Tauri / NIP-46),
-│   │   │                          #   NIP-44, gift wrap, follow list, signing queue, NIP-17 rooms
-│   │   ├── store/                 # Redux store + 20 slices
+│   │   │                          #   NIP-44, gift wrap, follow list, signing queue, NIP-17 rooms, negentropy
+│   │   ├── store/                 # Redux store (25 slices) + thunks
 │   │   ├── styles/                # Theme engine presets, color tokens
 │   │   ├── types/                 # TypeScript types
 │   │   └── workers/               # Web Worker for schnorr verification
@@ -306,27 +339,34 @@ TheWiredV1/
 │   ├── vite.config.ts
 │   └── package.json
 ├── packages/
-│   └── shared-types/              # @ishtarservices/shared-types
-│       └── src/                   # nostr, space, profile, api, permissions, music
+│   ├── core/                      # @ishtarservices/core (published): platform-neutral protocol code
+│   │   └── src/                   # crypto (gift wrap, NIP-44, NIP-17 rooms, file crypto), nostr (dedup, negentropy,
+│   │                              #   DM wire, music library/folder sync), media, music, listenTogether
+│   └── shared-types/              # @ishtarservices/shared-types (published, type-only)
+│       └── src/                   # nostr, space, profile, api, permissions, music, dm, listenTogether
 ├── services/
 │   ├── backend/                   # Node.js/Fastify backend (@thewired/backend)
 │   │   └── src/
-│   │       ├── routes/            # REST API endpoints (28 route modules)
-│   │       ├── services/          # Business logic (23 service modules)
-│   │       ├── workers/           # Background jobs (7 workers + ingestHandlers)
-│   │       ├── db/schema/         # Drizzle ORM tables (app schema, 25+ tables)
-│   │       ├── db/migrations/     # SQL migrations (0001-0025)
-│   │       ├── middleware/        # Auth context, error handler
-│   │       └── lib/               # Redis, Meilisearch, Nostr utils, MIME, validation
+│   │       ├── routes/            # REST API endpoints (34 route modules)
+│   │       ├── services/          # Business logic (35 service modules)
+│   │       ├── workers/           # Background jobs (9 workers + ingestHandlers)
+│   │       ├── db/schema/         # Drizzle ORM tables (app schema, 40+ tables)
+│   │       ├── db/migrations/     # SQL migrations (0001-0035)
+│   │       ├── middleware/        # Auth context, error handler, Blossom auth
+│   │       ├── scripts/           # Operator CLIs (reports) + backfills (transcodes, cover variants)
+│   │       └── lib/               # Redis, Meilisearch, Nostr utils, transcode, media tokens, SSRF guard
 │   ├── gateway/                   # Go API gateway
 │   │   ├── cmd/gateway/           # Entry point
 │   │   └── internal/              # auth, ratelimit, proxy, cors, logging, config
 │   ├── relay/                     # Rust NIP-29 relay (Postgres server or embedded SQLite)
 │   │   ├── migrations/            # PostgreSQL schema (relay schema)
 │   │   └── src/                   # nostr, protocol, db (pg + sqlite), music, relay_identity, connection
-│   └── landing/                   # Astro marketing site (downloads, features, pricing)
+│   ├── landing/                   # Astro marketing site (downloads, features, legal: privacy/terms/DMCA/guidelines)
+│   └── proxy/                     # Caddy production reverse proxy (Caddyfile + Dockerfile)
 ├── config/livekit.yaml            # LiveKit SFU config
-├── docker-compose.yml             # Dev infrastructure stack
+├── docker-compose.yml             # Dev stack (infra + services + landing + proxy)
+├── docker-compose.prod.yml        # Production compose reference
+├── process-compose.yaml           # `pnpm dev` orchestration (+ process-compose-shortcuts.yaml)
 ├── pnpm-workspace.yaml            # Workspace config
 ├── tsconfig.base.json             # Shared TypeScript config
 ├── CLAUDE.md                      # Claude Code instructions
@@ -353,8 +393,12 @@ TheWiredV1/
 | idb | 8 | IndexedDB wrapper |
 | nostr-tools | 2 | Nostr protocol utilities + NIP-46 BunkerSigner |
 | livekit-client | 2 | Voice/video SFU client |
-| marked + highlight.js | - | AI chat markdown + code highlighting |
-| recharts | 2 | AI artifact charts (lazy-loaded, code-split) |
+| lru-cache | 11 | Event dedup and other bounded caches |
+| Tiptap | 2 | Rich article editor (Markdown round-trip) |
+| motion | 12 | Animations |
+| marked + highlight.js | 18 / 11 | AI chat markdown + code highlighting |
+| recharts | 3 | AI artifact charts (lazy-loaded, code-split) |
+| Vitest + MSW + Playwright | 4 / 2 / 1 | Unit, API-mock and E2E testing |
 
 ### Backend
 | Package | Purpose |
@@ -365,7 +409,10 @@ TheWiredV1/
 | postgres (postgres.js) | PostgreSQL driver |
 | ioredis | Redis client |
 | meilisearch | Search engine client |
-| web-push | Push notifications |
+| BullMQ | Transcode job queue (on Redis) |
+| sharp | Cover-art resized variants |
+| livekit-server-sdk | Voice/video room tokens + management |
+| web-push | Web push notifications |
 | zod | Request validation |
 | pino | Structured logging |
 
@@ -374,15 +421,16 @@ TheWiredV1/
 |-------|---------|
 | axum 0.8 | HTTP + WebSocket server |
 | tokio | Async runtime |
-| sqlx 0.8 | PostgreSQL async driver |
+| sqlx 0.8 | PostgreSQL async driver (SQLite too, behind the `embedded` feature) |
 | secp256k1 0.30 | Schnorr signature verification |
 | sha2 | SHA-256 for event ID computation |
+| negentropy 0.5 | NIP-77 set reconciliation |
 
 ### Gateway (Go)
 | Module | Purpose |
 |--------|---------|
-| dcrd/secp256k1 | NIP-98 schnorr verification |
-| go-redis | Rate limiting with sliding window |
+| btcsuite/btcd/btcec/v2 | NIP-98 schnorr verification |
+| go-redis/v9 | Rate limiting with sliding window |
 
 ## Nostr Event Kinds Used
 
@@ -391,18 +439,29 @@ TheWiredV1/
 | 0 | NIP-01 | User profiles |
 | 1 | NIP-01 | Announcements / short text notes |
 | 3 | NIP-02 | Follow lists |
+| 5 | NIP-09 | Deletions (message deletes, un-react) |
+| 6 | NIP-18 | Reposts |
 | 7 | NIP-25 | Reactions |
-| 9 | NIP-C7 | Chat messages |
+| 9 | NIP-C7 | Chat messages (also music shelf posts in space music channels) |
 | 20 | NIP-68 | Picture posts |
+| 21 | NIP-71 | Landscape videos |
 | 22 | NIP-71 | Portrait/reel videos |
 | 34235 | NIP-71 | Addressable landscape videos |
 | 34236 | NIP-71 | Addressable reel videos |
 | 30023 | NIP-23 | Long-form articles |
-| 30311 | NIP-53 | Live streams |
-| 1311 | NIP-53 | Live chat |
-| 1059 | NIP-17 | Gift wraps (encrypted DMs, friend requests, call signaling, group rooms) |
+| 1068 / 1018 | NIP-88 | Polls / poll responses |
+| 1111 | NIP-22 | Comments (rendered when embedded; no comment UI yet) |
+| 1984 | NIP-56 | Reports (ingested by the backend into the moderation queue) |
+| 30311 | NIP-53 | Live streams (indexed; no player UI yet) |
+| 1311 | NIP-53 | Live chat (used in voice/video channels) |
+| 30312 / 10312 | NIP-53 | Interactive room metadata / room presence (voice channels) |
+| 1059 | NIP-17 | Gift wraps (encrypted DMs, friend requests, call invites, group rooms) |
 | 13 | NIP-17 | Seals (intermediate encryption layer) |
-| 14 | NIP-17 | Rumors (decrypted DM / call signaling content) |
+| 14 / 15 | NIP-17 | Rumors: DM message / encrypted file message |
+| 20014 / 20015 | Custom | DM typing indicator / delivered + read receipts (gift-wrapped rumors; see `docs/DM_WIRE_CONTRACT.md`) |
+| 20016 | Custom | Call / voice-channel E2EE sender-key envelope (gift-wrapped; see `docs/E2EE_CALLS.md`) |
+| 20017 | Custom | Shared music project key (gift-wrapped) |
+| 10050 | NIP-17 | DM inbox relays |
 | 9734 | NIP-57 | Zap request (sent to LNURL callback, not relays) |
 | 9735 | NIP-57 | Zap receipt |
 | 13194 | NIP-47 | NWC wallet info / capabilities |
@@ -410,10 +469,12 @@ TheWiredV1/
 | 23195 | NIP-47 | NWC response |
 | 23196 / 23197 | NIP-47 | NWC notifications (nip04 legacy / nip44_v2) |
 | 24133 | NIP-46 | Remote signer (bunker) request/response |
-| 30078 | NIP-78 | App data: channel layout + relay-set overlays (decentralized spaces) |
+| 30078 | NIP-78 | App data: channel layout + relay-set overlays (decentralized spaces); NIP-44 self-encrypted music library + folder sync |
 | 10000 | NIP-51 | Mute lists |
+| 10001 | NIP-51 | Pinned notes |
 | 10002 | NIP-65 | Relay lists |
 | 10009 | NIP-51 | User group memberships |
+| 10030 / 30030 | NIP-51 / NIP-30 | User emoji list / custom emoji sets |
 | 10063 | NIP-B7 | Blossom server list |
 | 22242 | NIP-42 | Client auth (relay challenge/response) |
 | 24242 | BUD-01 | Blossom blob auth tokens |
@@ -421,15 +482,17 @@ TheWiredV1/
 | 39000 | NIP-29 | Group metadata |
 | 39001 | NIP-29 | Group admins |
 | 39002 | NIP-29 | Group members |
-| 9000-9022 | NIP-29 | Group moderation (ban/unban, kick, metadata edits) |
+| 9000-9022 | NIP-29 | Group moderation (put/remove user, metadata edits, 9005 delete event, create group, invites, join/leave) |
+| 20900 | Custom | Backend nudge: a platform space's config changed |
 | 31683 | Custom | Music track metadata |
-| 33123 | Custom | Music album |
-| 30119 | Custom | Music playlist |
+| 33123 | Custom | Music album / project |
+| 30119 | Custom | Music playlist (a published folder) |
+| 31685 | Custom | Music proposals + listen (access) requests |
+| 31686 | Custom | Music track notes (timestamped annotations) |
 | 30000 | NIP-51 | Follow sets (favorite artists) |
 | 30003 | NIP-51 | Bookmark sets (liked tracks) |
-| 30166 | NIP-66 | Relay monitor data (read-only, discover worker) |
-| 34550 | NIP-72 | Moderated communities (discover) |
-| 39089 | NIP-51 | Starter packs (discover) |
+
+Music kinds are specified in [docs/nips/NIP-XX-Music-Events.md](./docs/nips/NIP-XX-Music-Events.md). NIP-66 relay monitors (30166), NIP-72 communities (34550) and starter packs (39089) are on the roadmap and not used yet.
 
 ## Development Phases
 
@@ -441,7 +504,7 @@ Core relay connection, chat, basic media playback, identity.
 - NIP-07 login + Tauri native keystore (OS keychain signing in Rust)
 - Multi-relay WebSocket manager with NIP-65 relay discovery
 - Subscription manager with full REQ/CLOSE/EOSE lifecycle
-- Event dedup (Bloom filter + LRU), signature verification (Web Worker)
+- Event dedup (Bloom filter + LRU at the time; now a single 100k-entry LRU in `@ishtarservices/core`), signature verification (Web Worker)
 - IndexedDB cache with TTL eviction, Redux normalized store
 - Kind:0 profile display and edit with publish
 - Kind:9 chat (NIP-C7) with optimistic UI, reply threading
@@ -513,12 +576,12 @@ Full music library, playback, upload, search, and discovery system.
 **Relay:**
 - Music event validation fixed: tag-based validation (checks `title` and `d` tags) instead of content-based validation
 
-**Still TODO (deferred to Phase 4+):**
-- FFmpeg transcoding workers (multi-bitrate HLS, audio normalization)
-- Blossom server integration for decentralized file storage
-- NIP-44 encrypted private playlists
-- NIP-57 zap integration + NIP-47 Nostr Wallet Connect
-- NIP-22 comments on videos/tracks/articles
+**Deferred from Phase 3 (status as of v0.7.2):**
+- FFmpeg transcoding: **shipped for music audio.** BullMQ `transcodeWorker` produces 128k + 256k AAC HLS (fMP4) with single-pass `loudnorm` to -14 LUFS. Still open: video transcoding, two-pass loudness measurement. See Phase 14.
+- Blossom storage: **shipped** (Phase 6), plus user-chosen media servers and kind:10063 server lists.
+- NIP-44 private playlists: **shipped differently.** Playlists became folders, synced across devices as NIP-44 self-encrypted kind:30078 docs; publishing a folder writes a public kind:30119. Private tracks and albums use NIP-44 content. There's no playlist encrypted to other people yet.
+- NIP-57 zaps + NIP-47 NWC: **shipped** (Phase 10). Zap splits are still open (Phase 14).
+- NIP-22 comments: **not started.** Track annotations use the custom kind:31686 instead. See Phase 14.
 
 ### Phase 4: Spaces, DMs, Notifications & Social -- COMPLETE
 
@@ -625,7 +688,7 @@ Content-addressed decentralized file storage built into the Fastify backend.
 ### Phase 7: Discovery & Onboarding -- COMPLETE
 
 **Discover page (`/discover`):**
-- Four tabs: Spaces, Relays, Communities, People
+- Originally four tabs (Spaces, Relays, Communities, People). Rebuilt in v0.7 as three segments, **Spaces, Music, People**, with a right-panel space preview. The Relays tab was retired and the Communities tab was never populated.
 - Featured spaces (horizontal scroll), trending section, category chip filter, browse-all with search
 - `app.listing_requests`, `app.space_categories` (11 seeded), `app.relay_directory` tables
 - `discoveryService`: browse, featured, categories, listing submission/review, relay directory
@@ -682,7 +745,7 @@ Expanded from basic upload/playback into a full artist + release workflow.
 - **Collapsible sidebar:** Compact + expanded modes
 - **Space mode:** `read-write` vs `read` (community vs feed)
 - **Saved invite cards:** Invite links persisted and rendered as rich cards in DMs
-- **Comprehensive test suite:** 229 client Vitest + 49 gateway Go + 33 relay Rust + backend Fastify-inject + Playwright E2E
+- **Comprehensive test suite:** 229 client Vitest + 49 gateway Go + 33 relay Rust + backend Fastify-inject + Playwright E2E at the time (see [Testing](#testing) for current sizes)
 - **Path-based CI:** Docker image builds gated on test success, diff against last successful build
 
 ### Phase 10: Wallet, Zaps & Remote Signing -- COMPLETE
@@ -703,7 +766,7 @@ Self-hostable NIP-29 spaces across all layers. See [docs/DECENTRALIZED_SPACES.md
 - **NIP-29-native create + import** (`ImportSpaceModal`: `host'groupId` / `naddr` / `nostr:` / deep link); 39000/39001/39002 synthesized into the same Redux slices as the backend path
 - **Backend** `relayConnectionManager` (multi-relay ingestion, SSRF guard, tiered discovery) + `ingestHandlers` **replace the single `relayIngester` worker**; `relayRegistrationService` + `cloudflareTunnelService`; routes `spaceRelays` + `relayTunnels`; migrations 0024/0025
 - **Relay:** SQLite backend + group store, membership-source abstraction, `is_private` gating, NIP-42 AUTH relaxation for hosted relays, tag-columns migration
-- **NIP-17 group rooms** engine (`lib/nostr/nip17Room.ts`) shipped + tested; full UI integration is the open M8 milestone ([docs/NIP17_GROUP_ROOMS.md](./docs/NIP17_GROUP_ROOMS.md))
+- **NIP-17 group rooms** engine (`nip17Room.ts`, now in `@ishtarservices/core`) shipped + tested, and the UI followed with DM wire v1: New DM → Room mode (2–9 people, optional subject), room rendering and typing counts in the DM sidebar and conversation ([docs/NIP17_GROUP_ROOMS.md](./docs/NIP17_GROUP_ROOMS.md))
 
 ### Phase 12: AI Engine -- COMPLETE
 
@@ -717,44 +780,89 @@ Toggleable AI assistant (Settings → Features, default off). See [docs/AI_ENGIN
 - **"Ask AI" context chips** across notes, threads, DMs, profiles, spaces; **publish-out** (note / article / space / DM)
 - **Keys never in Redux** — OS keychain + `llmManager` memory only
 
-### Phase 13: Discovery UX & Polish -- TODO
+### Since v0.6.0 (v0.6.1 – v0.7.2) -- COMPLETE
 
-See [DISCOVER_REMAINING_PHASES.md](./docs/DISCOVER_REMAINING_PHASES.md) for detail.
+Work that shipped after the phase plan above was written.
 
-- **Join from Discover:** Join button on `SpaceCard` with membership state
-- **Right panel preview:** Detailed space/relay preview when clicking a card
-- **Listing request UI:** Modal for space admins to submit listing requests
-- **Meilisearch spaces index:** Replace SQL `ILIKE` with full-text search
-- **Relay directory worker:** NIP-66 monitor ingestion + NIP-11 probing
-- **`ingestHandlers`** extensions for kind:10002 (relay usage counts) and kind:34550 (communities)
-- **Communities tab:** NIP-72 moderated communities browser
-- **People tab:** Starter packs (kind:39089) + suggested follows (2-hop social graph)
-- **"Friends Are In"** section: Spaces your follows are members of
-- **Command Palette (Cmd+K):** Global search overlay
-- **Trending/personalized feed UI** (backend endpoints already exist)
-- **NIP-77 Negentropy sync** for efficient reconnection
-- **NIP-53 live streaming** + live chat UI
-- **Pinned messages panel** per channel
-- **Audit log** (moderation/admin action history)
-- **Announcement channels** (admin-only posting enforcement on relay)
-- **Auto-mod** (keyword filters, spam detection)
-- **Anti-raid protection**
-- **Custom emoji reactions** per server
+**Content & social**
+- **Article authoring:** rich Tiptap editor, cover images, local drafts, public or space-exclusive articles
+- **NIP-88 polls** in feeds and chat, including polls whose options are tracks
+- **Inline note embeds** and a note share menu (copy link, forward to DM, share to space)
+- **Reactions + un-react** (kind:5), DM reactions; zaps on every author surface (v0.6.1)
+
+**DMs & calls**
+- **DM wire contract v1** ([docs/DM_WIRE_CONTRACT.md](./docs/DM_WIRE_CONTRACT.md)): relay NIP-42 AUTH gate for gift wraps, NIP-40 expiry, **NIP-77 negentropy** inbox sync, typing indicators, delivered/read receipts, sending/sent/failed state, group rooms UI
+- Friend-request state syncs across devices
+- **Call system overhaul:** SFU-first DM calls in private LiveKit rooms, shared `MediaStage` layout, device selection
+- **Frame-level E2EE** for 1:1 calls and voice channels ([docs/E2EE_CALLS.md](./docs/E2EE_CALLS.md))
+
+**Music**
+- **One visibility policy** (public / space / private / unlisted / catalog-hidden) across relay, backend and desktop; multi-space music events (read if a member of any listed space, publish only if a member of all) ([docs/MUSIC_VISIBILITY.md](./docs/MUSIC_VISIBILITY.md))
+- **Gated playback:** short-lived media tokens for private and space-only blobs and HLS, HTTP range/ETag, resized cover-art variants (`?w=`)
+- **Library + folder sync** across devices; folders replace playlists ([docs/MUSIC_LIBRARY_SYNC.md](./docs/MUSIC_LIBRARY_SYNC.md))
+- **Co-owned projects** via shared project keys; **listen requests** (request access to locked tracks, owner inbox, grants)
+- Space music channels as shelves; trustworthy "Update Available" with a `music_update` push
+
+**Media storage** ([docs/MEDIA_STORAGE.md](./docs/MEDIA_STORAGE.md)): uploads stay on The Wired's own server instead of a third-party host, members-only space media, user-chosen media servers
+
+**Discover & spaces**
+- Discover rebuilt around Spaces / Music / People, with zap and people ranking
+- Space edits persist and admin changes sync across clients; space admins manage feed sources; moderator deletes (kind:9005) are offered only where peers apply them
+
+**Trust, safety & platform**
+- **User reports** (NIP-56 events + in-app), admin review queue, platform suspensions and restores, operator CLI (`pnpm reports:*`)
+- **Account deletion**
+- Open Graph share pages for music and profile links
+- Legal pages on the landing site (privacy, terms, DMCA, community guidelines)
+- Shared protocol code published to npm as `@ishtarservices/core` + `@ishtarservices/shared-types`
+- Security audit remediation (June 2026), per-request NIP-98 nonces, keystore fallback hardening
+
+### Phase 13: Discovery UX & Polish -- IN PROGRESS
+
+See [DISCOVER_REMAINING_PHASES.md](./docs/DISCOVER_REMAINING_PHASES.md) for the original plan. Status as of v0.7.2:
+
+**Shipped**
+- **Right-panel preview:** clicking a space opens a preview with Join / Go to Space (the relay preview went away with the Relays tab)
+- **Listing request UI:** Space Settings → General → Discovery (category, submit, pending/listed state). The admin review UI is still missing.
+- **Audit log:** moderation actions in the Space Settings Moderation tab. Unmute and role changes are not logged yet.
+
+**Partial**
+- **Join from Discover:** only from the preview panel; list rows have no Join button or joined badge
+- **People segment:** NIP-05 browse, search and follow. No starter packs (kind:39089) or 2-hop follow suggestions.
+- **Trending / personalized feeds:** music trending has UI; the generic `/feeds/trending` and `/feeds/personalized` endpoints have none
+- **NIP-77 negentropy:** relay and client support it, but only the DM inbox uses it; channel and feed reconnects don't
+- **Announcement channels:** the `admin_only` flag, badge and read filter exist; posting is not enforced on the relay or in the composer
+- **Custom emoji per space:** the picker, emoji reactions and emoji tags on send work, but the emoji-set subscription and `EmojiSetManager` are not mounted
+- **NIP-53:** live chat runs inside voice/video channels; there's no live-stream channel or player UI
+
+**Not started**
+- **Meilisearch spaces index:** space search still uses SQL `ILIKE`
+- **Relay directory worker:** NIP-66 monitor ingestion + NIP-11 probing (the table and read route exist; nothing writes to them)
+- **`ingestHandlers`** for kind:10002 (relay usage counts) and kind:34550 (communities)
+- **Communities:** NIP-72 moderated communities
+- **"Friends Are In":** spaces your follows are members of
+- **Command palette (Cmd+K):** global search overlay
+- **Pinned messages panel:** only a backend `POST /spaces/:id/pin` stub exists
+- **Auto-mod:** keyword filters, spam detection
+- **Anti-raid protection:** join-rate limits, lockdown. Slow mode is displayed but not enforced.
 - **Forum-style threads**
 
 ### Phase 14: Monetization & Ecosystem -- TODO
 
-- **NIP-57 zap splits** + music-track zaps (zaps on notes/chat/articles/videos/profiles already shipped in Phase 10)
+**Done since this list was written**
+- **Audio transcoding:** multi-bitrate HLS with -14 LUFS normalization (see Phase 3)
+- **Private music collections:** NIP-44 self-encrypted folders and private releases (see Phase 3)
+
+**Remaining**
+- **NIP-57 zap splits** and zaps tied to tracks/albums. Music zaps currently go to the artist's profile; with several artists you pick one, and the zap isn't split.
 - **NIP-22 comments** on tracks, videos, articles
-- **NIP-44 encrypted private playlists**
-- **FFmpeg transcoding workers** (multi-bitrate HLS, audio normalization to -14 LUFS)
+- **Collaborative / shared playlists.** Co-owned album projects shipped via shared project keys, but folders are single-owner.
+- **Video transcoding** and two-pass loudness measurement
 - **NIP-89 app handler registration**
-- **Collaborative playlists**
 - **Plugin/extension API**
-- **Mobile companion app**
-- **Monitoring** (Prometheus + Grafana)
-- **`spamService` reputation model** and rate anomaly detection
+- **Monitoring** (Prometheus + Grafana; today there are only health endpoints)
+- **`spamService` reputation model** (the table and service exist with no callers) and rate anomaly detection
 
 ## License
 
-ISC
+MIT. See [LICENSE](./LICENSE). The brand assets in `services/landing/soot/` are excluded; see that directory's `NOTICE`.
