@@ -1,6 +1,5 @@
 import { useState, useRef, useCallback, lazy, Suspense } from "react";
 import { X, Paperclip, Smile, Loader2, Send, Repeat2, Disc3 } from "lucide-react";
-import { npubEncode } from "nostr-tools/nip19";
 import { Modal } from "@/components/ui/Modal";
 import { MentionAutocomplete } from "@/components/content/MentionAutocomplete";
 import { EmojiAutocomplete } from "@/components/content/EmojiAutocomplete";
@@ -10,7 +9,9 @@ import { useAutoResize } from "@/hooks/useAutoResize";
 import { useFileUpload } from "@/hooks/useFileUpload";
 import { AnchoredPopover } from "@/components/ui/AnchoredPopover";
 import { useAppSelector } from "@/store/hooks";
-import { buildRootNote, buildRepost } from "@/lib/nostr/eventBuilder";
+import { buildRepost } from "@/lib/nostr/eventBuilder";
+import { buildNotePost } from "@/lib/nostr/notePost";
+import { APP_RELAY } from "@/lib/nostr/constants";
 import { isGatedTags } from "@/lib/nostr/gatedTargets";
 import { buildNaddrReference } from "@/lib/nostr/naddrEncode";
 import { signAndPublish } from "@/lib/nostr/publish";
@@ -229,25 +230,8 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
     setPublishing(true);
 
     try {
-      let content = value.trim();
-      const mentionPubkeys: string[] = [];
-
-      // Replace @mentions with nostr: URIs
-      for (const [displayName, pk] of mentionMapRef.current) {
-        const token = `@${displayName}`;
-        if (content.includes(token)) {
-          const npub = npubEncode(pk);
-          content = content.replaceAll(token, `nostr:${npub}`);
-          mentionPubkeys.push(pk);
-        }
-      }
-
-      // Append naddr reference for the track/album
-      const naddr = buildNaddrReference(target.addressableId);
-      if (content.length > 0) content += "\n\n";
-      content += naddr;
-
-      // Build attachment metas and append URLs
+      // The soot-compatible music post: words, then media, then the release's
+      // naddr last, quoted with q + p (docs/nips/NIP-XX-Music-Events.md).
       const attachmentMetas: AttachmentMeta[] = [];
       for (const att of attachments) {
         if (att.status === "done" && att.result) {
@@ -257,33 +241,16 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
             sha256: att.result.sha256,
             size: att.result.size,
           });
-          content += "\n" + att.result.url;
         }
       }
-
-      // Append GIF URL
-      if (pendingGif) {
-        content += "\n" + pendingGif.url;
-      }
-
-      // Build NIP-30 emoji tags
-      const emojiTags: string[][] = [];
-      const shortcodeRe = /:([a-zA-Z0-9_]+):/g;
-      let m: RegExpExecArray | null;
-      while ((m = shortcodeRe.exec(content)) !== null) {
-        const url = customEmojiMapRef.current.get(m[1]);
-        if (url) {
-          emojiTags.push(["emoji", m[1], url]);
-        }
-      }
-
-      const unsigned = buildRootNote(
-        pubkey,
-        content,
-        mentionPubkeys.length > 0 ? mentionPubkeys : undefined,
-        attachmentMetas.length > 0 ? attachmentMetas : undefined,
-        emojiTags.length > 0 ? emojiTags : undefined,
-      );
+      const unsigned = buildNotePost(pubkey, {
+        text: value,
+        mentions: mentionMapRef.current,
+        attachments: attachmentMetas,
+        extraMediaUrls: pendingGif ? [pendingGif.url] : undefined,
+        musicRefs: [buildNaddrReference(target.addressableId, APP_RELAY)],
+        customEmoji: customEmojiMapRef.current,
+      });
 
       await signAndPublish(unsigned);
       resetState();
@@ -342,7 +309,6 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
     }
   };
 
-  const hasContent = value.trim().length > 0 || hasAttachments || !!pendingGif;
   const kindLabel = target.kind === "album" ? "Album" : "Track";
 
   return (
@@ -558,7 +524,7 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
               <button
                 type="button"
                 onClick={handlePost}
-                disabled={gated || !hasContent || publishing || isUploading}
+                disabled={gated || publishing || isUploading}
                 className="flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-primary to-primary-soft px-4 py-1.5 text-xs font-medium text-white transition-all hover:opacity-90 press-effect disabled:opacity-40"
               >
                 {publishing ? (
@@ -579,7 +545,7 @@ export function MusicPostModal({ open, onClose, target }: MusicPostModalProps) {
           ref={fileInputRef}
           type="file"
           multiple
-          accept="image/*,video/*,audio/*,application/pdf"
+          accept="image/*,video/*"
           className="hidden"
           onChange={handleFileInputChange}
         />
