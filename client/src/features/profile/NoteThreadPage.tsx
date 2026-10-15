@@ -14,8 +14,8 @@ import { useProfileNoteActions } from "./useProfileNoteActions";
 import { useNoteEngagement } from "../spaces/useNoteEngagement";
 import { EngagementCollectorProvider, useEngagementReporter } from "./engagementCollector";
 import { parseQuoteRef } from "../spaces/noteParser";
-import { useNoteMedia } from "../../lib/media/useNoteMedia";
-import { MediaGallery } from "../../components/media";
+import { useMusicNote } from "../../lib/media/useNoteMedia";
+import { MusicPostMedia } from "../../components/content/MusicPostMedia";
 import { useAppSelector } from "../../store/hooks";
 import { eventsSelectors } from "../../store/slices/eventsSlice";
 import { subscriptionManager } from "../../lib/nostr/subscriptionManager";
@@ -179,7 +179,7 @@ function RootNoteExpanded({ event }: { event: NostrEvent }) {
 
   const displayName = profile?.display_name || profile?.name || event.pubkey.slice(0, 12) + "...";
   const quoteRef = useMemo(() => parseQuoteRef(event), [event]);
-  const { media, text: cleanedContent } = useNoteMedia(event);
+  const { media, text: cleanedContent, musicRefs } = useMusicNote(event);
 
   const engagementRef = useEngagementReporter(event.id, 0);
 
@@ -217,8 +217,10 @@ function RootNoteExpanded({ event }: { event: NostrEvent }) {
         </div>
       )}
 
-      {/* Media */}
-      {media.length > 0 && <MediaGallery media={media} density="expanded" />}
+      {/* Media + the post's music */}
+      {(media.length > 0 || musicRefs.length > 0) && (
+        <MusicPostMedia media={media} refs={musicRefs} density="expanded" heroHeight="h-[26rem]" />
+      )}
 
       {quoteRef && (
         <QuotedNote eventId={quoteRef.eventId} relayHint={quoteRef.relayHint} pubkey={quoteRef.pubkey} />
@@ -280,7 +282,7 @@ function ReplyCard({ event, index, animationDelay }: { event: NostrEvent; index:
 
   const displayName = profile?.display_name || profile?.name || event.pubkey.slice(0, 12) + "...";
 
-  const { media, text: cleanedContent } = useNoteMedia(event);
+  const { media, text: cleanedContent, musicRefs } = useMusicNote(event);
 
   const engagementRef = useEngagementReporter(event.id, index);
 
@@ -312,7 +314,9 @@ function ReplyCard({ event, index, animationDelay }: { event: NostrEvent; index:
         </div>
       )}
 
-      {media.length > 0 && <MediaGallery media={media} density="compact" />}
+      {(media.length > 0 || musicRefs.length > 0) && (
+        <MusicPostMedia media={media} refs={musicRefs} density="compact" heroHeight="h-[16rem]" />
+      )}
 
       <NoteActionBar
         engagement={engagement}

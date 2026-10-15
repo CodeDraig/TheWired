@@ -125,7 +125,7 @@ export function ChatMessage({
               <span className="text-xs text-muted">{timeAgo}</span>
             </div>
             <div className="text-sm text-body break-words">
-              <RichContent content={displayContent} emojiTags={event.tags.filter((t) => t[0] === "emoji")} event={event} onMentionClick={onMentionClick} />
+              <RichContent content={displayContent} emojiTags={event.tags.filter((t) => t[0] === "emoji")} event={event} onMentionClick={onMentionClick} musicShape="poster" />
             </div>
           </div>
         </div>
@@ -200,7 +200,7 @@ export function ChatMessage({
           <PollCard event={event} variant="chat" />
         ) : (
           <div className="text-sm text-body break-words">
-            <RichContent content={displayContent} emojiTags={event.tags.filter((t) => t[0] === "emoji")} event={event} onMentionClick={onMentionClick} />
+            <RichContent content={displayContent} emojiTags={event.tags.filter((t) => t[0] === "emoji")} event={event} onMentionClick={onMentionClick} musicShape="poster" />
           </div>
         )}
         {/* Reaction pills — tap to toggle your own reaction */}

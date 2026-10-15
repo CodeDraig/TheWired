@@ -5,6 +5,7 @@ import { Avatar } from "../ui/Avatar";
 import { MediaGallery } from "../media";
 import { NoteShareMenu } from "../sharing/NoteShareMenu";
 import { MusicEmbedCard } from "./MusicEmbedCard";
+import { MusicPostMedia } from "./MusicPostMedia";
 import { PollCard } from "../../features/polls/PollCard";
 import { RichContent } from "./RichContent";
 import { EmbedDepthContext, MAX_EMBED_DEPTH } from "./embedDepth";
@@ -17,6 +18,7 @@ import { useZap } from "../../features/wallet/WalletProvider";
 import { parseLongFormEvent } from "../../features/longform/useLongForm";
 import { parseVideoEvent, selectVideoSource } from "../../features/media/imetaParser";
 import { extractMediaUrls, stripMediaUrls, type ExtractedMedia } from "../../lib/media/mediaUrlParser";
+import { splitTrailingMusicRefs } from "../../lib/content/musicPost";
 import { EVENT_KINDS, type NostrEvent } from "../../types/nostr";
 import { hasSpaceTag, tokenizeEventMediaUrl } from "../../lib/media/eventMedia";
 import { useMediaGrant } from "../../lib/media/mediaGrant";
@@ -27,6 +29,12 @@ interface EmbeddedNoteProps {
   /** An addressable reference (naddr). */
   addrRef?: { kind: number; pubkey: string; identifier: string; relays?: string[] };
 }
+
+const MUSIC_KINDS = new Set<number>([
+  EVENT_KINDS.MUSIC_TRACK,
+  EVENT_KINDS.MUSIC_ALBUM,
+  EVENT_KINDS.MUSIC_PLAYLIST,
+]);
 
 const VIDEO_KINDS = new Set<number>([
   EVENT_KINDS.VIDEO_HORIZONTAL,
@@ -48,10 +56,7 @@ export function EmbeddedNote({ idRef, addrRef }: EmbeddedNoteProps) {
 
   // Music coordinates resolve via the dedicated music backend (not a relay sub),
   // so short-circuit straight to the existing card — at any depth.
-  if (
-    addrRef &&
-    (addrRef.kind === EVENT_KINDS.MUSIC_TRACK || addrRef.kind === EVENT_KINDS.MUSIC_ALBUM)
-  ) {
+  if (addrRef && MUSIC_KINDS.has(addrRef.kind)) {
     return (
       <MusicEmbedCard kind={addrRef.kind} pubkey={addrRef.pubkey} identifier={addrRef.identifier} />
     );
@@ -86,7 +91,7 @@ function EmbeddedNoteResolver({
   if (event.kind === EVENT_KINDS.LONG_FORM) {
     return <ArticleEmbed event={event} />;
   }
-  if (event.kind === EVENT_KINDS.MUSIC_TRACK || event.kind === EVENT_KINDS.MUSIC_ALBUM) {
+  if (MUSIC_KINDS.has(event.kind)) {
     const d = event.tags.find((t) => t[0] === "d")?.[1] ?? "";
     return <MusicEmbedCard kind={event.kind} pubkey={event.pubkey} identifier={d} />;
   }
@@ -123,9 +128,15 @@ function NoteEmbed({ event, depth }: { event: NostrEvent; depth: number }) {
   const grant = useMediaGrant();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const media = useMemo(() => embedMediaForEvent(event), [event, grant]);
-  const text = useMemo(() => {
+  // A quoted music post keeps its music: the trailing refs render as its hero
+  // or (compact) rows, not inline in the clamped text.
+  const { text, musicRefs } = useMemo(() => {
     const stripped = media.length > 0 ? stripMediaUrls(event.content, event) : event.content;
-    return compact && stripped.length > 280 ? stripped.slice(0, 280) + "…" : stripped;
+    const { body, refs } = splitTrailingMusicRefs(stripped);
+    return {
+      text: compact && body.length > 280 ? body.slice(0, 280) + "…" : body,
+      musicRefs: refs,
+    };
   }, [event, media.length, compact]);
 
   const name = profile?.display_name || profile?.name || event.pubkey.slice(0, 8) + "…";
@@ -150,7 +161,13 @@ function NoteEmbed({ event, depth }: { event: NostrEvent; depth: number }) {
           </EmbedDepthContext.Provider>
         </div>
       )}
-      {media.length > 0 && <MediaGallery media={media} density="feed" />}
+      {musicRefs.length > 0 ? (
+        <EmbedDepthContext.Provider value={depth + 1}>
+          <MusicPostMedia media={media} refs={musicRefs} heroHeight={compact ? "h-[15rem]" : "h-[18rem]"} />
+        </EmbedDepthContext.Provider>
+      ) : (
+        media.length > 0 && <MediaGallery media={media} density="feed" />
+      )}
       {!compact && <NoteEmbedActions event={event} />}
     </div>
   );

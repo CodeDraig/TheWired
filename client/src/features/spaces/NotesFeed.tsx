@@ -7,9 +7,8 @@ import { Avatar } from "../../components/ui/Avatar";
 import { RichContent } from "../../components/content/RichContent";
 import { useProfile } from "../profile/useProfile";
 import { useUserPopover } from "../profile/UserPopoverContext";
-import { useNoteMedia } from "../../lib/media/useNoteMedia";
+import { useMusicNote } from "../../lib/media/useNoteMedia";
 import { imageCache } from "../../lib/cache/imageCache";
-import { MediaGallery } from "../../components/media";
 import { useScrollRestore } from "../../hooks/useScrollRestore";
 import { useFeedPagination } from "./useFeedPagination";
 import { FeedToolbar } from "./FeedToolbar";
@@ -26,6 +25,7 @@ import { NoteFooter } from "./notes/NoteFooter";
 import type { NostrEvent } from "../../types/nostr";
 import { EVENT_KINDS } from "../../types/nostr";
 import { MusicEmbedCard } from "../../components/content/MusicEmbedCard";
+import { MusicPostMedia } from "../../components/content/MusicPostMedia";
 import { RepostHeader } from "../profile/RepostHeader";
 import { useRepostedEvent } from "../profile/useRepostedEvent";
 import { NoteComposer } from "../profile/NoteComposer";
@@ -62,7 +62,7 @@ const NoteCard = memo(function NoteCard({ event }: { event: NostrEvent }) {
     minute: "2-digit",
   });
 
-  const { text: cleanText, media } = useNoteMedia(event);
+  const { text: cleanText, media, musicRefs } = useMusicNote(event);
 
   useEffect(() => {
     const imageUrls = media
@@ -137,14 +137,13 @@ const NoteCard = memo(function NoteCard({ event }: { event: NostrEvent }) {
             )}
             <span>{showMedia ? "Hide media" : "Show media"}</span>
           </button>
-
-          {/* Keep the gallery mounted and just toggle visibility — re-mounting
-              on every Show would re-decode the media and pop in at the wrong
-              size before settling. */}
-          <div className={showMedia ? undefined : "hidden"}>
-            <MediaGallery media={media} density="feed" />
-          </div>
         </div>
+      )}
+
+      {/* Media + the post's music (a track on its picture, or rows). Hiding
+          media keeps it mounted, and keeps the music as rows. */}
+      {(media.length > 0 || musicRefs.length > 0) && (
+        <MusicPostMedia media={media} refs={musicRefs} mediaHidden={!showMedia} />
       )}
 
       {/* Engagement counts, actions, replies, thread, share — isolated in a
@@ -179,7 +178,8 @@ const RepostCard = memo(function RepostCard({ event }: { event: NostrEvent }) {
 
   if (
     original.kind === EVENT_KINDS.MUSIC_TRACK ||
-    original.kind === EVENT_KINDS.MUSIC_ALBUM
+    original.kind === EVENT_KINDS.MUSIC_ALBUM ||
+    original.kind === EVENT_KINDS.MUSIC_PLAYLIST
   ) {
     const dTag = original.tags.find((t) => t[0] === "d")?.[1] ?? "";
     return (
