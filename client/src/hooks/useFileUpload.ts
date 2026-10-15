@@ -129,6 +129,12 @@ export interface UseFileUploadOptions {
    * `reuploadStaleAttachments`). A stale attachment is never sent as-is.
    */
   onContextChange?: "drop" | "reupload" | "manual";
+  /**
+   * Offered every accepted file (picked, pasted or dropped) before it uploads;
+   * return true to take it instead. The note composer takes audio this way:
+   * audio on a note becomes a track, never a blob.
+   */
+  divert?: (file: File) => boolean;
 }
 
 export function useFileUpload(opts: UseFileUploadOptions) {
@@ -143,6 +149,8 @@ export function useFileUpload(opts: UseFileUploadOptions) {
   const prefs = useAppSelector((s) => s.mediaPrefs.prefs);
   const prefsRef = useRef(prefs);
   prefsRef.current = prefs;
+  const divertRef = useRef(opts.divert);
+  divertRef.current = opts.divert;
 
   const [attachments, setAttachments] = useState<UploadedAttachment[]>([]);
   const attachmentsRef = useRef(attachments);
@@ -207,6 +215,7 @@ export function useFileUpload(opts: UseFileUploadOptions) {
           console.warn(`[Upload] File too large: ${file.name} (${file.size} bytes)`);
           continue;
         }
+        if (divertRef.current?.(file)) continue;
 
         const id = `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const previewUrl = URL.createObjectURL(file);

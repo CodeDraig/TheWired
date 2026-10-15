@@ -7,6 +7,8 @@ interface AttachmentPreviewProps {
   onRemove: (id: string) => void;
   /** Retry a failed upload. Without it the error tile only shows the failure. */
   onRetry?: (id: string) => void;
+  /** Badge this attachment "Cover" (a note's first photo, when it carries tracks). */
+  coverId?: string;
 }
 
 function getFileCategory(file: File): "image" | "video" | "audio" | "pdf" | "other" {
@@ -27,10 +29,12 @@ function AttachmentItem({
   attachment,
   onRemove,
   onRetry,
+  isCover,
 }: {
   attachment: UploadedAttachment;
   onRemove: () => void;
   onRetry?: () => void;
+  isCover?: boolean;
 }) {
   const category = getFileCategory(attachment.file);
   const isError = attachment.status === "error";
@@ -88,6 +92,11 @@ function AttachmentItem({
           className="h-20 w-20 rounded-lg object-cover"
         />
       )}
+      {isCover && (
+        <span className="pointer-events-none absolute bottom-1 left-1 rounded bg-black/60 px-1 py-px text-[9px] font-medium uppercase tracking-wide text-white">
+          Cover
+        </span>
+      )}
 
       {category === "video" && (
         <div className="relative h-20 w-20">
@@ -142,7 +151,7 @@ function AttachmentItem({
   );
 }
 
-export function AttachmentPreview({ attachments, onRemove, onRetry }: AttachmentPreviewProps) {
+export function AttachmentPreview({ attachments, onRemove, onRetry, coverId }: AttachmentPreviewProps) {
   if (attachments.length === 0) return null;
 
   return (
@@ -153,6 +162,7 @@ export function AttachmentPreview({ attachments, onRemove, onRetry }: Attachment
           attachment={att}
           onRemove={() => onRemove(att.id)}
           onRetry={onRetry ? () => onRetry(att.id) : undefined}
+          isCover={att.id === coverId}
         />
       ))}
     </div>
