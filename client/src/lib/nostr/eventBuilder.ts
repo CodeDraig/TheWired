@@ -298,16 +298,33 @@ export function buildRepost(
   target: { id: string; pubkey: string },
   originalJson: string,
 ): UnsignedEvent {
+  const tags: string[][] = [
+    ["e", target.id],
+    ["p", target.pubkey],
+  ];
+  // An addressable original (a track, project, folder) also carries its
+  // address, so "reposts of this release" is an `#a` query (soot writes the same).
+  const address = addressOfJson(originalJson);
+  if (address) tags.push(["a", address.coordinate], ["k", String(address.kind)]);
   return {
     pubkey,
     created_at: Math.floor(Date.now() / 1000),
     kind: 6,
-    tags: [
-      ["e", target.id],
-      ["p", target.pubkey],
-    ],
+    tags,
     content: originalJson,
   };
+}
+
+function addressOfJson(json: string): { coordinate: string; kind: number } | null {
+  try {
+    const ev = JSON.parse(json) as { kind?: unknown; pubkey?: unknown; tags?: unknown };
+    if (typeof ev.kind !== "number" || ev.kind < 30000 || ev.kind >= 40000) return null;
+    if (typeof ev.pubkey !== "string" || !Array.isArray(ev.tags)) return null;
+    const d = (ev.tags as unknown[]).find((t): t is string[] => Array.isArray(t) && t[0] === "d");
+    return { coordinate: `${ev.kind}:${ev.pubkey}:${d?.[1] ?? ""}`, kind: ev.kind };
+  } catch {
+    return null;
+  }
 }
 
 /** Build an unsigned kind:1 quote note with "q" tag */

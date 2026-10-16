@@ -1,9 +1,9 @@
 import { useState, useEffect, useMemo, useRef, memo, useCallback } from "react";
 import { ChevronUp, ChevronDown, Image as ImageIcon, CornerUpLeft, MoreHorizontal, Trash2 } from "lucide-react";
-import { MediaGallery } from "../../components/media";
 import { Avatar } from "../../components/ui/Avatar";
 import { RichContent } from "../../components/content/RichContent";
 import { MusicEmbedCard } from "../../components/content/MusicEmbedCard";
+import { MusicPostMedia } from "../../components/content/MusicPostMedia";
 import { PollCard } from "../polls/PollCard";
 import { NoteActionBar } from "../spaces/notes/NoteActionBar";
 import { ZapSummary } from "../wallet/ZapSummary";
@@ -20,7 +20,7 @@ import { useNoteEngagement } from "../spaces/useNoteEngagement";
 import { useRepostedEvent } from "./useRepostedEvent";
 import { useEngagementReporter, EngagementCollectorProvider } from "./engagementCollector";
 import { parseThreadRef, parseQuoteRef, isDirectReply } from "../spaces/noteParser";
-import { useNoteMedia } from "../../lib/media/useNoteMedia";
+import { useMusicNote } from "../../lib/media/useNoteMedia";
 import { UserPopoverCard } from "./UserPopoverCard";
 import { useZap } from "../wallet/WalletProvider";
 import { useClickOutside } from "../../hooks/useClickOutside";
@@ -139,7 +139,8 @@ function RepostedNoteInner({ repostEvent }: { repostEvent: NostrEvent }) {
   // Music event reposts: render as MusicEmbedCard instead of NoteCardInner
   if (
     originalEvent.kind === EVENT_KINDS.MUSIC_TRACK ||
-    originalEvent.kind === EVENT_KINDS.MUSIC_ALBUM
+    originalEvent.kind === EVENT_KINDS.MUSIC_ALBUM ||
+    originalEvent.kind === EVENT_KINDS.MUSIC_PLAYLIST
   ) {
     const dTag = originalEvent.tags.find((t) => t[0] === "d")?.[1] ?? "";
     return (
@@ -215,8 +216,8 @@ function NoteCardInner({
   const threadRef = useMemo(() => parseThreadRef(event), [event]);
   const quoteRef = useMemo(() => parseQuoteRef(event), [event]);
 
-  // Extract media
-  const { media, text: cleanedContent } = useNoteMedia(event);
+  // Media, and the music the note ends with (rendered as its music, not inline)
+  const { media, text: cleanedContent, musicRefs } = useMusicNote(event);
 
   const hasMedia = media.length > 0;
 
@@ -347,12 +348,10 @@ function NoteCardInner({
         </button>
       )}
 
-      {/* Keep the gallery mounted and toggle visibility so re-showing doesn't
-          re-decode the media and pop in at the wrong size. */}
-      {media.length > 0 && event.kind !== EVENT_KINDS.POLL && (
-        <div className={showMedia ? undefined : "hidden"}>
-          <MediaGallery media={media} density="feed" />
-        </div>
+      {/* Media + the post's music (a track on its picture, or rows). Hiding
+          media keeps the music, as rows. */}
+      {(hasMedia || musicRefs.length > 0) && event.kind !== EVENT_KINDS.POLL && (
+        <MusicPostMedia media={media} refs={musicRefs} mediaHidden={!showMedia} />
       )}
 
       {/* Quoted note */}

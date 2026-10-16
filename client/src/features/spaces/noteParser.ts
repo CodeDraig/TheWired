@@ -30,10 +30,16 @@ export function parseThreadRef(event: NostrEvent): ThreadRef {
   return { rootId, replyId, mentionedPubkeys };
 }
 
-/** Parse NIP-18 "q" tag for quote references */
+const EVENT_ID_RE = /^[0-9a-f]{64}$/i;
+
+/**
+ * Parse the NIP-18 "q" tag of a quoted EVENT. A `q` can also name an address
+ * (`31683:<pk>:<d>`): a music post quotes its tracks that way, and its
+ * `nostr:naddr` in the content already renders the card, so those are skipped.
+ */
 export function parseQuoteRef(event: NostrEvent): QuoteRef | null {
-  const qTag = event.tags.find((t) => t[0] === "q");
-  if (!qTag || !qTag[1]) return null;
+  const qTag = event.tags.find((t) => t[0] === "q" && EVENT_ID_RE.test(t[1] ?? ""));
+  if (!qTag) return null;
   return {
     eventId: qTag[1],
     relayHint: qTag[2] ?? "",

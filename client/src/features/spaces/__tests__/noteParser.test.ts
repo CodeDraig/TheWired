@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isDirectReply, isRootNote, parseThreadRef } from "../noteParser";
+import { isDirectReply, isRootNote, parseQuoteRef, parseThreadRef } from "../noteParser";
 import type { NostrEvent } from "../../../types/nostr";
 
 function ev(tags: string[][], kind = 1): NostrEvent {
@@ -97,5 +97,29 @@ describe("parseThreadRef / isRootNote (sanity)", () => {
       ["p", pk],
     ]);
     expect(parseThreadRef(e).mentionedPubkeys).toEqual([pk]);
+  });
+});
+
+describe("parseQuoteRef", () => {
+  const base = { id: "1".repeat(64), pubkey: "2".repeat(64), created_at: 1, kind: 1, content: "", sig: "" };
+
+  it("reads a quoted event's id, relay and author", () => {
+    const id = "f".repeat(64);
+    expect(parseQuoteRef({ ...base, tags: [["q", id, "wss://r", "3".repeat(64)]] } as NostrEvent)).toEqual({
+      eventId: id,
+      relayHint: "wss://r",
+      pubkey: "3".repeat(64),
+    });
+  });
+
+  it("ignores a q that names an address (a music post's quoted track)", () => {
+    const tags = [["q", `31683:${"3".repeat(64)}:song`, "wss://r", "3".repeat(64)]];
+    expect(parseQuoteRef({ ...base, tags } as NostrEvent)).toBeNull();
+  });
+
+  it("finds the event q after address qs", () => {
+    const id = "e".repeat(64);
+    const tags = [["q", `31683:${"3".repeat(64)}:song`], ["q", id]];
+    expect(parseQuoteRef({ ...base, tags } as NostrEvent)?.eventId).toBe(id);
   });
 });

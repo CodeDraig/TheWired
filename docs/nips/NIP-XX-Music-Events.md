@@ -366,6 +366,88 @@ Rendering rules shared by The Wired desktop and soot:
 
 ---
 
+## Music posts (kind 1)
+
+A music post is an ordinary kind `1` note that carries music: a release
+someone shares with a few words, or audio the author attached in the note
+composer. The Wired desktop and soot write and read the same shape, so a post
+renders the same on both and stays readable on any other client.
+
+### Content and tags
+
+```jsonc
+{
+  "kind": 1,
+  // words, blank line, media URLs (one per line), blank line, refs (one per line)
+  "content": "first take of the new one\n\nhttps://blossom.example/<sha>.jpg\n\nnostr:naddr1...",
+  "tags": [
+    ["q", "31683:<pubkey>:<d>", "<relay hint>", "<pubkey>"],   // NIP-18, one per ref
+    ["p", "<release author>"],                                  // per author who isn't the poster
+    ["imeta", "url https://blossom.example/<sha>.jpg", "m image/jpeg", "x <sha>", "size <n>"]
+  ]
+}
+```
+
+- The music refs come **last**. Media goes before them, never after; empty
+  blocks drop out.
+- Each ref gets a NIP-18 `q` naming the address, so "notes that quote this
+  release" is a `#q` query. A client that reads `q` as an event id MUST skip
+  values that aren't 64-hex ids. The content's `nostr:naddr` already renders
+  the release.
+- A reply (`e` root/reply tags) may carry words and media but never attaches
+  tracks.
+
+### Detecting the music
+
+A renderer peels the **consecutive run of music naddrs at the end** of the
+text that's left once media URLs are lifted out:
+
+- Only naddrs of kind `31683` (track), `33123` (project) or `30119` (folder)
+  count. The `nostr:` prefix is optional.
+- Refs may be separated by any whitespace. Each must start a token: an naddr
+  glued to a link (`https://njump.me/naddr1…`) is not a ref.
+- The run stops at the first trailing token that isn't one, including an
+  article naddr, a word, or a bad checksum. A music naddr earlier in the text
+  stays inline.
+
+### Rendering
+
+| The post has | It renders as |
+| --- | --- |
+| exactly one track ref + a picture that **is the track's cover** (same URL, media-grant token ignored), and the track is public and playable | the track **on its picture**: title, `artist · track · m:ss` and ▶ over the photo; a `+N` badge when there are more pictures; the picture opens the gallery |
+| anything else with refs | the media, then one row per release; a row hides its cover when the note already shows that picture |
+| no refs | an ordinary note |
+
+The same rules apply to a quoted music post, at a smaller size. In chat and
+DMs a shared public track or project draws as a cover poster. A private,
+members-only or folder ref keeps the row.
+
+### Attached audio
+
+Audio attached in a note composer is published as a real track before the
+note, which then ends with that track's naddr. Up to three tracks fit in one
+note. Each track:
+
+- is a `31683` with `d` = slug of the title plus a random suffix (`-x7k2p9`),
+  so two "voice memo"s never replace each other;
+- takes its title from the file (editable), its artist from the poster's
+  profile, and `["p", <poster>, "", "artist"]`;
+- uses the note's first photo as its `image`;
+- is public, and carries `["catalog", "none"]` unless the composer's "Show in
+  my music" switch is on. That keeps it off the author's catalog and shelves
+  while it stays playable and saveable from the post.
+
+Tracks publish in order. A track that published stays published if a later
+one or the note fails, and a retry quotes it instead of uploading it again.
+
+### Reposts
+
+A kind `6` repost of an addressable original (a track, project or folder)
+carries `["a", "<kind>:<pubkey>:<d>"]` and `["k", "<kind>"]` next to the
+NIP-18 `e`/`p` tags, so "reposts of this release" is an `#a` query.
+
+---
+
 ## Relay Behavior
 
 Relays that wish to validate music events SHOULD at minimum verify:

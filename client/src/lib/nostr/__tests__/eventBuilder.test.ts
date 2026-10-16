@@ -334,6 +334,14 @@ describe("buildRepost", () => {
     expect(ev.content).toBe('{"content":"hi"}');
     expect(ev.tags).toContainEqual(["e", "evt1"]);
     expect(ev.tags).toContainEqual(["p", PK2]);
+    expect(ev.tags.some((t) => t[0] === "a" || t[0] === "k")).toBe(false);
+  });
+
+  it("adds the address and kind for an addressable original (a track)", () => {
+    const track = { id: "evt2", pubkey: PK2, kind: 31683, tags: [["d", "my-song"], ["title", "My Song"]] };
+    const ev = buildRepost(PK, { id: "evt2", pubkey: PK2 }, JSON.stringify(track));
+    expect(ev.tags).toContainEqual(["a", `31683:${PK2}:my-song`]);
+    expect(ev.tags).toContainEqual(["k", "31683"]);
   });
 });
 

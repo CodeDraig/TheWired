@@ -189,7 +189,7 @@ export const DMMessage = memo(function DMMessage({
             {message.attachment ? (
               <DMFileAttachment meta={message.attachment} author={message.senderPubkey} isMe={isMe} autoLoad={!!senderIsFriend} />
             ) : (
-              <RichContent content={displayContent} emojiTags={message.emojiTags} onMentionClick={(pubkey, anchor) => openUserPopover(pubkey, anchor)} />
+              <RichContent content={displayContent} emojiTags={message.emojiTags} onMentionClick={(pubkey, anchor) => openUserPopover(pubkey, anchor)} musicShape="poster" />
             )}
           </div>
           {/* Hover row: react */}

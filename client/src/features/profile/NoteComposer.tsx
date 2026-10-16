@@ -1,6 +1,5 @@
 import { useState, useRef, useCallback, lazy, Suspense } from "react";
-import { Send, Paperclip, Smile, Loader2, ImageIcon, BarChart3, X } from "lucide-react";
-import { npubEncode } from "nostr-tools/nip19";
+import { Send, Paperclip, Smile, Loader2, ImageIcon, BarChart3, X, Music } from "lucide-react";
 import { Avatar } from "@/components/ui/Avatar";
 import { AnchoredPopover } from "@/components/ui/AnchoredPopover";
 import { MentionAutocomplete } from "@/components/content/MentionAutocomplete";
@@ -10,7 +9,8 @@ import { GifPreview } from "@/components/chat/GifPreview";
 import { useAutoResize } from "@/hooks/useAutoResize";
 import { useFileUpload } from "@/hooks/useFileUpload";
 import { useAppSelector } from "@/store/hooks";
-import { buildRootNote, buildPollEvent } from "@/lib/nostr/eventBuilder";
+import { buildPollEvent } from "@/lib/nostr/eventBuilder";
+import { buildNotePost } from "@/lib/nostr/notePost";
 import { signAndPublish } from "@/lib/nostr/publish";
 import { relayManager } from "@/lib/nostr/relayManager";
 import { registerGifShare } from "@/lib/api/gif";
@@ -18,6 +18,9 @@ import type { AttachmentMeta } from "@/lib/nostr/eventBuilder";
 import type { GifItem } from "@/types/emoji";
 import type { EmojiSelectResult } from "@/components/chat/EmojiPicker";
 import type { PollDraft } from "@/features/polls/PollComposer";
+import { isAudioFile } from "@/features/music/noteTrack";
+import { useNoteTracks, noteTrackErrorMessage } from "@/features/music/useNoteTracks";
+import { NoteTrackCard } from "@/features/music/NoteTrackCard";
 
 const LazyGifPicker = lazy(() =>
   import("@/components/chat/GifPicker").then((m) => ({ default: m.GifPicker })),
@@ -61,13 +64,17 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
   const [showPollComposer, setShowPollComposer] = useState(false);
   const [pendingGif, setPendingGif] = useState<GifItem | null>(null);
   const [pollDraft, setPollDraft] = useState<PollDraft | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const mentionMapRef = useRef<Map<string, string>>(new Map());
   const customEmojiMapRef = useRef<Map<string, string>>(new Map());
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gifBtnRef = useRef<HTMLButtonElement>(null);
   const pollBtnRef = useRef<HTMLButtonElement>(null);
   const emojiBtnRef = useRef<HTMLButtonElement>(null);
+  const audioInputRef = useRef<HTMLInputElement>(null);
 
+  // Audio on a note becomes a track the note quotes, never a blob.
+  const tracks = useNoteTracks();
   const {
     attachments,
     removeAttachment,
@@ -79,7 +86,19 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
     hasAttachments,
     addFiles,
     retryAttachment,
-  } = useFileUpload({ context: { kind: "public" } });
+  } = useFileUpload({
+    context: { kind: "public" },
+    divert: (file) => {
+      if (!isAudioFile(file)) return false;
+      tracks.addFiles([file]);
+      return true;
+    },
+  });
+
+  // The first photo is the tracks' cover.
+  const coverAttachment = tracks.hasTracks
+    ? attachments.find((a) => a.file.type.startsWith("image/") && a.status !== "error")
+    : undefined;
 
   useAutoResize(textareaRef, value, 200);
 
@@ -225,24 +244,15 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
 
     const hasContent = value.trim().length > 0;
     const hasDoneAttachments = attachments.some((a) => a.status === "done");
-    if (!hasContent && !hasDoneAttachments && !pendingGif) return;
+    if (!hasContent && !hasDoneAttachments && !pendingGif && !tracks.hasTracks) return;
+    if (tracks.drafts.some((d) => !d.title.trim())) {
+      setError("Give every track a title.");
+      return;
+    }
 
+    setError(null);
     setPublishing(true);
     try {
-      let content = value.trim();
-      const mentionPubkeys: string[] = [];
-
-      // Replace @mentions with nostr: URIs
-      for (const [displayName, pk] of mentionMapRef.current) {
-        const token = `@${displayName}`;
-        if (content.includes(token)) {
-          const npub = npubEncode(pk);
-          content = content.replaceAll(token, `nostr:${npub}`);
-          mentionPubkeys.push(pk);
-        }
-      }
-
-      // Build attachment metas and append URLs
       const attachmentMetas: AttachmentMeta[] = [];
       for (const att of attachments) {
         if (att.status === "done" && att.result) {
@@ -252,37 +262,46 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
             sha256: att.result.sha256,
             size: att.result.size,
           });
-          if (content.length > 0) content += "\n";
-          content += att.result.url;
         }
       }
 
-      // Append GIF URL
-      if (pendingGif) {
-        if (content.length > 0) content += "\n";
-        content += pendingGif.url;
-      }
-
-      // Build NIP-30 emoji tags
-      const emojiTags: string[][] = [];
-      const shortcodeRe = /:([a-zA-Z0-9_]+):/g;
-      let m: RegExpExecArray | null;
-      while ((m = shortcodeRe.exec(content)) !== null) {
-        const url = customEmojiMapRef.current.get(m[1]);
-        if (url) {
-          emojiTags.push(["emoji", m[1], url]);
+      // Tracks first, in order; a retry quotes the ones that already went out.
+      let musicRefs: string[] = [];
+      if (tracks.hasTracks) {
+        const cover = attachments.find((a) => a.status === "done" && a.result && a.file.type.startsWith("image/"));
+        try {
+          musicRefs = await tracks.publishAll({
+            pubkey,
+            artist: profile?.display_name || profile?.name || pubkey,
+            imageUrl: cover?.result?.url,
+          });
+        } catch (err) {
+          setError(noteTrackErrorMessage(err));
+          return;
         }
       }
 
-      const unsigned = buildRootNote(
-        pubkey,
-        content,
-        mentionPubkeys.length > 0 ? mentionPubkeys : undefined,
-        attachmentMetas.length > 0 ? attachmentMetas : undefined,
-        emojiTags.length > 0 ? emojiTags : undefined,
-      );
-
-      await signAndPublish(unsigned);
+      try {
+        await signAndPublish(
+          buildNotePost(pubkey, {
+            text: value,
+            mentions: mentionMapRef.current,
+            attachments: attachmentMetas,
+            extraMediaUrls: pendingGif ? [pendingGif.url] : undefined,
+            musicRefs,
+            customEmoji: customEmojiMapRef.current,
+          }),
+        );
+      } catch (err) {
+        setError(
+          musicRefs.length > 0
+            ? `The ${musicRefs.length === 1 ? "track" : "tracks"} published, but the note didn't post — try again.`
+            : err instanceof Error
+              ? err.message
+              : "Couldn't post the note",
+        );
+        return;
+      }
 
       // Reset state
       setValue("");
@@ -294,11 +313,12 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
       mentionMapRef.current.clear();
       customEmojiMapRef.current.clear();
       clearAttachments();
+      tracks.reset();
       setExpanded(false);
     } finally {
       setPublishing(false);
     }
-  }, [pubkey, value, attachments, pendingGif, pollDraft, publishing, isUploading, clearAttachments]);
+  }, [pubkey, profile, value, attachments, pendingGif, pollDraft, publishing, isUploading, clearAttachments, tracks]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Let autocomplete handle its own keys
@@ -314,7 +334,7 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
         setShowGifPicker(false);
         setShowEmojiPicker(false);
         setShowPollComposer(false);
-      } else if (!value.trim() && !hasAttachments && !pendingGif) {
+      } else if (!value.trim() && !hasAttachments && !pendingGif && !tracks.hasTracks) {
         setExpanded(false);
       }
       return;
@@ -330,7 +350,9 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
   if (!pubkey) return null;
 
   const displayName = profile?.display_name || profile?.name || pubkey.slice(0, 12);
-  const hasContent = value.trim().length > 0 || hasAttachments || !!pendingGif || !!pollDraft;
+  const hasContent =
+    value.trim().length > 0 || hasAttachments || !!pendingGif || !!pollDraft || tracks.hasTracks;
+  const status = error ?? tracks.notice;
 
   // Collapsed state
   if (!expanded) {
@@ -476,7 +498,7 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
           onKeyUp={(e) => updateAutocompleteState(value, e.currentTarget.selectionStart)}
           onClick={(e) => updateAutocompleteState(value, e.currentTarget.selectionStart)}
           onPaste={handlePaste}
-          placeholder="What's on your mind?"
+          placeholder={tracks.hasTracks ? "Say something about it…" : "What's on your mind?"}
           rows={3}
           spellCheck
           autoCorrect="on"
@@ -485,8 +507,25 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
         />
       </div>
 
+      {/* Audio that posts as tracks */}
+      <NoteTrackCard
+        drafts={tracks.drafts}
+        publishedCount={tracks.postedRefs.length}
+        coverPreview={coverAttachment?.previewUrl}
+        inCatalog={tracks.inCatalog}
+        onInCatalogChange={tracks.setInCatalog}
+        onRename={tracks.rename}
+        onRemove={tracks.remove}
+        disabled={publishing}
+      />
+
       {/* Attachment previews */}
-      <AttachmentPreview attachments={attachments} onRemove={removeAttachment} onRetry={retryAttachment} />
+      <AttachmentPreview
+        attachments={attachments}
+        onRemove={removeAttachment}
+        onRetry={retryAttachment}
+        coverId={coverAttachment?.id}
+      />
 
       {/* GIF preview */}
       {pendingGif && (
@@ -518,6 +557,8 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
         </div>
       )}
 
+      {status && <p className="px-4 pb-2 text-xs text-red-400">{status}</p>}
+
       {/* Toolbar */}
       <div className="flex items-center justify-between border-t border-border px-3 py-2">
         <div className="flex items-center gap-1">
@@ -538,6 +579,15 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
             title="Add image"
           >
             <ImageIcon size={18} />
+          </button>
+          <button
+            type="button"
+            onClick={() => audioInputRef.current?.click()}
+            disabled={!!pollDraft || tracks.atCap || publishing}
+            className="rounded-lg p-1.5 text-muted hover:text-heading hover:bg-surface-hover transition-colors disabled:opacity-40"
+            title={tracks.atCap ? "3 tracks per note" : "Add audio — it posts as a track"}
+          >
+            <Music size={18} />
           </button>
           <button
             ref={gifBtnRef}
@@ -565,7 +615,7 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
               setShowGifPicker(false);
               setShowEmojiPicker(false);
             }}
-            disabled={!!pollDraft || hasAttachments || !!pendingGif}
+            disabled={!!pollDraft || hasAttachments || !!pendingGif || tracks.hasTracks}
             className={`rounded-lg p-1.5 transition-colors disabled:opacity-40 ${
               showPollComposer
                 ? "bg-primary/20 text-primary"
@@ -595,11 +645,19 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
         </div>
 
         <div className="flex items-center gap-2">
+          {tracks.progress && (
+            <span className="flex items-center gap-1.5 text-xs text-muted">
+              <Loader2 size={12} className="animate-spin" />
+              {tracks.progress}
+            </span>
+          )}
           <button
             type="button"
             onClick={() => {
               setValue("");
               clearAttachments();
+              tracks.reset();
+              setError(null);
               setPendingGif(null);
               setPollDraft(null);
               setShowPollComposer(false);
@@ -635,6 +693,17 @@ export function NoteComposer({ className = "mx-6 mt-4" }: NoteComposerProps) {
         accept="image/*,video/*,audio/*,application/pdf"
         className="hidden"
         onChange={handleFileInputChange}
+      />
+      <input
+        ref={audioInputRef}
+        type="file"
+        multiple
+        accept="audio/*"
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files) tracks.addFiles(Array.from(e.target.files));
+          e.target.value = "";
+        }}
       />
     </div>
   );

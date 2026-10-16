@@ -3,12 +3,12 @@ import { useAppSelector } from "@/store/hooks";
 import { EVENT_KINDS } from "@/types/nostr";
 import { resolveMusic } from "@/lib/api/music";
 import { processIncomingEvent } from "@/lib/nostr/eventPipeline";
-import type { MusicTrack, MusicAlbum } from "@/types/music";
+import type { MusicTrack, MusicAlbum, MusicPlaylist } from "@/types/music";
 
 /**
- * Look up a music track/album by address (`kind:pubkey:identifier`) in the
- * store, auto-resolving via the backend when missing (events flow back through
- * the pipeline into musicSlice). Extracted from MusicEmbedCard so other
+ * Look up a music track/album/folder by address (`kind:pubkey:identifier`) in
+ * the store, auto-resolving via the backend when missing (events flow back
+ * through the pipeline into musicSlice). Extracted from MusicEmbedCard so other
  * surfaces (poll options, etc.) can embed playable tracks.
  *
  * The anonymous resolve is tried first; when it misses and the viewer is
@@ -25,30 +25,28 @@ export function useResolvedMusic(
   addressableId: string;
   track: MusicTrack | undefined;
   album: MusicAlbum | undefined;
+  playlist: MusicPlaylist | undefined;
   resolving: boolean;
   unavailable: boolean;
 } {
   const addressableId = `${kind}:${pubkey}:${identifier}`;
-  const isTrack = kind === EVENT_KINDS.MUSIC_TRACK;
+  const type =
+    kind === EVENT_KINDS.MUSIC_TRACK ? "track" : kind === EVENT_KINDS.MUSIC_PLAYLIST ? "playlist" : "album";
   const signedIn = useAppSelector((s) => !!s.identity.pubkey);
 
-  const track = useAppSelector((s) =>
-    isTrack ? s.music.tracks[addressableId] : undefined,
-  );
-  const album = useAppSelector((s) =>
-    !isTrack ? s.music.albums[addressableId] : undefined,
-  );
+  const track = useAppSelector((s) => (type === "track" ? s.music.tracks[addressableId] : undefined));
+  const album = useAppSelector((s) => (type === "album" ? s.music.albums[addressableId] : undefined));
+  const playlist = useAppSelector((s) => (type === "playlist" ? s.music.playlists[addressableId] : undefined));
 
   const [resolving, setResolving] = useState(false);
   // Keyed by address + sign-in state: signing in earns one authenticated retry.
   const attemptKey = `${addressableId}|${signedIn ? "auth" : "anon"}`;
   const [failedFor, setFailedFor] = useState<string | null>(null);
-  const hasData = isTrack ? !!track?.title : !!album?.title;
+  const hasData = !!(track?.title || album?.title || playlist?.title);
   const failed = failedFor === attemptKey;
 
   useEffect(() => {
     if (hasData || failed) return;
-    const type = isTrack ? "track" : "album";
 
     // `resolving` must not be an effect dependency: flipping it would run the
     // cleanup and drop the in-flight result.
@@ -69,7 +67,7 @@ export function useResolvedMusic(
       })
       .catch(() => setFailedFor(attemptKey))
       .finally(() => setResolving(false));
-  }, [hasData, failed, isTrack, pubkey, identifier, signedIn, attemptKey]);
+  }, [hasData, failed, type, pubkey, identifier, signedIn, attemptKey]);
 
-  return { addressableId, track, album, resolving, unavailable: failed && !hasData && !resolving };
+  return { addressableId, track, album, playlist, resolving, unavailable: failed && !hasData && !resolving };
 }

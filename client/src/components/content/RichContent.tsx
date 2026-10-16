@@ -11,6 +11,9 @@ import { InlineMarkdown } from "./InlineMarkdown";
 import { EmbedRenderer } from "./EmbedRenderer";
 import { EmbeddedNote } from "./EmbeddedNote";
 import { InviteCard } from "./InviteCard";
+import { MusicLinkCard } from "./MusicLinkCard";
+import { matchMusicEmbed } from "@/lib/content/musicEmbeds";
+import { MusicEmbedShapeContext, type MusicEmbedShape } from "./musicEmbedContext";
 import { SmartImage, SmartVideo } from "../media";
 
 interface RichContentProps {
@@ -29,14 +32,16 @@ interface RichContentProps {
    * the inline embed for them so the same note isn't shown twice.
    */
   suppressEventIds?: string[];
+  /** `poster`: chat and DMs draw a shared public track or project as its cover. */
+  musicShape?: MusicEmbedShape;
 }
 
-export function RichContent({ content, emojiTags, event, onMentionClick, suppressEventIds }: RichContentProps) {
+export function RichContent({ content, emojiTags, event, onMentionClick, suppressEventIds, musicShape }: RichContentProps) {
   // Re-parse when the media grant arrives so space media picks up its token.
   useMediaGrant();
   const segments = parseContent(content, emojiTags, event);
 
-  return (
+  const body = (
     <div className="whitespace-pre-wrap wrap-break-word">
       {segments.map((seg, i) => (
         <RichSegment
@@ -47,6 +52,11 @@ export function RichContent({ content, emojiTags, event, onMentionClick, suppres
         />
       ))}
     </div>
+  );
+  return musicShape ? (
+    <MusicEmbedShapeContext.Provider value={musicShape}>{body}</MusicEmbedShapeContext.Provider>
+  ) : (
+    body
   );
 }
 
@@ -173,7 +183,10 @@ function RichSegment({
         />
       );
 
-    case "url":
+    case "url": {
+      // A music provider link without a player embed: a card, like soot.
+      const music = matchMusicEmbed(segment.url);
+      if (music) return <MusicLinkCard media={music} />;
       return (
         <a
           href={segment.url}
@@ -184,6 +197,7 @@ function RichSegment({
           {segment.url}
         </a>
       );
+    }
 
     case "image":
     case "video":
