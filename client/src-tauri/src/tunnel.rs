@@ -52,11 +52,106 @@ pub struct RunningTunnel {
 /// Provisioning data returned by the backend's `/relays/tunnel/provision` for a
 /// branded `<id>.relay.thewired.app` tunnel. Field names are snake_case to match
 /// the JSON the JS layer forwards.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone, Debug)]
 pub struct NamedTunnelConfig {
     pub tunnel_id: String,
     pub hostname: String,
     pub account_tag: String,
+}
+
+/// The DNS zone the backend provisions branded tunnels under
+/// (`<id>.relay.thewired.app`). A hostname anywhere else is not ours.
+pub const NAMED_TUNNEL_ZONE: &str = "relay.thewired.app";
+
+impl NamedTunnelConfig {
+    /// Validate every server-supplied field BEFORE it reaches a filename or the
+    /// connector config. The payload arrives over the network (NIP-98-authed,
+    /// but a compromised or spoofed backend must not get a path traversal or a
+    /// config injection out of it). Returns the normalised config.
+    pub fn validated(self) -> Result<Self, String> {
+        Ok(NamedTunnelConfig {
+            tunnel_id: validate_cf_id("tunnel_id", &self.tunnel_id)?,
+            account_tag: validate_cf_id("account_tag", &self.account_tag)?,
+            hostname: validate_tunnel_hostname(&self.hostname)?,
+        })
+    }
+}
+
+/// Cloudflare tunnel ids are UUIDs and account tags are 32-hex strings:
+/// `^[0-9a-fA-F-]{1,64}$`. Nothing else (no `.`, `/`, `\`, whitespace, control
+/// characters, percent-encoding), so the value is safe as a bare filename
+/// component and as a YAML scalar.
+pub fn validate_cf_id(field: &str, value: &str) -> Result<String, String> {
+    if value.is_empty() || value.len() > 64 {
+        return Err(format!("tunnel provisioning: {field} has an invalid length"));
+    }
+    if !value.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return Err(format!("tunnel provisioning: {field} contains invalid characters"));
+    }
+    Ok(value.to_string())
+}
+
+/// Strict DNS hostname beneath [`NAMED_TUNNEL_ZONE`]: ASCII labels of
+/// `[a-z0-9-]` (no leading/trailing `-`, 1–63 chars), dot-separated, at most
+/// 253 chars overall, lower-cased, and at least one label before the zone.
+pub fn validate_tunnel_hostname(value: &str) -> Result<String, String> {
+    let host = value.to_ascii_lowercase();
+    if host.is_empty() || host.len() > 253 {
+        return Err("tunnel provisioning: hostname has an invalid length".to_string());
+    }
+    let suffix = format!(".{NAMED_TUNNEL_ZONE}");
+    let Some(prefix) = host.strip_suffix(suffix.as_str()) else {
+        return Err(format!("tunnel provisioning: hostname is not under {NAMED_TUNNEL_ZONE}"));
+    };
+    if prefix.is_empty() {
+        return Err("tunnel provisioning: hostname is the zone apex".to_string());
+    }
+    for label in host.split('.') {
+        let ok_len = !label.is_empty() && label.len() <= 63;
+        let ok_chars = label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        let ok_edges = !label.starts_with('-') && !label.ends_with('-');
+        if !(ok_len && ok_chars && ok_edges) {
+            return Err("tunnel provisioning: hostname has an invalid DNS label".to_string());
+        }
+    }
+    Ok(host)
+}
+
+#[derive(serde::Serialize)]
+struct CloudflaredConfig {
+    tunnel: String,
+    #[serde(rename = "credentials-file")]
+    credentials_file: String,
+    ingress: Vec<CloudflaredIngress>,
+}
+
+#[derive(serde::Serialize)]
+struct CloudflaredIngress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hostname: Option<String>,
+    service: String,
+}
+
+/// The connector's `config.yml`, built as data and serialized — never by string
+/// formatting — so no value can introduce YAML structure of its own.
+fn render_tunnel_config(
+    tunnel_id: &str,
+    creds_path: &Path,
+    hostname: &str,
+    port: u16,
+) -> Result<String, String> {
+    let cfg = CloudflaredConfig {
+        tunnel: tunnel_id.to_string(),
+        credentials_file: creds_path.to_string_lossy().into_owned(),
+        ingress: vec![
+            CloudflaredIngress {
+                hostname: Some(hostname.to_string()),
+                service: format!("http://127.0.0.1:{port}"),
+            },
+            CloudflaredIngress { hostname: None, service: "http_status:404".to_string() },
+        ],
+    };
+    serde_yaml_ng::to_string(&cfg).map_err(|e| format!("serialize tunnel config: {e}"))
 }
 
 /// The device-held connector secret, surfaced to the JS layer so it can be sent
@@ -182,12 +277,15 @@ async fn start_named_tunnel(
     port: u16,
     cfg: NamedTunnelConfig,
 ) -> Result<RunningTunnel, String> {
+    // Server-supplied ids/hostname: validate before they touch a path or config.
+    let cfg = cfg.validated()?;
     let secret = load_or_create_tunnel_secret()?;
     let base = crate::relay::base_dir(app)?;
     let tunnel_dir = base.join("tunnel");
     std::fs::create_dir_all(&tunnel_dir).map_err(|e| format!("create tunnel dir: {e}"))?;
 
-    // Credentials file: the device secret + the ids the server assigned.
+    // Credentials file: the device secret + the ids the server assigned
+    // (`tunnel_id` is hex/hyphen only, so this is a bare filename component).
     let creds_path = tunnel_dir.join(format!("{}.json", cfg.tunnel_id));
     let creds = serde_json::json!({
         "AccountTag": cfg.account_tag,
@@ -202,13 +300,7 @@ async fn start_named_tunnel(
     set_owner_only(&creds_path);
 
     let config_path = tunnel_dir.join("config.yml");
-    let config_yaml = format!(
-        "tunnel: {id}\ncredentials-file: {creds}\ningress:\n  - hostname: {host}\n    service: http://127.0.0.1:{port}\n  - service: http_status:404\n",
-        id = cfg.tunnel_id,
-        creds = creds_path.display(),
-        host = cfg.hostname,
-        port = port,
-    );
+    let config_yaml = render_tunnel_config(&cfg.tunnel_id, &creds_path, &cfg.hostname, port)?;
     std::fs::write(&config_path, config_yaml).map_err(|e| format!("write tunnel config: {e}"))?;
 
     let bin = resolve_cloudflared(app).await?;
@@ -483,5 +575,124 @@ mod tests {
             None
         );
         assert_eq!(extract_trycloudflare("no url here"), None);
+    }
+}
+
+/// The named-tunnel provisioning payload comes from the backend over the
+/// network and used to be interpolated into a filesystem path and a YAML config
+/// with `format!`. These pin the validators and the structured serializer.
+#[cfg(test)]
+mod provisioning_tests {
+    use super::{render_tunnel_config, validate_cf_id, validate_tunnel_hostname, NamedTunnelConfig, NAMED_TUNNEL_ZONE};
+    use std::path::Path;
+
+    const ID: &str = "6ff42ae2-765d-4adf-8112-31c55c1551ef";
+
+    #[test]
+    fn accepts_real_cloudflare_ids() {
+        assert_eq!(validate_cf_id("tunnel_id", ID).unwrap(), ID);
+        assert_eq!(validate_cf_id("account_tag", "ABCDEF0123456789abcdef0123456789").unwrap(), "ABCDEF0123456789abcdef0123456789");
+        assert_eq!(validate_cf_id("tunnel_id", "a").unwrap(), "a");
+        assert!(validate_cf_id("tunnel_id", &"f".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn rejects_path_and_control_characters_in_ids() {
+        for bad in [
+            "",
+            "../../../etc/cron.d/x",
+            "..",
+            "abc/def",
+            "abc\\def",
+            "abc def",
+            "abc\n- hostname: evil",
+            "abc\0",
+            "abc.json",
+            "Ab_cd",
+            "%2e%2e",
+            "日本",
+        ] {
+            assert!(validate_cf_id("tunnel_id", bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_cf_id("tunnel_id", &"f".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn accepts_hostnames_beneath_the_zone() {
+        let h = format!("abc123.{NAMED_TUNNEL_ZONE}");
+        assert_eq!(validate_tunnel_hostname(&h).unwrap(), h);
+        // Normalised to lowercase (DNS is case-insensitive; cloudflared matches literally).
+        assert_eq!(validate_tunnel_hostname(&format!("ABC-123.{NAMED_TUNNEL_ZONE}")).unwrap(), format!("abc-123.{NAMED_TUNNEL_ZONE}"));
+        assert!(validate_tunnel_hostname(&format!("a.b.{NAMED_TUNNEL_ZONE}")).is_ok());
+    }
+
+    #[test]
+    fn rejects_hostnames_outside_the_zone_or_malformed() {
+        for bad in [
+            String::new(),
+            NAMED_TUNNEL_ZONE.to_string(),                          // the zone apex itself
+            "abc.relay.thewired.app.evil.example".to_string(),      // zone in the middle
+            "abc.evil.example".to_string(),                         // other zone
+            "abcrelay.thewired.app".to_string(),                    // missing dot
+            format!("-abc.{NAMED_TUNNEL_ZONE}"),                     // leading hyphen
+            format!("abc-.{NAMED_TUNNEL_ZONE}"),                     // trailing hyphen
+            format!("a_b.{NAMED_TUNNEL_ZONE}"),                      // underscore
+            format!("ab c.{NAMED_TUNNEL_ZONE}"),                     // space
+            format!("abc.{NAMED_TUNNEL_ZONE}\n  - hostname: evil"),  // YAML injection
+            format!("abc.{NAMED_TUNNEL_ZONE}/path"),
+            format!("abc.{NAMED_TUNNEL_ZONE}:443"),
+            format!("abc..{NAMED_TUNNEL_ZONE}"),                     // empty label
+            format!("{}.{NAMED_TUNNEL_ZONE}", "a".repeat(64)),       // label > 63
+            format!("{}.{NAMED_TUNNEL_ZONE}", vec!["abcdefghij"; 25].join(".")), // > 253 total
+            format!("xn--\u{00e9}.{NAMED_TUNNEL_ZONE}"),             // non-ASCII
+        ] {
+            assert!(validate_tunnel_hostname(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn config_validation_rejects_any_bad_field() {
+        let ok = NamedTunnelConfig {
+            tunnel_id: ID.into(),
+            hostname: format!("abc.{NAMED_TUNNEL_ZONE}"),
+            account_tag: "0123456789abcdef".into(),
+        };
+        assert!(ok.clone().validated().is_ok());
+        let bad_id = NamedTunnelConfig { tunnel_id: "../x".into(), ..ok.clone() };
+        assert!(bad_id.validated().is_err());
+        let bad_host = NamedTunnelConfig { hostname: "abc.evil.example".into(), ..ok.clone() };
+        assert!(bad_host.validated().is_err());
+        let bad_tag = NamedTunnelConfig { account_tag: "tag\n".into(), ..ok.clone() };
+        assert!(bad_tag.validated().is_err());
+    }
+
+    #[test]
+    fn renders_a_structured_config_cloudflared_can_read() {
+        let yaml = render_tunnel_config(ID, Path::new("/tmp/t/x.json"), "abc.relay.thewired.app", 7787).unwrap();
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(doc["tunnel"].as_str(), Some(ID));
+        assert_eq!(doc["credentials-file"].as_str(), Some("/tmp/t/x.json"));
+        let ingress = doc["ingress"].as_sequence().unwrap();
+        assert_eq!(ingress.len(), 2);
+        assert_eq!(ingress[0]["hostname"].as_str(), Some("abc.relay.thewired.app"));
+        assert_eq!(ingress[0]["service"].as_str(), Some("http://127.0.0.1:7787"));
+        assert!(ingress[1].get("hostname").is_none(), "catch-all rule has no hostname");
+        assert_eq!(ingress[1]["service"].as_str(), Some("http_status:404"));
+    }
+
+    #[test]
+    fn yaml_injection_in_a_value_stays_a_single_quoted_scalar() {
+        // Bypasses the validators on purpose: even if a hostile value reached the
+        // serializer, it must come out as ONE string, never as extra YAML nodes.
+        let evil = "abc.relay.thewired.app\n  - hostname: evil.example\n    service: http://127.0.0.1:22";
+        let yaml = render_tunnel_config(ID, Path::new("/tmp/t/x.json"), evil, 7787).unwrap();
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        let ingress = doc["ingress"].as_sequence().unwrap();
+        assert_eq!(ingress.len(), 2, "no injected ingress rule: {yaml}");
+        assert_eq!(ingress[0]["hostname"].as_str(), Some(evil));
+        // And a path with spaces / colons round-trips too.
+        let yaml = render_tunnel_config(ID, Path::new("/Users/a b/Library/Application Support/x: y.json"), "abc.relay.thewired.app", 1).unwrap();
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(doc["credentials-file"].as_str(), Some("/Users/a b/Library/Application Support/x: y.json"));
     }
 }
