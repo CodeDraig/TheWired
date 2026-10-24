@@ -31,11 +31,13 @@ vi.mock("../relayManager", () => ({
   },
 }));
 
+/** The signed-in account's own kind-10050 list (identity.dmRelayList). */
+let ownList: string[] = [];
 vi.mock("../../../store", () => ({
-  store: { getState: () => ({ identity: { dmRelayList: [] } }) },
+  store: { getState: () => ({ identity: { dmRelayList: ownList } }) },
 }));
 
-import { getDMRelaysForPublish, fallbackDMRelays, clearDMRelayCache } from "../dmRelayList";
+import { getDMRelaysForPublish, fallbackDMRelays, clearDMRelayCache, selfWrapTargets, recipientTargets as dmRecipientTargets } from "../dmRelayList";
 import { relayManager } from "../relayManager";
 import { APP_RELAY } from "../constants";
 import { normalizeRelayUrl } from "../relayUrl";
@@ -102,5 +104,35 @@ describe("getDMRelaysForPublish — recipient wraps always reach the platform re
     const targets = await recipientTargets(PEER);
     expect(subscribeMock).toHaveBeenCalledTimes(2);
     expect(targets).toEqual(["wss://new.example", APP]);
+  });
+});
+
+describe("selfWrapTargets / recipientTargets — the DM send sets", () => {
+  beforeEach(() => {
+    ownList = [];
+    lists.clear();
+    clearDMRelayCache();
+  });
+
+  it("self-wrap: own list plus the platform relay, deduped by normalized URL (trailing slash)", () => {
+    ownList = ["wss://own.example", APP + "/"];
+    const t = selfWrapTargets();
+    expect(t.map((u) => normalizeRelayUrl(u) ?? u)).toEqual(["wss://own.example", APP]);
+    expect(t).toHaveLength(2);
+  });
+
+  it("self-wrap without an own list: the fallback set (write relays + platform relay), no duplicate", () => {
+    const t = selfWrapTargets();
+    expect(t.map((u) => normalizeRelayUrl(u) ?? u)).toEqual(["wss://write.example", APP]);
+  });
+
+  it("recipient with a list: every inbox relay counts; without one: only the platform relay counts", async () => {
+    lists.set(PEER, ["wss://inbox.example"]);
+    const withList = await dmRecipientTargets(PEER);
+    expect(withList.targets).toEqual(["wss://inbox.example", APP]);
+    expect(withList.countAs).toEqual(withList.targets);
+    const noList = await dmRecipientTargets("c".repeat(64));
+    expect(noList.targets.map((u) => normalizeRelayUrl(u) ?? u)).toEqual(["wss://write.example", APP]);
+    expect(noList.countAs).toEqual([APP]);
   });
 });

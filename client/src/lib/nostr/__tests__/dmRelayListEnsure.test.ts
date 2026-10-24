@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // docs/DM_WIRE_CONTRACT.md §1, sender rule: keep the platform relay in the
 // account's own kind 10050. Append it to a list that lacks it (other relays
@@ -22,6 +22,8 @@ import {
   ensureAppRelayInOwnDMList,
   APP_RELAY_RECHECK_MS,
   DM_RELAY_APP_RELAY_RECORD_KEY,
+  createEoseSettler,
+  EOSE_SETTLE_GRACE_MS,
   type AppRelayListRecord,
 } from "../dmRelayListEnsure";
 
@@ -60,6 +62,15 @@ describe("planAppRelayAppend — the §1 own-list rule", () => {
     // The user adding it back lifts the opt-out.
     const back = planAppRelayAppend({ list: [DAMUS, APP], listCreatedAt: 3_000, record: optedOut, nowMs: NOW });
     expect(back).toMatchObject({ action: "keep", record: { optOut: false } });
+  });
+
+  it("a removal made on another client BEFORE we ever appended is a choice too (presentAt)", () => {
+    // Day 1: the list carries the relay (published by soot, say).
+    const keep = planAppRelayAppend({ list: [DAMUS, APP], listCreatedAt: 1_000, record: undefined, nowMs: NOW });
+    expect(keep).toMatchObject({ action: "keep", record: { presentAt: 1_000 } });
+    // Day 2: a newer list without it — the user removed it elsewhere.
+    const later = planAppRelayAppend({ list: [DAMUS], listCreatedAt: 1_500, record: keep.action === "keep" ? keep.record : undefined, nowMs: NOW + APP_RELAY_RECHECK_MS + 1 });
+    expect(later).toMatchObject({ action: "opt_out", record: { optOut: true } });
   });
 
   it("a list older than our own append is the stale copy we replaced, not a choice", () => {
@@ -112,5 +123,45 @@ describe("ensureAppRelayInOwnDMList — effect", () => {
     expect(kv.get(DM_RELAY_APP_RELAY_RECORD_KEY)).toBeUndefined();
     expect(store.getState().identity.dmRelayList).toEqual([]);
     expect(await ensureAppRelayInOwnDMList(ME, "tauri_keystore", { relays: [NOS], createdAt: 100 })).toBe("appended");
+  });
+});
+
+describe("createEoseSettler — act only once every bootstrap relay answered (or a grace passed)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+  const RELAYS = ["wss://a.relay", "wss://b.relay", "wss://c.relay"];
+
+  it("the first relay's EOSE does not settle; the last one does, once", () => {
+    const onSettle = vi.fn();
+    const s = createEoseSettler(RELAYS, onSettle);
+    s.onEOSE("wss://a.relay");
+    s.onEOSE("wss://a.relay/"); // same relay, slash form
+    expect(onSettle).not.toHaveBeenCalled();
+    s.onEOSE("wss://b.relay");
+    expect(onSettle).not.toHaveBeenCalled();
+    s.onEOSE("wss://c.relay");
+    expect(onSettle).toHaveBeenCalledTimes(1);
+    s.onEOSE("wss://c.relay");
+    vi.advanceTimersByTime(EOSE_SETTLE_GRACE_MS * 2);
+    expect(onSettle).toHaveBeenCalledTimes(1);
+  });
+
+  it("a relay that never answers cannot stall it: the grace after the first EOSE settles", () => {
+    const onSettle = vi.fn();
+    const s = createEoseSettler(RELAYS, onSettle);
+    s.onEOSE("wss://a.relay");
+    vi.advanceTimersByTime(EOSE_SETTLE_GRACE_MS - 1);
+    expect(onSettle).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(onSettle).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancel (logout) drops a pending settle", () => {
+    const onSettle = vi.fn();
+    const s = createEoseSettler(RELAYS, onSettle);
+    s.onEOSE("wss://a.relay");
+    s.cancel();
+    vi.advanceTimersByTime(EOSE_SETTLE_GRACE_MS * 2);
+    expect(onSettle).not.toHaveBeenCalled();
   });
 });

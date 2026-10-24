@@ -1249,13 +1249,16 @@ async function handleGiftWrap(event: NostrEvent): Promise<void> {
   // the NIP-77 reconcile re-requests ids the slice never processed, and a copy
   // from another relay can arrive any time — either gets a fresh decrypt. A
   // verdict core reached itself (bad seal signature, wrong kind, expired, bad
-  // ciphertext) is final for that wrap and stays marked, so it is not
-  // decrypted again every reconcile round.
+  // ciphertext) is final for that wrap: it stays marked AND goes into the
+  // slice's processed set, so the NIP-77 reconcile (which filters on that
+  // set) stops re-requesting it every round.
   let dm: UnwrappedDM;
   try {
     dm = await unwrapGiftWrap(event, { acceptKinds: GIFT_WRAP_ACCEPT_KINDS });
   } catch (err) {
-    if (!(err instanceof GiftWrapRejectedError || (err as { name?: string })?.name === "GiftWrapRejectedError")) {
+    if (err instanceof GiftWrapRejectedError || (err as { name?: string })?.name === "GiftWrapRejectedError") {
+      dispatch(markDMWrapProcessed(event.id));
+    } else {
       dedup.unmarkSeen(event.id);
     }
     return;

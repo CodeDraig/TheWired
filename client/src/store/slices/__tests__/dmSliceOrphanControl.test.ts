@@ -64,6 +64,14 @@ describe("dmSlice — edits and deletes that arrive before their anchor", () => 
     expect(msg.editedContent).toBeUndefined();
   });
 
+  it("a legacy edit anchored on the WRAP id (no rumorId on the sender's side) replays too", () => {
+    const store = createTestStore();
+    store.dispatch(editDMMessage({ partnerPubkey: PEER, rumorId: "w-peer", newContent: "fixed", editedAt: 2000, senderPubkey: PEER, wrapId: "w-edit" }));
+    store.dispatch(addDMMessage({ partnerPubkey: PEER, myPubkey: ME, message: fromPeer() }));
+    expect(store.getState().dm.messages[PEER][0].editedContent).toBe("fixed");
+    expect(store.getState().dm.pendingControl["w-peer"]).toBeUndefined();
+  });
+
   it("the parking lot is bounded: the oldest anchors are evicted past the cap", () => {
     const store = createTestStore();
     for (let i = 0; i <= MAX_PENDING_DM_CONTROL_TARGETS; i++) {

@@ -70,6 +70,10 @@ export interface DMMessage {
   /** The relay whose OK settled `status: "sent"` (the platform relay or one of
    *  the recipient's kind-10050 relays). Debugging aid; absent on history rows. */
   sentVia?: string;
+  /** Sent (one of the recipient's inbox relays accepted) but the platform relay
+   *  did not: the recipient's phone gets no push for it, and a recipient who
+   *  reads only the platform relay never sees it. */
+  pushMissed?: boolean;
   /** Friends who acknowledged this rumor (kind-20015 receipts). */
   deliveredTo?: string[];
   readBy?: string[];
@@ -405,10 +409,13 @@ export const dmSlice = createSlice({
         }
         delete state.pendingReactions[message.rumorId];
       }
-      // Replay edits / deletes that arrived ahead of this message, in arrival order.
-      if (message.rumorId && state.pendingControl[message.rumorId]) {
-        for (const c of state.pendingControl[message.rumorId]) applyDMControl(message, c);
-        delete state.pendingControl[message.rumorId];
+      // Replay edits / deletes that arrived ahead of this message, in arrival
+      // order. Anchors are rumor ids; legacy senders anchored on the wrap id.
+      for (const anchor of message.rumorId ? [message.rumorId, message.wrapId] : [message.wrapId]) {
+        const parked = state.pendingControl[anchor];
+        if (!parked) continue;
+        for (const c of parked) applyDMControl(message, c);
+        delete state.pendingControl[anchor];
       }
 
       // Update contact
@@ -724,6 +731,16 @@ export const dmSlice = createSlice({
       state.mutationCounter += 1;
     },
 
+    /** The recipient wrap was accepted by an inbox relay but not by the
+     *  platform relay: no push will follow (see DMMessage.pushMissed). */
+    markDMPushMissed(state, action: PayloadAction<{ partnerPubkey: string; wrapId: string }>) {
+      const { partnerPubkey, wrapId } = action.payload;
+      const msg = state.messages[partnerPubkey]?.find((m) => m.wrapId === wrapId);
+      if (!msg || msg.pushMissed) return;
+      msg.pushMissed = true;
+      state.mutationCounter += 1;
+    },
+
     /** Flag (or clear) a message whose self-wrap did not publish. */
     markDMSyncWarning(state, action: PayloadAction<{ partnerPubkey: string; wrapId: string; warning: boolean }>) {
       const { partnerPubkey, wrapId, warning } = action.payload;
@@ -902,6 +919,7 @@ export const dmSlice = createSlice({
 export const {
   addDMMessage,
   dmSendResolved,
+  markDMPushMissed,
   markDMWrapProcessed,
   setActiveConversation,
   markConversationRead,

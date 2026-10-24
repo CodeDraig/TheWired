@@ -87,14 +87,21 @@ export class GiftWrapRejectedError extends Error {
   }
 }
 
-/** A codec failure is a verdict only when the ciphertext itself is bad (MAC /
- *  padding / version — the wrap was not for this key). Anything else — the
- *  signer is away, a bunker timed out, the extension is locked — is the
- *  caller's to retry, so it propagates untouched. */
-function isCiphertextError(err: unknown): boolean {
+/**
+ * A codec failure is retried only when it says the SIGNER was unavailable —
+ * a timeout, a locked extension or keystore, a bunker that is away or has not
+ * approved yet, no signer at all. Anything else (bad MAC, bad padding, wrong
+ * version, truncated payload, whatever a vendor calls a wrong-key failure) is
+ * a verdict on the wrap: retrying it would only spend a decrypt per NIP-77
+ * round on bytes that will never change. An unknown message is therefore a
+ * verdict, never a retry. Exported so a platform codec can test its own
+ * messages against the same list.
+ */
+export function isTransientCodecFailure(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  // nostr-tools nip44 v2 and the Rust keystore both name the failing stage.
-  return /invalid (mac|padding|payload|base64|data length|ciphertext)|unknown encryption version|payload must be a valid string|bad mac|mac mismatch|decryption failed/i.test(msg);
+  return /timed? ?out|timeout|locked|not ready|not (yet )?available|unavailable|no signer|not logged in|not connected|disconnected|network|offline|busy|try again|rejected|denied|cancel+ed|not supported|doesn'?t support|unsupported by/i.test(
+    msg,
+  );
 }
 
 /** Who we are + how we sign/encrypt. The only platform-specific inputs. */
@@ -270,7 +277,8 @@ export interface UnwrapOptions {
   now?: number;
 }
 
-/** Run the codec; a bad-ciphertext failure is a verdict, anything else propagates. */
+/** Run the codec; a signer-unavailable failure propagates (retryable), every
+ *  other failure is a `decrypt` verdict. */
 async function decryptOrReject(
   codec: Pick<SignerAdapter, "nip44Decrypt">,
   peer: string,
@@ -280,10 +288,8 @@ async function decryptOrReject(
     return await codec.nip44Decrypt(peer, ciphertext);
   } catch (err) {
     if (err instanceof GiftWrapRejectedError) throw err;
-    if (isCiphertextError(err)) {
-      throw new GiftWrapRejectedError("decrypt", err instanceof Error ? err.message : "NIP-44 decrypt failed");
-    }
-    throw err;
+    if (isTransientCodecFailure(err)) throw err;
+    throw new GiftWrapRejectedError("decrypt", err instanceof Error ? err.message : "NIP-44 decrypt failed");
   }
 }
 

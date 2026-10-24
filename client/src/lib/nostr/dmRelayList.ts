@@ -7,7 +7,36 @@ import { store } from "../../store";
 
 /** APP_RELAY in the normalized form parseDMRelayList emits, so a list that
  *  already names it dedupes against it. */
-const APP_RELAY_URL = normalizeRelayUrl(APP_RELAY) ?? APP_RELAY;
+export const APP_RELAY_URL = normalizeRelayUrl(APP_RELAY) ?? APP_RELAY;
+
+const relayKey = (u: string) => normalizeRelayUrl(u) ?? u;
+
+/** Where a recipient wrap goes and which of those relays' OKs count as
+ *  *sent* (docs/DM_WIRE_CONTRACT.md §1). The recipient's kind-10050 list
+ *  (∪ platform relay) when they have one — every entry counts; otherwise
+ *  every write relay plus the platform relay, and only the platform relay
+ *  counts (it is the one relay the push ingester and the phone read). */
+export async function recipientTargets(to: string): Promise<{ targets: string[]; countAs: string[] }> {
+  const inbox = await getDMRelaysForPublish(to);
+  if (inbox) return { targets: inbox, countAs: inbox };
+  return { targets: fallbackDMRelays(), countAs: [APP_RELAY_URL] };
+}
+
+/** The self-wrap's relays: the own kind-10050 list (or the fallback set),
+ *  always including the platform relay — our other devices sync from it.
+ *  Deduped by normalized URL so a trailing-slash APP_RELAY never doubles a frame. */
+export function selfWrapTargets(): string[] {
+  const own = getOwnDMRelays();
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const url of [...(own.length > 0 ? own : fallbackDMRelays()), APP_RELAY_URL]) {
+    const k = relayKey(url);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(url);
+  }
+  return out;
+}
 
 /** Parse a kind:10050 DM relay list event into relay URLs */
 export function parseDMRelayList(event: NostrEvent): string[] {

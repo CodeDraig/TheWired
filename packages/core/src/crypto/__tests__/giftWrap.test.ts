@@ -5,6 +5,7 @@ import {
   createSelfWrap,
   unwrapGiftWrap,
   GiftWrapRejectedError,
+  isTransientCodecFailure,
   type GiftWrapContext,
 } from "../giftWrap";
 import { verifyEventSync } from "../verifyEvent";
@@ -166,6 +167,20 @@ describe("unwrap verdicts vs transient failures", () => {
     // Unsupported rumor kind.
     const { wrap: odd } = await createGiftWrappedDM(ctxOf(alice), "x", bob.pubkey, undefined, await buildRumor(alice.pubkey, bob.pubkey, "x", undefined, { kind: 1 }));
     await expect(unwrapGiftWrap(bob.signer, odd)).rejects.toMatchObject({ name: "GiftWrapRejectedError", code: "kind" });
+  });
+
+  it("an unknown codec failure (a vendor's wrong-key or truncated-payload message) is a verdict, not a retry", async () => {
+    const alice = makeTestIdentity();
+    const bob = makeTestIdentity();
+    const { wrap } = await createGiftWrappedDM(ctxOf(alice), "hi", bob.pubkey);
+    for (const msg of ["Invalid data size", "Unknown version", "Padded data too short", "Non-zero padding bytes", "something the extension made up"]) {
+      const codec = { nip44Decrypt: async () => { throw new Error(msg); } };
+      await expect(unwrapGiftWrap(codec, wrap)).rejects.toMatchObject({ name: "GiftWrapRejectedError", code: "decrypt" });
+    }
+    expect(isTransientCodecFailure(new Error("Invalid MAC"))).toBe(false);
+    for (const msg of ["Signing operation timed out", "NIP-46 request timed out", "No signer available for NIP-44 decryption", "Extension is locked", "user rejected the request", "Your remote signer doesn't support NIP-44 decryption"]) {
+      expect(isTransientCodecFailure(new Error(msg))).toBe(true);
+    }
   });
 
   it("a codec that cannot answer (signer away, bunker timeout) propagates as-is so the caller can retry", async () => {

@@ -61,6 +61,14 @@ describe("eventPipeline — gift wrap decrypt failures and the dedup LRU", () =>
     unwrapSpy.mockRejectedValue(new GiftWrapRejectedError("seal_sig", "Seal signature invalid"));
     await deliverTwice(wrapFor(ME, "d".repeat(64)));
     expect(unwrapSpy).toHaveBeenCalledTimes(1);
+    // …and the NIP-77 reconcile (which filters on the slice's processed set) stops asking for it.
+    expect(store.getState().dm.processedWrapIdSet["d".repeat(64)]).toBe(true);
+  });
+
+  it("a transiently failed wrap is NOT marked processed, so the reconcile can re-request it", async () => {
+    unwrapSpy.mockRejectedValue(new Error("Signing operation timed out"));
+    await deliverTwice(wrapFor(ME, "e".repeat(64)));
+    expect(store.getState().dm.processedWrapIdSet["e".repeat(64)]).toBeUndefined();
   });
 
   it("a wrap that unwrapped stays marked (the slice dedups by wrap id anyway)", async () => {

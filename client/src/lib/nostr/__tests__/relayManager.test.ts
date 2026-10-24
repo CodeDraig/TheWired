@@ -436,6 +436,33 @@ describe("relayManager — publishTracked (own-message send state)", () => {
       }
     });
 
+    it("outcome: every target's verdict, settled when all answered — the platform relay's refusal is visible", async () => {
+      const { a, b } = openTwo();
+      const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"], { countAs: ["wss://a.relay", "wss://b.relay"] });
+      ok(b, true);
+      await expect(t.accepted).resolves.toBe("wss://b.relay");
+      let out: unknown;
+      void t.outcome.then((o) => { out = o; });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(out).toBeUndefined(); // a has not answered
+      ok(a, false, "blocked: not a member");
+      await expect(t.outcome).resolves.toEqual({ acceptedBy: "wss://b.relay", byRelay: { "wss://a.relay": "refused", "wss://b.relay": "accepted" } });
+    });
+
+    it("outcome at the timeout marks a relay that never answered as silent", async () => {
+      vi.useFakeTimers();
+      try {
+        const { b } = openTwo();
+        const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"], { timeout: 10_000 });
+        ok(b, true);
+        await expect(t.accepted).resolves.toBe("wss://b.relay");
+        vi.advanceTimersByTime(10_000);
+        await expect(t.outcome).resolves.toEqual({ acceptedBy: "wss://b.relay", byRelay: { "wss://a.relay": "silent", "wss://b.relay": "accepted" } });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("no counting relay among the targets: the send can never count, so it fails at once", async () => {
       openTwo();
       const t = relayManager.publishTracked(event, ["wss://b.relay"], { countAs: ["wss://a.relay"] });

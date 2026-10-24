@@ -32,8 +32,53 @@ export interface AppRelayListRecord {
   checkedAt: number;
   /** created_at (s) of the list THIS device published with the relay appended. */
   appendedAt?: number;
-  /** The user removed it after we appended it: leave their list alone. */
+  /** created_at (s) of the newest list we saw that DID carry the relay. A later
+   *  list without it is a removal, whoever published the earlier one. */
+  presentAt?: number;
+  /** The user removed it after it was in their list: leave their list alone. */
   optOut?: boolean;
+}
+
+/** Bootstrap-relay EOSEs settle the own-list query: all of them, or a grace
+ *  period after the first (a slow relay must not stall login forever). */
+export const EOSE_SETTLE_GRACE_MS = 5_000;
+
+/**
+ * Decide once per login WHEN the fetched kind-10050 lists are complete enough
+ * to act on. Acting on the FIRST relay's EOSE would let a stale, fast relay
+ * serving an old list make us republish an appended copy with `created_at =
+ * now` over a newer list the user saved elsewhere — and again every day.
+ */
+export function createEoseSettler(
+  relayUrls: readonly string[],
+  onSettle: () => void,
+  graceMs: number = EOSE_SETTLE_GRACE_MS,
+): { onEOSE(relayUrl: string): void; cancel(): void } {
+  const expected = new Set(relayUrls.map((u) => normalizeRelayUrl(u) ?? u));
+  const seen = new Set<string>();
+  let settled = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    if (timer) clearTimeout(timer);
+    onSettle();
+  };
+  return {
+    onEOSE(relayUrl: string) {
+      if (settled) return;
+      seen.add(normalizeRelayUrl(relayUrl) ?? relayUrl);
+      if (seen.size >= expected.size) {
+        settle();
+        return;
+      }
+      if (!timer) timer = setTimeout(settle, graceMs);
+    },
+    cancel() {
+      settled = true;
+      if (timer) clearTimeout(timer);
+    },
+  };
 }
 
 export type AppRelayPlan =
@@ -71,11 +116,21 @@ export function planAppRelayAppend(input: {
   const { list, listCreatedAt, record, nowMs } = input;
   const appRelay = input.appRelay ?? APP_RELAY_URL;
   if (listHasAppRelay(list, appRelay)) {
-    return { action: "keep", record: { checkedAt: nowMs, appendedAt: record?.appendedAt, optOut: false } };
+    return {
+      action: "keep",
+      record: {
+        checkedAt: nowMs,
+        appendedAt: record?.appendedAt,
+        presentAt: Math.max(listCreatedAt, record?.presentAt ?? 0),
+        optOut: false,
+      },
+    };
   }
   if (record?.optOut) return { action: "skip" };
-  if (record?.appendedAt !== undefined && listCreatedAt > record.appendedAt) {
-    // Newer than our append and without the relay: a deliberate removal.
+  const hadIt = Math.max(record?.appendedAt ?? -1, record?.presentAt ?? -1);
+  if (hadIt >= 0 && listCreatedAt > hadIt) {
+    // Newer than a list that carried the relay (ours or anyone's) and without
+    // it: a deliberate removal.
     return { action: "opt_out", record: { ...record, checkedAt: nowMs, optOut: true } };
   }
   if (record && nowMs - record.checkedAt < APP_RELAY_RECHECK_MS) return { action: "skip" };
@@ -130,7 +185,11 @@ export async function ensureAppRelayInOwnDMList(
       if (store.getState().identity.pubkey !== pubkey) return "skipped";
       store.dispatch(setDMRelayList({ relays: plan.next, createdAt: unsigned.created_at }));
       await saveUserState("dm_relay_list", plan.next).catch(() => {});
-      await saveUserState(DM_RELAY_APP_RELAY_RECORD_KEY, { ...plan.record, appendedAt: unsigned.created_at }).catch(() => {});
+      await saveUserState(DM_RELAY_APP_RELAY_RECORD_KEY, {
+        ...plan.record,
+        appendedAt: unsigned.created_at,
+        presentAt: unsigned.created_at,
+      }).catch(() => {});
       return "appended";
     }
   }

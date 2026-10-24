@@ -33,13 +33,22 @@ const trackedSpy = vi.fn();
 let relayAnswer: () => Promise<string | null> = async () => "wss://peer";
 /** Same for the tracked self-wrap. */
 let selfAnswer: () => Promise<string | null> = async () => APP;
+/** Every target relay's verdict for the recipient wrap, once all answered. */
+let recipientOutcome: () => Promise<{ acceptedBy: string | null; byRelay: Record<string, string> }> = async () => ({
+  acceptedBy: "wss://peer",
+  byRelay: { "wss://peer": "accepted", [APP]: "accepted" },
+});
 vi.mock("@/lib/nostr/relayManager", () => {
   const base: Record<string, unknown> = {
     publish: (event: unknown, relays?: unknown) => publishSpy(event, relays),
     publishTracked: (event: unknown, relays?: unknown, opts?: unknown) => {
       trackedSpy(event, relays, opts);
       const isSelf = (event as { id: string }).id === selfWrapId;
-      return { sent: publishSpy(event, relays), accepted: isSelf ? selfAnswer() : relayAnswer() };
+      return {
+        sent: publishSpy(event, relays),
+        accepted: isSelf ? selfAnswer() : relayAnswer(),
+        outcome: isSelf ? Promise.resolve({ acceptedBy: null, byRelay: {} }) : recipientOutcome(),
+      };
     },
     getWriteRelays: () => [{ url: "wss://w" }],
   };
@@ -51,11 +60,14 @@ vi.mock("@/lib/nostr/relayManager", () => {
  *  undefined when they have none. */
 let peerInbox: string[] | undefined = ["wss://peer", APP];
 vi.mock("@/lib/nostr/dmRelayList", () => ({
-  getDMRelaysForPublish: async () => peerInbox,
-  getOwnDMRelays: () => ["wss://own"],
-  fallbackDMRelays: () => ["wss://w", APP],
+  APP_RELAY_URL: "ws://localhost:7777",
+  recipientTargets: async () => (peerInbox ? { targets: peerInbox, countAs: peerInbox } : { targets: ["wss://w", APP], countAs: [APP] }),
+  selfWrapTargets: () => ["wss://own", APP],
 }));
 vi.mock("@/lib/nostr/publish", () => ({ signAndPublish: vi.fn(async () => {}) }));
+/** publishOutbox.record(event, targets, now, onAck) calls. */
+const outboxSpy = vi.fn();
+vi.mock("@/lib/nostr/publishOutbox", () => ({ publishOutbox: { record: (...a: unknown[]) => outboxSpy(...a) } }));
 
 import { APP_RELAY } from "@/lib/nostr/constants";
 import { store, resetAll } from "@/store";
@@ -82,8 +94,10 @@ beforeEach(() => {
   selfWrapSpy.mockClear();
   publishSpy.mockClear();
   trackedSpy.mockClear();
+  outboxSpy.mockClear();
   relayAnswer = async () => "wss://peer";
   selfAnswer = async () => APP;
+  recipientOutcome = async () => ({ acceptedBy: "wss://peer", byRelay: { "wss://peer": "accepted", [APP]: "accepted" } });
   peerInbox = ["wss://peer", APP];
   selfWrapId = "w2".padEnd(64, "0");
   store.dispatch(login({ pubkey: ME, signerType: "tauri_keystore" }));
@@ -283,6 +297,33 @@ describe("dmService — which relays count as sent", () => {
     await sendDM(PEER, "two");
     await settle();
     expect(store.getState().dm.messages[PEER].find((m) => m.wrapId === selfWrapId)?.syncWarning).toBeUndefined();
+  });
+
+  it("a self-wrap the platform relay refused goes to the outbox, addressed to it; its OK clears the warning", async () => {
+    selfAnswer = async () => null;
+    await sendDM(PEER, "one");
+    await settle();
+    expect(row().syncWarning).toBe(true);
+    expect(outboxSpy).toHaveBeenCalledTimes(1);
+    const [event, targets, , onAck] = outboxSpy.mock.calls[0] as [{ id: string }, string[], number, () => void];
+    expect(event.id).toBe(selfWrapId);
+    expect(targets).toEqual([APP]);
+    onAck();
+    expect(row().syncWarning).toBeUndefined();
+  });
+
+  it("sent via an inbox relay while the platform relay refused marks the row pushMissed", async () => {
+    recipientOutcome = async () => ({ acceptedBy: "wss://peer", byRelay: { "wss://peer": "accepted", [APP]: "refused" } });
+    await sendDM(PEER, "hello");
+    await settle();
+    expect(row().status).toBe("sent");
+    expect(row().pushMissed).toBe(true);
+
+    recipientOutcome = async () => ({ acceptedBy: "wss://peer", byRelay: { "wss://peer": "accepted", [APP]: "accepted" } });
+    selfWrapId = "w5".padEnd(64, "0");
+    await sendDM(PEER, "two");
+    await settle();
+    expect(store.getState().dm.messages[PEER].find((m) => m.wrapId === selfWrapId)?.pushMissed).toBeUndefined();
   });
 
   it("the row records which relay accepted the recipient wrap", async () => {
