@@ -29,6 +29,7 @@ func main() {
 		MediaPerMin:       cfg.RateLimitMedia,
 		ReportAnonPerHour: cfg.RateLimitReportAnon,
 		ReportPerHour:     cfg.RateLimitReport,
+		IPPerMin:          cfg.RateLimitIP,
 	}
 	limiter, err := ratelimit.NewLimiter(cfg.RedisURL, limits)
 	if err != nil {

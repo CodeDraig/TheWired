@@ -155,6 +155,11 @@ services:
       GATEWAY_SHARED_SECRET: ${GATEWAY_SHARED_SECRET:-}
       # NIP-98 payload tag on body-bearing /api requests: off | warn | enforce
       NIP98_REQUIRE_PAYLOAD: ${NIP98_REQUIRE_PAYLOAD:-off}
+      # GATEWAY_ENV=production flips TRUSTED_PROXIES to "trust nobody" and CORS
+      # to deny-by-default; dev keeps the private-range / "*" defaults.
+      GATEWAY_ENV: ${GATEWAY_ENV:-${NODE_ENV:-development}}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      RATE_LIMIT_IP_PER_MIN: ${RATE_LIMIT_IP_PER_MIN:-1200}
     depends_on:
       backend:
         condition: service_started
