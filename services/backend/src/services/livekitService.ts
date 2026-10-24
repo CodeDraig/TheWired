@@ -35,7 +35,7 @@ export const livekitService = {
     roomName: string,
     participantName: string,
     grants: TokenGrants,
-    ttlSeconds = 86400,
+    ttlSeconds = 3600,
   ): Promise<string> {
     const token = new AccessToken(config.livekitApiKey, config.livekitApiSecret, {
       identity,

@@ -6,11 +6,11 @@ import { requirePubkey, requireSpaceCreator } from "../lib/authz.js";
 import { isListedPublicMusic } from "../services/musicVisibility.js";
 
 const spacesQuerySchema = z.object({
-  category: z.string().optional(),
+  category: z.string().max(50).optional(),
   /** One tag or a comma-separated OR-list (`tag=club,techno,rave`) — a scene spans several. */
   tag: z.string().max(500).optional(),
   sort: z.enum(["trending", "newest", "popular"]).optional(),
-  search: z.string().optional(),
+  search: z.string().max(200).optional(),
   limit: limitParam(20, 100),
   offset: offsetParam,
 });
@@ -25,10 +25,10 @@ const spaceMusicQuerySchema = z.object({
 });
 
 const listingRequestBodySchema = z.object({
-  spaceId: nonEmptyString,
-  category: z.string().optional(),
-  tags: z.array(z.string()).optional(),
-  reason: z.string().optional(),
+  spaceId: nonEmptyString.max(128),
+  category: z.string().max(50).optional(),
+  tags: z.array(z.string().max(64)).max(20).optional(),
+  reason: z.string().max(2000).optional(),
 });
 
 const idParamsSchema = z.object({
@@ -37,13 +37,13 @@ const idParamsSchema = z.object({
 
 const reviewBodySchema = z.object({
   status: z.enum(["approved", "rejected"]),
-  reviewNote: z.string().optional(),
+  reviewNote: z.string().max(2000).optional(),
 });
 
 const relaysQuerySchema = z.object({
   sort: z.enum(["popular", "fastest", "newest"]).optional(),
-  nip: z.coerce.number().int().optional(),
-  search: z.string().optional(),
+  nip: z.coerce.number().int().min(0).max(10_000).optional(),
+  search: z.string().max(200).optional(),
   limit: limitParam(20, 100),
 });
 

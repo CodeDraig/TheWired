@@ -5,13 +5,49 @@ import {
   type PushPlatform,
   type PushProvider,
 } from "../db/schema/notifications.js";
-import { eq, and, lt } from "drizzle-orm";
+import { eq, and, lt, ne } from "drizzle-orm";
 import { nanoid } from "../lib/id.js";
 import { getRedis } from "../lib/redis.js";
+import { isPrivateHost } from "../lib/relayUrlGuard.js";
 
 /** More devices than anyone plausibly owns — the cap only bounds junk-token
  *  registration (Expo throttles senders that push to dead tokens). */
 export const MAX_DEVICES_PER_PUBKEY = 20;
+
+/** Web Push subscriptions per pubkey (one per browser profile that opted in;
+ *  a repeat of the same endpoint upserts, so this bounds junk only). */
+export const MAX_WEB_PUSH_SUBSCRIPTIONS_PER_PUBKEY = 50;
+
+/**
+ * Hosts a Web Push endpoint may live on: the push services of the browsers
+ * The Wired's desktop client can run in. A subscription endpoint is a URL the
+ * dispatcher POSTs to from inside the deployment, so anything else — an
+ * internal service, a metadata address, an arbitrary public host — is
+ * refused. Exact host or any subdomain.
+ */
+export const WEB_PUSH_ENDPOINT_HOSTS: readonly string[] = [
+  "fcm.googleapis.com", // Chrome, Edge (Chromium), Brave, Opera, Vivaldi
+  "push.apple.com", // Safari (web.push.apple.com)
+  "push.services.mozilla.com", // Firefox (updates.push.services.mozilla.com)
+  "notify.windows.com", // Edge on Windows (WNS)
+];
+
+/** Is `raw` an endpoint the dispatcher may POST to? */
+export function isAllowedPushEndpoint(raw: string): { ok: boolean; reason?: string } {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return { ok: false, reason: "invalid URL" };
+  }
+  if (u.protocol !== "https:") return { ok: false, reason: "endpoint must be https" };
+  if (u.username || u.password) return { ok: false, reason: "endpoint must not carry credentials" };
+  const host = u.hostname.toLowerCase().replace(/\.+$/, "");
+  if (isPrivateHost(host)) return { ok: false, reason: "private host" };
+  const known = WEB_PUSH_ENDPOINT_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
+  if (!known) return { ok: false, reason: "not a known push service" };
+  return { ok: true };
+}
 
 /** How long the last Expo delivery error for an account is remembered —
  *  long enough for a tester to open You → Notifications the next day. */
@@ -85,13 +121,27 @@ export interface RegisterDeviceParams {
 
 export const pushService = {
   // ── Web Push (desktop) ──
-  async subscribe(pubkey: string, endpoint: string, keys: { p256dh: string; auth: string }) {
-    await db.insert(pushSubscriptions).values({
-      id: nanoid(),
-      pubkey,
-      endpoint,
-      p256dh: keys.p256dh,
-      auth: keys.auth,
+  /** Upsert on endpoint: a browser's subscription belongs to whoever is
+   *  signed in on it, so a repeat refreshes the keys and REBINDS the pubkey
+   *  (same rule as devices). Returns false when the pubkey is at the cap and
+   *  the endpoint is new (soft cap — count and insert don't race-proof each
+   *  other). The endpoint has already passed isAllowedPushEndpoint. */
+  async subscribe(pubkey: string, endpoint: string, keys: { p256dh: string; auth: string }): Promise<boolean> {
+    return db.transaction(async (tx) => {
+      const others = await tx
+        .select({ id: pushSubscriptions.id })
+        .from(pushSubscriptions)
+        .where(and(eq(pushSubscriptions.pubkey, pubkey), ne(pushSubscriptions.endpoint, endpoint)));
+      if (others.length >= MAX_WEB_PUSH_SUBSCRIPTIONS_PER_PUBKEY) return false;
+      await tx.delete(pushSubscriptions).where(eq(pushSubscriptions.endpoint, endpoint));
+      await tx.insert(pushSubscriptions).values({
+        id: nanoid(),
+        pubkey,
+        endpoint,
+        p256dh: keys.p256dh,
+        auth: keys.auth,
+      });
+      return true;
     });
   },
 

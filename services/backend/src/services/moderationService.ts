@@ -119,8 +119,14 @@ export const moderationService = {
   },
 
   /** Unmute a member */
-  async unmuteMember(muteId: string) {
-    await db.delete(timedMutes).where(eq(timedMutes.id, muteId));
+  /** Scoped to the space: a mute id alone must not reach another space's
+   *  mute (the id is guessable / leakable). Whether a row went. */
+  async unmuteMember(spaceId: string, muteId: string): Promise<boolean> {
+    const rows = await db
+      .delete(timedMutes)
+      .where(and(eq(timedMutes.spaceId, spaceId), eq(timedMutes.id, muteId)))
+      .returning({ id: timedMutes.id });
+    return rows.length > 0;
   },
 
   /** List active mutes (not expired) */

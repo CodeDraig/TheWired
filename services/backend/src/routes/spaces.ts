@@ -22,16 +22,26 @@ const idParamsSchema = z.object({
   id: nonEmptyString,
 });
 
+/** A space picture is rendered by every member's client: https only. */
+const pictureUrl = z
+  .string()
+  .max(2048)
+  .url()
+  .refine((u) => u.startsWith("https://"), { message: "picture must be an https URL" });
+
 const createSpaceBodySchema = z.object({
-  id: nonEmptyString,
-  name: nonEmptyString,
-  hostRelay: nonEmptyString.url(),
-  picture: z.string().optional(),
-  about: z.string().optional(),
-  category: z.string().optional(),
-  language: z.string().optional(),
+  id: nonEmptyString.max(128),
+  name: nonEmptyString.max(100),
+  hostRelay: nonEmptyString.max(2048).url(),
+  picture: pictureUrl.optional(),
+  about: z.string().max(2000).optional(),
+  category: z.string().max(50).optional(),
+  language: z.string().max(32).optional(),
   mode: z.enum(["read", "read-write"]).optional(),
-  channels: z.array(z.object({ type: nonEmptyString, label: nonEmptyString })).optional(),
+  channels: z
+    .array(z.object({ type: nonEmptyString.max(32), label: nonEmptyString.max(100) }))
+    .max(50)
+    .optional(),
 });
 
 /** PATCH /:id — the editable metadata. `null` clears about/picture. */
@@ -39,7 +49,7 @@ const updateSpaceBodySchema = z
   .object({
     name: nonEmptyString.max(60).optional(),
     about: z.string().max(2000).nullable().optional(),
-    picture: z.string().url().max(2048).nullable().optional(),
+    picture: pictureUrl.nullable().optional(),
   })
   .refine((b) => b.name !== undefined || b.about !== undefined || b.picture !== undefined, {
     message: "Nothing to update",
