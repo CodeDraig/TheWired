@@ -299,39 +299,39 @@ describe("relayManager — publishTracked (own-message send state)", () => {
     return { a, b };
   }
 
-  it("hands the event to every target and resolves true at the first accept", async () => {
+  it("hands the event to every target and resolves with the first relay that accepts", async () => {
     const { a, b } = openTwo();
     const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"]);
     expect(t.sent).toBe(2);
     expect(a.sent.some((m) => JSON.parse(m)[0] === "EVENT")).toBe(true);
     expect(b.sent.some((m) => JSON.parse(m)[0] === "EVENT")).toBe(true);
     ok(b, true); // a never answers
-    await expect(t.accepted).resolves.toBe(true);
+    await expect(t.accepted).resolves.toBe("wss://b.relay");
   });
 
   it("counts a duplicate refusal as accepted (the relay already holds it)", async () => {
     const { a } = openTwo();
     const t = relayManager.publishTracked(event, ["wss://a.relay"]);
     ok(a, false, "duplicate: already have this event");
-    await expect(t.accepted).resolves.toBe(true);
+    await expect(t.accepted).resolves.toBe("wss://a.relay");
   });
 
-  it("resolves false once every target refused", async () => {
+  it("resolves null once every target refused", async () => {
     const { a, b } = openTwo();
     const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"]);
     ok(a, false, "blocked: no");
     ok(b, false, "rate-limited: slow down");
-    await expect(t.accepted).resolves.toBe(false);
+    await expect(t.accepted).resolves.toBeNull();
   });
 
-  it("resolves false when no relay answers in time — a queued event proves nothing", async () => {
+  it("resolves null when no relay answers in time — a queued event proves nothing", async () => {
     vi.useFakeTimers();
     try {
       relayManager.connect("wss://down.relay"); // never opens: the EVENT is queued
-      const t = relayManager.publishTracked(event, ["wss://down.relay"], 10_000);
+      const t = relayManager.publishTracked(event, ["wss://down.relay"], { timeout: 10_000 });
       expect(t.sent).toBe(1);
       vi.advanceTimersByTime(10_000);
-      await expect(t.accepted).resolves.toBe(false);
+      await expect(t.accepted).resolves.toBeNull();
     } finally {
       vi.useRealTimers();
     }
@@ -340,6 +340,64 @@ describe("relayManager — publishTracked (own-message send state)", () => {
   it("with no known target relay: nothing sent, not accepted", async () => {
     const t = relayManager.publishTracked(event, ["wss://unknown.relay"]);
     expect(t.sent).toBe(0);
-    await expect(t.accepted).resolves.toBe(false);
+    await expect(t.accepted).resolves.toBeNull();
+  });
+
+  // `countAs`: only these relays' OKs settle the send (the platform relay +
+  // the recipient's inbox relays for a DM). A public relay's OK alone leaves
+  // the send pending — it reaches neither the push ingester nor the phone.
+  describe("countAs — which relays' OKs count", () => {
+    it("a non-counting relay's OK leaves the send pending; the counting relay's OK settles it", async () => {
+      vi.useFakeTimers();
+      try {
+        const { a, b } = openTwo();
+        const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"], { countAs: ["wss://a.relay"] });
+        let settled: string | null | undefined;
+        void t.accepted.then((v) => { settled = v; });
+        ok(b, true);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBeUndefined();
+        ok(a, true);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBe("wss://a.relay");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("every counting relay refusing fails the send even though a public relay took it", async () => {
+      const { a, b } = openTwo();
+      const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"], { countAs: ["wss://a.relay"] });
+      ok(b, true);
+      ok(a, false, "blocked: not a member");
+      await expect(t.accepted).resolves.toBeNull();
+    });
+
+    it("a counting relay that never answers fails the send at the timeout, public OK or not", async () => {
+      vi.useFakeTimers();
+      try {
+        const { b } = openTwo();
+        const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"], { countAs: ["wss://a.relay"], timeout: 10_000 });
+        ok(b, true);
+        vi.advanceTimersByTime(10_000);
+        await expect(t.accepted).resolves.toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a `duplicate:` from a counting relay counts; counting relays are matched in any slash form", async () => {
+      const { a } = openTwo();
+      const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"], { countAs: ["wss://a.relay/"] });
+      ok(a, false, "duplicate: have it");
+      await expect(t.accepted).resolves.toBe("wss://a.relay");
+    });
+
+    it("no counting relay among the targets: the send can never count, so it fails at once", async () => {
+      openTwo();
+      const t = relayManager.publishTracked(event, ["wss://b.relay"], { countAs: ["wss://a.relay"] });
+      expect(t.sent).toBe(1);
+      await expect(t.accepted).resolves.toBeNull();
+    });
   });
 });

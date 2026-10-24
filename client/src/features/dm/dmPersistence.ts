@@ -4,6 +4,7 @@ import {
   type DMMessage,
   type DMContact,
   type DMFlags,
+  type PendingDMControl,
 } from "@/store/slices/dmSlice";
 import { saveUserState, getUserState } from "@/lib/db/userStateStore";
 
@@ -22,6 +23,8 @@ interface PersistedDMState {
   processedWrapIds: string[];
   lastReadTimestamps?: Record<string, number>;
   flags?: DMFlags;
+  /** Edits / deletes still waiting for their anchor message. */
+  pendingControl?: Record<string, PendingDMControl[]>;
 }
 
 /** Build a trimmed snapshot of DM state suitable for IndexedDB persistence */
@@ -43,6 +46,7 @@ function buildPersistedState(): PersistedDMState {
     processedWrapIds: state.processedWrapIds.slice(-MAX_PERSISTED_WRAP_IDS),
     lastReadTimestamps: state.lastReadTimestamps,
     flags: state.flags,
+    pendingControl: state.pendingControl,
   };
 }
 
@@ -58,6 +62,7 @@ export async function loadDMState(): Promise<void> {
       processedWrapIds: persisted.processedWrapIds,
       lastReadTimestamps: persisted.lastReadTimestamps,
       flags: persisted.flags,
+      pendingControl: persisted.pendingControl,
     }),
   );
 }

@@ -24,6 +24,7 @@ import { handlePotentialKick } from "./kickHandler";
 import { parseRelayList } from "./nip65";
 import { loadAndApplyDisabledRelays } from "./relayList";
 import { parseDMRelayList, clearDMRelayCache } from "./dmRelayList";
+import { ensureAppRelayInOwnDMList } from "./dmRelayListEnsure";
 import { EVENT_KINDS } from "../../types/nostr";
 import { saveUserState, getUserState } from "../db/userStateStore";
 import { getProfile } from "../db/profileStore";
@@ -737,12 +738,17 @@ export async function performLogin(
 
   // Step 6b: Subscribe for DM relay list (kind:10050) from bootstrap relays
   let dmRelayEoseReceived = false;
+  /** The newest list a relay served this session (not the IndexedDB cache). */
+  let newestDMRelayList: { relays: string[]; createdAt: number } | null = null;
   relayManager.subscribe({
     filters: [{ kinds: [10050], authors: [pubkey], limit: 1 }],
     relayUrls: BOOTSTRAP_RELAYS,
     onEvent: (event) => {
       const relays = parseDMRelayList(event);
       if (relays.length > 0) {
+        if (!newestDMRelayList || event.created_at > newestDMRelayList.createdAt) {
+          newestDMRelayList = { relays, createdAt: event.created_at };
+        }
         store.dispatch(setDMRelayList({ relays, createdAt: event.created_at }));
         saveUserState("dm_relay_list", relays);
         // Connect to DM relays so gift wraps can be received
@@ -754,6 +760,13 @@ export async function performLogin(
     onEOSE: () => {
       if (dmRelayEoseReceived) return;
       dmRelayEoseReceived = true;
+      // A list exists: keep the platform relay in it (DM_WIRE_CONTRACT §1 —
+      // append when missing, once a day, never after the user removed it).
+      // Judged on a list a relay served, never on the cache alone, so a stale
+      // cached copy is never republished over a newer list we did not see.
+      if (newestDMRelayList) {
+        void ensureAppRelayInOwnDMList(pubkey, store.getState().identity.signerType, newestDMRelayList).catch(() => {});
+      }
       // If no kind:10050 found and no cache, auto-publish defaults
       const currentDMRelays = store.getState().identity.dmRelayList;
       // Don't auto-publish on a remote signer's behalf — it fires an unprompted

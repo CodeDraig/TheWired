@@ -552,37 +552,50 @@ class RelayManagerImpl {
   }
 
   /**
-   * Publish like `publish` (same targets, same count), and report whether
-   * any relay took it: `accepted` resolves true at the first OK true (or a
-   * `duplicate:` refusal — the relay already holds it), false once every
-   * target refused or `timeout` passed without one. A socket that is
+   * Publish like `publish` (same targets, same count), and report whether a
+   * relay that COUNTS took it: `accepted` resolves with that relay's URL at
+   * the first OK true (or a `duplicate:` refusal — the relay already holds
+   * it), and with null once every counting relay refused or `timeout` passed
+   * without one. `countAs` names the relays whose OK counts (default: every
+   * target); for a DM that is the platform relay — the only one the push
+   * ingester and the phone read — plus the recipient's kind-10050 relays, so
+   * a public relay's OK alone leaves the send pending. A socket that is
    * reconnecting queues the event, so the count alone proves nothing.
    */
   publishTracked(
     event: NostrEvent,
     targets?: string[],
-    timeout = 10_000,
-  ): { sent: number; accepted: Promise<boolean> } {
+    opts: { timeout?: number; countAs?: string[] } = {},
+  ): { sent: number; accepted: Promise<string | null> } {
+    const timeout = opts.timeout ?? 10_000;
     const relays = targets
       ? targets
           .map((url) => this.connections.get(this.key(url)))
           .filter((c): c is RelayConnection => !!c)
       : this.getWriteRelays();
-    if (relays.length === 0) return { sent: 0, accepted: Promise.resolve(false) };
+    if (relays.length === 0) return { sent: 0, accepted: Promise.resolve(null) };
 
-    const accepted = new Promise<boolean>((resolve) => {
-      const waiting = new Set(relays.map((c) => c.url));
-      const finish = (ok: boolean) => {
+    const countKeys = opts.countAs ? new Set(opts.countAs.map((u) => this.key(u))) : null;
+    const counting = relays.filter((c) => !countKeys || countKeys.has(this.key(c.url)));
+
+    const accepted = new Promise<string | null>((resolve) => {
+      if (counting.length === 0) {
+        // No relay whose OK could count is even a target: it can never be sent.
+        resolve(null);
+        return;
+      }
+      const waiting = new Set(counting.map((c) => c.url));
+      const finish = (relay: string | null) => {
         clearTimeout(timer);
         this.publishOKCallbacks.delete(event.id);
-        resolve(ok);
+        resolve(relay);
       };
       this.publishOKCallbacks.set(event.id, (relayUrl, success, message) => {
-        if (!waiting.delete(relayUrl)) return;
-        if (success || message.startsWith("duplicate:")) finish(true);
-        else if (waiting.size === 0) finish(false);
+        if (!waiting.delete(relayUrl)) return; // not a counting relay, or answered already
+        if (success || message.startsWith("duplicate:")) finish(relayUrl);
+        else if (waiting.size === 0) finish(null);
       });
-      const timer = setTimeout(() => finish(false), timeout);
+      const timer = setTimeout(() => finish(null), timeout);
     });
     for (const conn of relays) conn.publish(event);
     return { sent: relays.length, accepted };

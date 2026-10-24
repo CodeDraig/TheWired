@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // The service builds rumors + wraps through the giftWrap shim and publishes
 // through relayManager; both are stubbed so we can assert the WIRE SHAPES
 // (docs/DM_WIRE_CONTRACT.md §2–§5) without crypto or sockets.
+const APP = "ws://localhost:7777";
 const buildRumorSpy = vi.fn();
 const wrapSpy = vi.fn();
 const selfWrapSpy = vi.fn();
@@ -25,25 +26,38 @@ vi.mock("@/lib/nostr/giftWrap", () => ({
   giftWrapContext: () => ({ myPubkey: "a".repeat(64), signer: {} }),
 }));
 const publishSpy = vi.fn((_event: unknown, _relays?: unknown) => 1);
-/** What the relays answer for a tracked recipient wrap (the next send). */
-let relayAnswer: () => Promise<boolean> = async () => true;
+/** Every publishTracked call: (event, targets, opts). */
+const trackedSpy = vi.fn();
+/** What the counting relays answer for the tracked recipient wrap (the next
+ *  send): the accepting relay's URL, or null. */
+let relayAnswer: () => Promise<string | null> = async () => "wss://peer";
+/** Same for the tracked self-wrap. */
+let selfAnswer: () => Promise<string | null> = async () => APP;
 vi.mock("@/lib/nostr/relayManager", () => {
   const base: Record<string, unknown> = {
     publish: (event: unknown, relays?: unknown) => publishSpy(event, relays),
-    publishTracked: (event: unknown, relays?: unknown) => ({ sent: publishSpy(event, relays), accepted: relayAnswer() }),
+    publishTracked: (event: unknown, relays?: unknown, opts?: unknown) => {
+      trackedSpy(event, relays, opts);
+      const isSelf = (event as { id: string }).id === selfWrapId;
+      return { sent: publishSpy(event, relays), accepted: isSelf ? selfAnswer() : relayAnswer() };
+    },
     getWriteRelays: () => [{ url: "wss://w" }],
   };
   // Anything else the store/login modules touch at import time is a no-op.
   const relayManager = new Proxy(base, { get: (t, k: string) => (k in t ? t[k] : () => undefined) });
   return { relayManager };
 });
+/** The peer's kind-10050 inbox (∪ APP_RELAY, as the real helper returns), or
+ *  undefined when they have none. */
+let peerInbox: string[] | undefined = ["wss://peer", APP];
 vi.mock("@/lib/nostr/dmRelayList", () => ({
-  getDMRelaysForPublish: async () => ["wss://peer"],
+  getDMRelaysForPublish: async () => peerInbox,
   getOwnDMRelays: () => ["wss://own"],
-  fallbackDMRelays: () => ["wss://w", "ws://localhost:7777"],
+  fallbackDMRelays: () => ["wss://w", APP],
 }));
 vi.mock("@/lib/nostr/publish", () => ({ signAndPublish: vi.fn(async () => {}) }));
 
+import { APP_RELAY } from "@/lib/nostr/constants";
 import { store, resetAll } from "@/store";
 import { login, setFollowList } from "@/store/slices/identitySlice";
 import { addFriendRequest } from "@/store/slices/friendRequestSlice";
@@ -67,7 +81,10 @@ beforeEach(() => {
   wrapSpy.mockClear();
   selfWrapSpy.mockClear();
   publishSpy.mockClear();
-  relayAnswer = async () => true;
+  trackedSpy.mockClear();
+  relayAnswer = async () => "wss://peer";
+  selfAnswer = async () => APP;
+  peerInbox = ["wss://peer", APP];
   selfWrapId = "w2".padEnd(64, "0");
   store.dispatch(login({ pubkey: ME, signerType: "tauri_keystore" }));
 });
@@ -165,24 +182,25 @@ describe("dmService — own-message send state (relay OK, as on mobile)", () => 
   const settle = () => new Promise((r) => setTimeout(r, 0));
 
   it("sendDM adds the row as pending and marks it sent when a relay accepts", async () => {
-    let accept!: (ok: boolean) => void;
-    relayAnswer = () => new Promise<boolean>((r) => { accept = r; });
+    let accept!: (relay: string | null) => void;
+    relayAnswer = () => new Promise<string | null>((r) => { accept = r; });
     await sendDM(PEER, "hello");
     expect(row().status).toBe("pending");
-    accept(true);
+    accept("wss://peer");
     await settle();
     expect(row().status).toBe("sent");
+    expect(row().sentVia).toBe("wss://peer");
   });
 
   it("marks the row failed when no relay accepted it", async () => {
-    relayAnswer = async () => false;
+    relayAnswer = async () => null;
     await sendDM(PEER, "hello");
     await settle();
     expect(row().status).toBe("failed");
   });
 
   it("sendDMFile tracks the file row the same way", async () => {
-    relayAnswer = async () => false;
+    relayAnswer = async () => null;
     await sendDMFile(PEER, {
       url: "https://blossom/x.bin",
       fileType: "image/png",
@@ -197,13 +215,13 @@ describe("dmService — own-message send state (relay OK, as on mobile)", () => 
   });
 
   it("resendDM sends the same text and reply anchor again and drops the failed row", async () => {
-    relayAnswer = async () => false;
+    relayAnswer = async () => null;
     await sendDM(PEER, "try again", { wrapId: "legacy", rumorId: TARGET });
     await settle();
     const failedWrapId = row().wrapId;
     expect(row().status).toBe("failed");
     buildRumorSpy.mockClear();
-    relayAnswer = async () => true;
+    relayAnswer = async () => "wss://peer";
     selfWrapId = "w3".padEnd(64, "0");
     await resendDM(PEER, failedWrapId);
     await settle();
@@ -219,5 +237,59 @@ describe("dmService — own-message send state (relay OK, as on mobile)", () => 
     buildRumorSpy.mockClear();
     await resendDM(PEER, row().wrapId);
     expect(buildRumorSpy).not.toHaveBeenCalled();
+  });
+});
+
+// "Sent" means the message can reach the phone: only the platform relay (the
+// push ingester's source) or one of the recipient's kind-10050 relays settle
+// the send. The self-wrap is tracked the same way, against the platform relay.
+describe("dmService — which relays count as sent", () => {
+  const row = () => store.getState().dm.messages[PEER][0];
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+  const recipientCall = () => trackedSpy.mock.calls.find((c) => (c[0] as { id: string }).id !== selfWrapId)!;
+  const selfCall = () => trackedSpy.mock.calls.find((c) => (c[0] as { id: string }).id === selfWrapId)!;
+
+  it("the recipient wrap counts the recipient's inbox relays (platform relay included)", async () => {
+    await sendDM(PEER, "hello");
+    const [, targets, opts] = recipientCall();
+    expect(targets).toEqual(["wss://peer", APP]);
+    expect((opts as { countAs: string[] }).countAs).toEqual(["wss://peer", APP]);
+  });
+
+  it("a recipient without a list: every write relay is a target but only the platform relay counts", async () => {
+    peerInbox = undefined;
+    await sendDM(PEER, "hello");
+    const [, targets, opts] = recipientCall();
+    expect(targets).toEqual(["wss://w", APP]);
+    expect((opts as { countAs: string[] }).countAs).toEqual([APP]);
+  });
+
+  it("the self-wrap always targets the platform relay too and is tracked against it", async () => {
+    await sendDM(PEER, "hello");
+    const [, targets, opts] = selfCall();
+    expect(targets).toEqual(["wss://own", APP]);
+    expect((opts as { countAs: string[] }).countAs).toEqual([APP]);
+    expect(APP_RELAY).toBe(APP);
+  });
+
+  it("a self-wrap the platform relay did not accept shows the sync warning; one it accepted does not", async () => {
+    selfAnswer = async () => null;
+    await sendDM(PEER, "one");
+    await settle();
+    expect(row().syncWarning).toBe(true);
+
+    selfAnswer = async () => APP;
+    selfWrapId = "w4".padEnd(64, "0");
+    await sendDM(PEER, "two");
+    await settle();
+    expect(store.getState().dm.messages[PEER].find((m) => m.wrapId === selfWrapId)?.syncWarning).toBeUndefined();
+  });
+
+  it("the row records which relay accepted the recipient wrap", async () => {
+    relayAnswer = async () => APP;
+    await sendDM(PEER, "hello");
+    await settle();
+    expect(row().status).toBe("sent");
+    expect(row().sentVia).toBe(APP);
   });
 });

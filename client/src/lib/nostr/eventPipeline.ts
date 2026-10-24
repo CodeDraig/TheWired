@@ -32,6 +32,7 @@ import { parseThreadRef, parseQuoteRef } from "../../features/spaces/noteParser"
 import { parseVoteEvent } from "../../features/polls/pollParser";
 import { profileCache } from "./profileCache";
 import { unwrapGiftWrap, type UnwrappedDM } from "./giftWrap";
+import { GiftWrapRejectedError } from "@ishtarservices/core";
 import { GIFT_WRAP_ACCEPT_KINDS, KIND_DM_PROJECT_KEY, parseProjectKeyDM } from "../../features/music/sharedKey/projectKeyDM";
 import { forgetHeldProjectKey, receiveProjectKey } from "../../features/music/sharedKey/projectKeys";
 import { isSecretPersistEnabled } from "./secretStore";
@@ -1230,7 +1231,11 @@ deps.decryptQueue.setHandler(handleGiftWrap);
 /** Handle incoming gift wrap (kind:1059) — decrypt and route to DM or friend request */
 async function handleGiftWrap(event: NostrEvent): Promise<void> {
   const myPubkey = getState().identity.pubkey;
-  if (!myPubkey) return;
+  if (!myPubkey) {
+    // Not logged in (yet): nothing about the wrap was judged — let a later copy in.
+    dedup.unmarkSeen(event.id);
+    return;
+  }
 
   // Only process wraps addressed to us. Recipient wraps from our own sends
   // bounce back from relays but can't be decrypted — some NIP-07 extensions
@@ -1238,8 +1243,25 @@ async function handleGiftWrap(event: NostrEvent): Promise<void> {
   const recipientTag = event.tags.find((t) => t[0] === "p")?.[1];
   if (recipientTag && recipientTag !== myPubkey) return;
 
+  // The wrap was marked in the dedup LRU before it reached this queue. A
+  // decrypt that fails because the signer was away (NIP-46 timeout, locked
+  // extension, keystore not ready) says nothing about the wrap, so unmark it:
+  // the NIP-77 reconcile re-requests ids the slice never processed, and a copy
+  // from another relay can arrive any time — either gets a fresh decrypt. A
+  // verdict core reached itself (bad seal signature, wrong kind, expired, bad
+  // ciphertext) is final for that wrap and stays marked, so it is not
+  // decrypted again every reconcile round.
+  let dm: UnwrappedDM;
   try {
-    const dm = await unwrapGiftWrap(event, { acceptKinds: GIFT_WRAP_ACCEPT_KINDS });
+    dm = await unwrapGiftWrap(event, { acceptKinds: GIFT_WRAP_ACCEPT_KINDS });
+  } catch (err) {
+    if (!(err instanceof GiftWrapRejectedError || (err as { name?: string })?.name === "GiftWrapRejectedError")) {
+      dedup.unmarkSeen(event.id);
+    }
+    return;
+  }
+
+  try {
 
     // Validate unwrapped data — guard against corrupted decryptions from
     // wraps not addressed to us (some NIP-07 extensions don't throw on
@@ -1411,7 +1433,7 @@ async function handleGiftWrap(event: NostrEvent): Promise<void> {
       }
     }
   } catch {
-    // Decryption failed — common for wraps not addressed to us
+    // Routing failed on a decrypted wrap — a malformed rumor, not a transient.
   }
 }
 

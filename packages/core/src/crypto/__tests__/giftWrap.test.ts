@@ -4,6 +4,7 @@ import {
   createGiftWrappedDM,
   createSelfWrap,
   unwrapGiftWrap,
+  GiftWrapRejectedError,
   type GiftWrapContext,
 } from "../giftWrap";
 import { verifyEventSync } from "../verifyEvent";
@@ -109,31 +110,73 @@ describe("gift wrap round trip", () => {
     await expect(unwrapGiftWrap(badCodec, fakeWrap, { verifySeal: false })).rejects.toThrow(/kind/);
   });
 
-  it("rejects rumor content that still looks like base64 ciphertext", async () => {
-    const codec = {
-      nip44Decrypt: async (_peer: string, ct: string) => {
-        if (ct === "outer") {
-          return JSON.stringify({ pubkey: "a".repeat(64), created_at: 1, kind: 13, tags: [], content: "inner" });
-        }
-        return JSON.stringify({
-          pubkey: "a".repeat(64),
-          created_at: 1,
-          kind: 14,
-          tags: [],
-          content: "QUJDRA==".repeat(10), // 80 chars of pure base64
-        });
-      },
-    };
-    const fakeWrap = {
-      id: "f".repeat(64),
-      pubkey: "b".repeat(64),
-      created_at: 1,
-      kind: KIND_GIFT_WRAP,
-      tags: [],
-      content: "outer",
-      sig: "0".repeat(128),
-    };
-    await expect(unwrapGiftWrap(codec, fakeWrap, { verifySeal: false })).rejects.toThrow(/encrypted/);
+  it("delivers a body that is only an npub (63 chars of bech32)", async () => {
+    const alice = makeTestIdentity();
+    const bob = makeTestIdentity();
+    const body = "npub1" + "q".repeat(58); // 63 chars, all in the base64 alphabet
+    const { wrap } = await createGiftWrappedDM(ctxOf(alice), body, bob.pubkey);
+    const dm = await unwrapGiftWrap(bob.signer, wrap);
+    expect(dm.content).toBe(body);
+  });
+
+  it("delivers a body that is a bare 64-hex event id", async () => {
+    const alice = makeTestIdentity();
+    const bob = makeTestIdentity();
+    const body = "deadbeef".repeat(8);
+    const { wrap } = await createGiftWrappedDM(ctxOf(alice), body, bob.pubkey);
+    const dm = await unwrapGiftWrap(bob.signer, wrap);
+    expect(dm.content).toBe(body);
+  });
+
+  it("delivers a 60-character laugh", async () => {
+    const alice = makeTestIdentity();
+    const bob = makeTestIdentity();
+    const body = "ha".repeat(30);
+    const { wrap } = await createGiftWrappedDM(ctxOf(alice), body, bob.pubkey);
+    const dm = await unwrapGiftWrap(bob.signer, wrap);
+    expect(dm.content).toBe(body);
+  });
+
+  it("a wrong key fails at the NIP-44 MAC, not at a content heuristic", async () => {
+    const alice = makeTestIdentity();
+    const bob = makeTestIdentity();
+    const mallory = makeTestIdentity();
+    const { wrap } = await createGiftWrappedDM(ctxOf(alice), "QUJDRA==".repeat(10), bob.pubkey);
+    await expect(unwrapGiftWrap(mallory.signer, wrap)).rejects.toThrow();
+    const dm = await unwrapGiftWrap(bob.signer, wrap);
+    expect(dm.content).toBe("QUJDRA==".repeat(10));
+  });
+});
+
+describe("unwrap verdicts vs transient failures", () => {
+  it("every verdict core reaches itself is a GiftWrapRejectedError (never retry)", async () => {
+    const alice = makeTestIdentity();
+    const bob = makeTestIdentity();
+    const { wrap } = await createGiftWrappedDM(ctxOf(alice), "hi", bob.pubkey);
+
+    // Wrong recipient: the NIP-44 MAC fails inside the codec. nostr-tools throws
+    // a plain Error there, so core wraps a decrypt failure as a rejection too.
+    const mallory = makeTestIdentity();
+    await expect(unwrapGiftWrap(mallory.signer, wrap)).rejects.toBeInstanceOf(GiftWrapRejectedError);
+
+    // Expired wrap.
+    const expired = { ...wrap, tags: [...wrap.tags, ["expiration", "1"]] };
+    await expect(unwrapGiftWrap(bob.signer, expired, { now: 2 })).rejects.toMatchObject({ name: "GiftWrapRejectedError", code: "expired" });
+
+    // Unsupported rumor kind.
+    const { wrap: odd } = await createGiftWrappedDM(ctxOf(alice), "x", bob.pubkey, undefined, await buildRumor(alice.pubkey, bob.pubkey, "x", undefined, { kind: 1 }));
+    await expect(unwrapGiftWrap(bob.signer, odd)).rejects.toMatchObject({ name: "GiftWrapRejectedError", code: "kind" });
+  });
+
+  it("a codec that cannot answer (signer away, bunker timeout) propagates as-is so the caller can retry", async () => {
+    const alice = makeTestIdentity();
+    const bob = makeTestIdentity();
+    const { wrap } = await createGiftWrappedDM(ctxOf(alice), "hi", bob.pubkey);
+    const away = { nip44Decrypt: async () => { throw new Error("NIP-46 request timed out"); } };
+    const err = await unwrapGiftWrap(away, wrap).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(GiftWrapRejectedError);
+    expect(err.message).toMatch(/timed out/);
   });
 });
 
