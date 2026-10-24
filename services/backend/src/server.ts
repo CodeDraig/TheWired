@@ -42,6 +42,11 @@ import { errorHandler } from "./middleware/errorHandler.js";
 
 export async function createServer() {
   const server = Fastify({
+    // Behind Caddy (share pages) and Caddy → gateway (API) both on the Docker
+    // network: resolve request.ip from X-Forwarded-For across those hops only,
+    // so per-IP logic (report hashes, logs) sees the client, not the proxy,
+    // while a direct client cannot spoof it. See config.trustProxy.
+    trustProxy: config.trustProxy,
     logger: {
       level: config.logLevel,
       serializers: {
@@ -78,6 +83,9 @@ export async function createServer() {
         : true,
   });
   await server.register(helmet, {
+    // No global CSP: this is a JSON API (a CSP is meaningless there) and the
+    // HTML the backend does serve — the share pages in routes/linkPreview.ts —
+    // sets its own strict policy per response.
     contentSecurityPolicy: false,
     crossOriginResourcePolicy: { policy: "cross-origin" },
   });

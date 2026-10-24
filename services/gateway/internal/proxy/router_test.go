@@ -15,7 +15,7 @@ func TestRouter_StripAPIPrefix(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	router := NewRouter(backend.URL)
+	router := NewRouter(backend.URL, nil)
 	handler := router.Handler()
 
 	tests := []struct {
@@ -48,7 +48,7 @@ func TestRouter_PreservesHeaders(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	router := NewRouter(backend.URL)
+	router := NewRouter(backend.URL, nil)
 	handler := router.Handler()
 
 	req := httptest.NewRequest("GET", "http://gateway/api/spaces", nil)
@@ -73,7 +73,7 @@ func TestRouter_StripsCORSFromBackend(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	router := NewRouter(backend.URL)
+	router := NewRouter(backend.URL, nil)
 	handler := router.Handler()
 
 	req := httptest.NewRequest("GET", "http://gateway/api/spaces", nil)
@@ -107,7 +107,7 @@ func TestNewBlossomHandler_ForwardsTokenQueryOnGetAndHead(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	handler := NewBlossomHandler(backend.URL)
+	handler := NewBlossomHandler(backend.URL, nil)
 	hash := "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 	grant := "v1." + hash + ".1790000000." + hash
 	tests := []struct {
@@ -141,7 +141,7 @@ func TestNewBlossomHandler_PassesPathThrough(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	handler := NewBlossomHandler(backend.URL)
+	handler := NewBlossomHandler(backend.URL, nil)
 
 	hash := "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 	req := httptest.NewRequest("GET", "http://gateway/"+hash+".mp3", nil)
@@ -188,7 +188,7 @@ func TestRouter_PreservesEncodedSlash(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	handler := NewRouter(backend.URL).Handler()
+	handler := NewRouter(backend.URL, nil).Handler()
 	pk := "56f03c035bf7d75b1120f2e0688a76ae3cd8e027d31b97ea97e171b3d33be4c5"
 
 	tests := []struct {
@@ -226,7 +226,7 @@ func TestRouter_EncodedSlashThroughServeMux(t *testing.T) {
 	defer backend.Close()
 
 	mux := http.NewServeMux()
-	mux.Handle("/api/", NewRouter(backend.URL).Handler())
+	mux.Handle("/api/", NewRouter(backend.URL, nil).Handler())
 	gw := httptest.NewServer(mux)
 	defer gw.Close()
 
@@ -253,7 +253,7 @@ func TestNewBlossomHandler_PreservesEncoding(t *testing.T) {
 	defer backend.Close()
 
 	req := httptest.NewRequest("GET", "http://gateway/list/a%2Fb", nil)
-	NewBlossomHandler(backend.URL).ServeHTTP(httptest.NewRecorder(), req)
+	NewBlossomHandler(backend.URL, nil).ServeHTTP(httptest.NewRecorder(), req)
 	if gotURI != "/list/a%2Fb" {
 		t.Errorf("backend request URI %q, want /list/a%%2Fb", gotURI)
 	}
