@@ -124,6 +124,70 @@ async fn store_and_broadcast_if_ok(
     }
 }
 
+/// The `OK false` a restricted (hosted_only) relay answers to a write that is
+/// not for a group it hosts.
+fn hosted_only_rejection(event: &Event) -> String {
+    format!(
+        r#"["OK","{}",false,"restricted: this relay only accepts events for groups it hosts"]"#,
+        event.id
+    )
+}
+
+/// Does any of these ids name a group this relay hosts? A lookup error counts
+/// as "no" (fail closed).
+async fn names_hosted_group(state: &AppState, h_tags: &[String]) -> bool {
+    for h in h_tags {
+        if state.pool.group_exists(h).await.unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// hosted_only policy for a kind 5: accepted only when at least one `e`
+/// target is an event this relay holds AND the sender authored, or when an
+/// own `a` target names an address this relay holds. Naming a hosted group
+/// in `h` is not enough — a deletion of nothing is still free storage.
+async fn hosted_deletion_allowed(state: &AppState, event: &Event) -> bool {
+    let mut checked = 0usize;
+    for tag in &event.tags {
+        if checked >= crate::nostr::nip29::moderation::MAX_DELETION_TARGETS {
+            break;
+        }
+        match (tag.first().map(String::as_str), tag.get(1)) {
+            (Some("e"), Some(id)) => {
+                checked += 1;
+                if let Ok(Some(target)) = state.pool.get_event_by_id(id).await {
+                    if target.pubkey == event.pubkey {
+                        return true;
+                    }
+                }
+            }
+            (Some("a"), Some(addr)) => {
+                checked += 1;
+                let parts: Vec<&str> = addr.splitn(3, ':').collect();
+                if parts.len() == 3 && parts[1] == event.pubkey {
+                    if let Ok(kind) = parts[0].parse::<i32>() {
+                        let filter = Filter {
+                            authors: vec![event.pubkey.clone()],
+                            kinds: vec![kind],
+                            d_tags: vec![parts[2].to_string()],
+                            limit: Some(1),
+                            ..Filter::default()
+                        };
+                        let ctx = ReadCtx::plain(Some(&event.pubkey));
+                        if matches!(state.pool.query_events_ctx(&filter, &ctx).await, Ok(v) if !v.is_empty()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 async fn handle_event(
     msg: serde_json::Value,
     state: &Arc<AppState>,
@@ -292,6 +356,14 @@ async fn handle_event(
             return result;
         }
         5 => {
+            // SECURITY (audit 2026-10): on a restricted relay a kind 5 is
+            // only accepted when it deletes something this relay holds for
+            // the sender — otherwise a stranger could store unlimited "deletions"
+            // of ids that never existed here (the general hosted-only guard
+            // below never ran for kind 5).
+            if state.hosted_only && !hosted_deletion_allowed(state, &event).await {
+                return vec![hosted_only_rejection(&event)];
+            }
             let result = match crate::nostr::nip29::moderation::handle_deletion(&state.pool, &event).await {
                 Ok(outcome) => outcome.frames,
                 Err(e) => vec![format!(r#"["OK","{}",false,"error: {e}"]"#, event.id)],
@@ -324,6 +396,18 @@ async fn handle_event(
         }
         9022 => {
             let group_id = event.get_tag_value("h");
+            // SECURITY (audit 2026-10): on a restricted relay only a current
+            // member of a hosted group has a leave to record; anything else
+            // was a free stored event for a stranger.
+            if state.hosted_only {
+                let is_member = match &group_id {
+                    Some(gid) => state.pool.group_has_member(gid, &event.pubkey).await.unwrap_or(false),
+                    None => false,
+                };
+                if !is_member {
+                    return vec![hosted_only_rejection(&event)];
+                }
+            }
             let result = crate::nostr::nip29::membership::handle_leave(&state.pool, &event)
                 .await
                 .unwrap_or_else(|e| vec![format!(r#"["OK","{}",false,"error: {e}"]"#, event.id)]);
@@ -360,20 +444,8 @@ async fn handle_event(
     // NIP-29 groups it hosts. Reject any regular event that isn't h-tagged to an
     // existing group (any of its h tags will do), so a stranger can't fill the
     // host's disk with arbitrary events (open-relay abuse).
-    if state.hosted_only {
-        let mut hosts_group = false;
-        for h in &h_tags {
-            if state.pool.group_exists(h).await.unwrap_or(false) {
-                hosts_group = true;
-                break;
-            }
-        }
-        if !hosts_group {
-            return vec![format!(
-                r#"["OK","{}",false,"restricted: this relay only accepts events for groups it hosts"]"#,
-                event.id
-            )];
-        }
+    if state.hosted_only && !names_hosted_group(state, &h_tags).await {
+        return vec![hosted_only_rejection(&event)];
     }
 
     // Publish-side membership gate. NIP-29 management kinds matched above and

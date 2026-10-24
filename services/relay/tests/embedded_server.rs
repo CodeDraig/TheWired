@@ -464,6 +464,80 @@ async fn embedded_relay_refuses_republish_of_deleted_event() {
     relay.stop().await;
 }
 
+/// Security audit 2026-10: the hosted_only write policy ("only content for
+/// groups this relay hosts") was bypassed by two management kinds that were
+/// answered `OK true` and stored before the policy ran: a kind 5 naming ids the
+/// relay never saw, and a kind 9022 naming any `h` at all. Each was free disk
+/// for a stranger on a publicly tunneled personal relay.
+#[tokio::test]
+async fn embedded_relay_hosted_only_policy_covers_deletions_and_leaves() {
+    let owner = TestIdentity::from_seed(7);
+    let stranger = TestIdentity::from_seed(8);
+    let pool = sqlite::connect_memory().await.unwrap();
+    let relay = server::run_embedded(Db::Sqlite(pool.clone()), 0, "t".into(), None, Some(owner.pubkey.clone()), false)
+        .await
+        .unwrap();
+    let (ws, _) = connect_async(relay.ws_url()).await.unwrap();
+    let (mut tx, mut rx) = ws.split();
+    assert!(read_until(&mut rx, "AUTH").await.is_some());
+
+    // Owner hosts a group and posts in it.
+    let create = sign_event(&owner, 9007, vec![vec!["h".into(), "g".into()]], "G", 1_700_000_000);
+    tx.send(event_frame(&create)).await.unwrap();
+    assert_eq!(read_until(&mut rx, "OK").await.unwrap()[2], true);
+    let chat = sign_event(&owner, 9, vec![vec!["h".into(), "g".into()]], "hi", 1_700_000_001);
+    tx.send(event_frame(&chat)).await.unwrap();
+    assert_eq!(read_until(&mut rx, "OK").await.unwrap()[2], true);
+    let baseline = sqlite::count_events(&pool).await.unwrap();
+
+    async fn send<S, R>(tx: &mut S, rx: &mut R, ev: &thewired_relay::nostr::event::Event) -> serde_json::Value
+    where
+        S: futures::Sink<Message> + Unpin,
+        S::Error: std::fmt::Debug,
+        R: Stream<Item = Result<Message, WsError>> + Unpin,
+    {
+        tx.send(event_frame(ev)).await.unwrap();
+        read_until(rx, "OK").await.unwrap()
+    }
+
+    // Stranger: kind 5 naming ids this relay never saw → refused, not stored.
+    let junk_del = sign_event(&stranger, 5, vec![vec!["e".into(), "ab".repeat(32)]], "", 1_700_000_010);
+    let ok = send(&mut tx, &mut rx, &junk_del).await;
+    assert_eq!(ok[2], false, "stranger kind 5 must be refused: {ok}");
+    // Stranger: kind 5 that merely NAMES the hosted group but deletes nothing of theirs.
+    let tagged_del = sign_event(
+        &stranger,
+        5,
+        vec![vec!["e".into(), chat.id.clone()], vec!["h".into(), "g".into()]],
+        "",
+        1_700_000_011,
+    );
+    let ok = send(&mut tx, &mut rx, &tagged_del).await;
+    assert_eq!(ok[2], false, "stranger kind 5 h-tagged to a hosted group must be refused: {ok}");
+    assert!(sqlite::get_event_by_id(&pool, &chat.id).await.unwrap().is_some(), "owner's message untouched");
+    // Stranger: 9022 leave for an unknown group, and for a hosted group they are not in.
+    for gid in ["nope", "g"] {
+        let leave = sign_event(&stranger, 9022, vec![vec!["h".into(), gid.into()]], "", 1_700_000_012);
+        let ok = send(&mut tx, &mut rx, &leave).await;
+        assert_eq!(ok[2], false, "stranger 9022 for {gid:?} must be refused: {ok}");
+    }
+    assert_eq!(sqlite::count_events(&pool).await.unwrap(), baseline, "nothing of the stranger's was stored");
+
+    // Legitimate paths still work: the owner deletes their own hosted message,
+    // and a real member leaves.
+    let own_del = sign_event(&owner, 5, vec![vec!["e".into(), chat.id.clone()]], "", 1_700_000_020);
+    let ok = send(&mut tx, &mut rx, &own_del).await;
+    assert_eq!(ok[2], true, "owner deleting own message: {ok}");
+    assert!(sqlite::get_event_by_id(&pool, &chat.id).await.unwrap().is_none());
+    let join = sign_event(&stranger, 9021, vec![vec!["h".into(), "g".into()]], "", 1_700_000_021);
+    assert_eq!(send(&mut tx, &mut rx, &join).await[2], true, "open group join");
+    let leave = sign_event(&stranger, 9022, vec![vec!["h".into(), "g".into()]], "", 1_700_000_022);
+    let ok = send(&mut tx, &mut rx, &leave).await;
+    assert_eq!(ok[2], true, "a member may leave: {ok}");
+
+    relay.stop().await;
+}
+
 /// Security audit 2026-10: on the embedded relay the owner-only 9007 path keeps
 /// working for NEW ids, but a second 9007 for an id the relay already hosts is
 /// refused and changes nothing — not even when it comes from the owner and
