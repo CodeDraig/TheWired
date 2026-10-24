@@ -59,8 +59,12 @@ async fn maybe_refresh_memberships(
     }
 }
 
-/// Maximum incoming WebSocket message size (128 KiB)
-const MAX_MESSAGE_SIZE: usize = 128 * 1024;
+/// Maximum incoming WebSocket message size (128 KiB). Enforced at the upgrade
+/// (`server.rs`: tungstenite message AND frame cap, so an oversized frame is
+/// refused before it is buffered — the library default was 64 MiB per
+/// message, security audit 2026-10) and re-checked here. Advertised as NIP-11
+/// `max_message_length`.
+pub(crate) const MAX_MESSAGE_SIZE: usize = 128 * 1024;
 
 /// Has a socket gone quiet for longer than the configured idle timeout? A zero
 /// timeout disables the check. Any inbound frame (text, pong, even a client
@@ -258,6 +262,14 @@ pub async fn handle_connection(
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
+                    // A transport-level error (a frame over the size cap, a
+                    // protocol violation): the stream is unusable, so end the
+                    // connection rather than spin on repeated errors.
+                    Some(Err(e)) => {
+                        tracing::debug!(remote = %addr, error = %e, "WebSocket error; closing");
+                        let _ = sender.send(Message::Close(None)).await;
+                        break;
+                    }
                     _ => {}
                 }
             }

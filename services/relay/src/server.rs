@@ -466,6 +466,13 @@ async fn root_handler(
             let broadcast_rx = state.broadcast_tx.subscribe();
             tracing::debug!(remote = %addr, "WebSocket upgrade");
             let resp: Response = ws
+                // Cap what tungstenite will buffer for one message / one frame
+                // at the advertised limit. Without this the library defaults
+                // (64 MiB message, 16 MiB frame) applied and the 128 KiB check
+                // in the connection loop ran only after the whole frame was in
+                // memory (security audit 2026-10).
+                .max_message_size(connection::MAX_MESSAGE_SIZE)
+                .max_frame_size(connection::MAX_MESSAGE_SIZE)
                 .on_upgrade(move |socket| {
                     connection::handle_connection(socket, state, broadcast_rx, addr, client_ip)
                 })
