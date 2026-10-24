@@ -5,6 +5,7 @@ import { blobFallbackCandidates, decryptDMFile, parseBlobUrl } from "@ishtarserv
 import type { DMFileMeta } from "@ishtarservices/shared-types";
 import { ownBlossomOrigin } from "@/lib/api/blossom";
 import { fetchAuthorServers } from "@/lib/media/authorServers";
+import { isUnsafeHost } from "@/lib/security/ssrfGuard";
 
 /** Tauri's HTTP plugin bypasses CORS in the desktop app; the plain browser
  *  preview has no `invoke` bridge, so fall back to window.fetch there. */
@@ -31,10 +32,31 @@ type LoadState =
 
 const objectUrlCache = new Map<string, string>();
 
+/**
+ * May an attachment be fetched from this URL? The URL (and its fallbacks, and
+ * the sender's kind-10063 servers) is chosen by the sender, and on desktop the
+ * download goes through the Tauri HTTP plugin — no CORS, no CSP — so a friend
+ * must not be able to point the app at loopback / private / link-local hosts.
+ * Only public http(s) qualifies; the app's own API origin (loopback in dev) is
+ * the one exception.
+ */
+export function isAllowedAttachmentUrl(url: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+  if (u.origin === ownBlossomOrigin()) return true;
+  return !isUnsafeHost(u.hostname);
+}
+
 /** Download one candidate and decrypt it. `decryptDMFile` checks
  *  sha256(ciphertext) against `x` first, so a fallback server can't swap the
  *  bytes (docs/MEDIA_STORAGE.md §5). */
 async function downloadAndDecrypt(url: string, meta: DMFileMeta): Promise<Uint8Array> {
+  if (!isAllowedAttachmentUrl(url)) throw new Error("attachment host not allowed");
   const res = await httpFetch(url, { method: "GET" });
   if (!res.ok) throw new Error(`download failed (${res.status})`);
   return decryptDMFile(new Uint8Array(await res.arrayBuffer()), meta);
