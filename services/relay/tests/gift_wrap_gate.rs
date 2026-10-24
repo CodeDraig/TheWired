@@ -299,3 +299,46 @@ async fn negentropy_for_wraps_requires_auth() {
     assert_eq!(frame_type(&frames[0]), "NEG-ERR");
     assert!(frames[0][2].as_str().unwrap().contains("auth-required"), "{frames:?}");
 }
+
+/// Security audit 2026-10 (RUSTSEC-2026-0365, negentropy < 0.5.2): an IdList
+/// frame whose peer-supplied count (here 2^34) exceeds the ids actually
+/// present made the responder reserve room for all of them up front — a
+/// failed terabyte allocation that aborted the whole relay process. The relay
+/// must answer such a frame with NEG-ERR and stay up, for both the initial
+/// NEG-OPEN message and a follow-up NEG-MSG on an open session.
+#[tokio::test]
+async fn negentropy_rejects_oversized_id_list_count_without_allocating() {
+    let pool = match setup_test_pool().await { Ok(p) => p, Err(e) => { eprintln!("skip: {e}"); return; } };
+    let (state, tx) = make_app_state_with(pool, |_| {});
+    let alice = TestIdentity::from_seed(1);
+    let mut conn = Conn::new(None);
+    conn.send(&state, &tx, &format!(r#"["EVENT",{}]"#, serde_json::to_string(&sign_event(&alice, 1, vec![], "x", 100)).unwrap())).await;
+
+    // version, infinite upper bound, IdList mode, count = 2^34, no ids follow.
+    // Where the OS overcommits (macOS) the 512 GiB reservation "succeeds" and
+    // the frame instead stalls the handler for seconds, so the budget below is
+    // part of the assertion: the frame must be refused before any allocation.
+    // (The reconcile is synchronous, so a timeout future could not preempt it;
+    // measure wall-clock instead.)
+    let hostile = hex::encode([0x61, 0x00, 0x00, 0x02, 0xc0, 0x80, 0x80, 0x80, 0x00]);
+    let started = std::time::Instant::now();
+    let frames = conn
+        .send(&state, &tx, &format!(r#"["NEG-OPEN","n1",{{"kinds":[1]}},"{hostile}"]"#))
+        .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "hostile NEG-OPEN must be refused before any allocation (took {:?})",
+        started.elapsed()
+    );
+    assert_eq!(frame_type(&frames[0]), "NEG-ERR", "{frames:?}");
+    assert!(frames[0][2].as_str().unwrap().starts_with("error:"), "{frames:?}");
+
+    // A well-formed open still works afterwards, and the same hostile frame
+    // on the open session is also refused without taking the session down.
+    let frames = conn.send(&state, &tx, r#"["NEG-OPEN","n2",{"kinds":[1]},"61"]"#).await;
+    assert_eq!(frame_type(&frames[0]), "NEG-MSG", "{frames:?}");
+    let frames = conn.send(&state, &tx, &format!(r#"["NEG-MSG","n2","{hostile}"]"#)).await;
+    assert_eq!(frame_type(&frames[0]), "NEG-ERR", "{frames:?}");
+    let frames = conn.send(&state, &tx, r#"["NEG-MSG","n2","61"]"#).await;
+    assert_eq!(frame_type(&frames[0]), "NEG-MSG", "session survives a hostile frame: {frames:?}");
+}
