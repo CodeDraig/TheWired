@@ -153,6 +153,8 @@ services:
       REDIS_URL: redis://redis:6379
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       GATEWAY_SHARED_SECRET: ${GATEWAY_SHARED_SECRET:-}
+      # NIP-98 payload tag on body-bearing /api requests: off | warn | enforce
+      NIP98_REQUIRE_PAYLOAD: ${NIP98_REQUIRE_PAYLOAD:-off}
     depends_on:
       backend:
         condition: service_started

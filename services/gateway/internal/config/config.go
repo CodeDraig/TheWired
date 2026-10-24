@@ -38,6 +38,10 @@ type Config struct {
 	// X-Gateway-Auth HMAC (internal/gatewayauth). Empty = header not sent; the
 	// backend's GATEWAY_AUTH_MODE decides whether it is required.
 	GatewaySharedSecret string
+
+	// NIP-98 `payload` tag requirement on body-bearing /api requests:
+	// off (verify-if-present, default) | warn | enforce (401 PAYLOAD_REQUIRED).
+	NIP98RequirePayload string
 }
 
 func Load() *Config {
@@ -78,6 +82,7 @@ func Load() *Config {
 		AuthFailPerMin:    getEnvInt("RATE_LIMIT_AUTH_FAIL_PER_MIN", 60),
 
 		GatewaySharedSecret: os.Getenv("GATEWAY_SHARED_SECRET"),
+		NIP98RequirePayload: strings.ToLower(getEnv("NIP98_REQUIRE_PAYLOAD", "off")),
 	}
 }
 

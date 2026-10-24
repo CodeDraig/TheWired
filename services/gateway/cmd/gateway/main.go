@@ -98,7 +98,11 @@ func main() {
 		gmiddleware.LoggingMiddleware(
 			cors.CORSMiddleware(cfg.AllowedOrigins)(
 				authFail.Middleware(
-					auth.NIP98MiddlewareWithReplay(replay,
+					auth.NIP98MiddlewareWithOptions(auth.Options{
+						Replay:           replay,
+						ReplayFailClosed: !failOpen,
+						PayloadMode:      cfg.NIP98RequirePayload,
+					},
 						ratelimit.RateLimitMiddleware(limiter, failOpen,
 							router.Handler(),
 						),
