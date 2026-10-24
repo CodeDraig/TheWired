@@ -142,7 +142,7 @@ async fn wraps_served_only_to_authenticated_recipient_or_ingest() {
 
     // The ingest role reads every wrap (metadata only — content is opaque).
     let mut as_backend = Conn::new(Some(&backend.pubkey));
-    let all = format!(r#"["REQ","s2",{{"kinds":[1059]}}]"#);
+    let all = r#"["REQ","s2",{"kinds":[1059]}]"#.to_string();
     assert_eq!(event_ids(&as_backend.send(&state, &tx, &all).await), vec![wrap.id.clone()]);
 }
 

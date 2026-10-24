@@ -386,7 +386,7 @@ pub fn sign_event(
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     let hash = hasher.finalize();
-    let id = hex::encode(&hash);
+    let id = hex::encode(hash);
 
     let sig = secp.sign_schnorr_no_aux_rand(&hash, &identity.keypair);
 

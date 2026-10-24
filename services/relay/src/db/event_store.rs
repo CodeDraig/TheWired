@@ -16,12 +16,12 @@ const MAX_QUERY_LIMIT: i64 = 500;
 
 /// Replaceable event kinds: only one event per pubkey+kind (NIP-01)
 fn is_replaceable(kind: i32) -> bool {
-    kind == 0 || kind == 3 || (kind >= 10000 && kind < 20000)
+    kind == 0 || kind == 3 || (10000..20000).contains(&kind)
 }
 
 /// Addressable event kinds: only one event per pubkey+kind+d_tag (NIP-01)
 fn is_addressable(kind: i32) -> bool {
-    kind >= 30000 && kind < 40000
+    (30000..40000).contains(&kind)
 }
 
 /// Store an event in the database.

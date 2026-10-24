@@ -76,10 +76,10 @@ pub async fn handle_deletion(db: &Db, event: &Event) -> anyhow::Result<Vec<Strin
             if let Some(target_id) = tag.get(1) {
                 // Verify the target event is authored by the deletion sender
                 if let Ok(Some(target)) = db.get_event_by_id(target_id).await {
-                    if target.pubkey == event.pubkey {
-                        if db.delete_event(target_id).await.unwrap_or(false) {
-                            deleted += 1;
-                        }
+                    if target.pubkey == event.pubkey
+                        && db.delete_event(target_id).await.unwrap_or(false)
+                    {
+                        deleted += 1;
                     }
                 }
             }

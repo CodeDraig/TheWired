@@ -9,6 +9,7 @@
 //!     refuses their writes, except a NIP-09 deletion (kind 5) or a NIP-62
 //!     request to vanish (kind 62): a suspended account may still take its own
 //!     content down.
+//!
 //! A lifted suspension / restored tombstone keeps its row with `lifted_at` /
 //! `restored_at` set, so both actions stay reversible and on record.
 //!
