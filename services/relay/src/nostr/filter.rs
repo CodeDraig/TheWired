@@ -17,6 +17,11 @@ pub struct Filter {
     /// Any other single-letter `#x` tag filter (NIP-01) → its allowed values.
     /// Previously dropped, returning over-broad results (#69).
     pub generic_tags: Vec<(String, Vec<String>)>,
+    /// Relay-internal, never read from the wire: only rows the relay first
+    /// stored at or after this unix time. The lag resync uses it to re-run a
+    /// subscription over exactly the window the connection missed, by server
+    /// receipt time — which a NIP-59 backdated `created_at` cannot escape.
+    pub first_seen_since: Option<i64>,
 }
 
 /// Intermediate shape for deserialization: the known fields are named, everything
@@ -81,6 +86,7 @@ impl<'de> Deserialize<'de> for Filter {
             e_tags: raw.e_tags,
             d_tags: raw.d_tags,
             generic_tags,
+            first_seen_since: None,
         })
     }
 }

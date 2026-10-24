@@ -37,6 +37,11 @@ pub struct AppState {
     pub owner_pubkey: Option<String>,
     /// Live connections per client IP (per-IP cap, `RELAY_MAX_CONNS_PER_IP`).
     pub ip_conns: std::sync::Mutex<HashMap<IpAddr, usize>>,
+    /// Last connect time per client IP, for the rate limiter's cold-start
+    /// allowance: granted only to the first connection an IP opens within a
+    /// rate window, so a reconnect loop cannot mint a fresh allowance per
+    /// socket. Entries older than a window are pruned on every connect.
+    pub ip_last_connect: std::sync::Mutex<HashMap<IpAddr, std::time::Instant>>,
     /// Counters surfaced in logs and `/health`: connections whose broadcast
     /// receiver lagged, live events skipped by lag (then resynced from
     /// storage), and frames refused by the per-connection rate limiter.
@@ -128,6 +133,7 @@ pub async fn run(config: Config, pool: Db) -> anyhow::Result<()> {
         hosted_only: false,
         owner_pubkey: None,
         ip_conns: std::sync::Mutex::new(HashMap::new()),
+        ip_last_connect: std::sync::Mutex::new(HashMap::new()),
         metrics: Metrics::default(),
     });
 
@@ -271,6 +277,7 @@ pub async fn run_embedded(
         hosted_only: true,
         owner_pubkey,
         ip_conns: std::sync::Mutex::new(HashMap::new()),
+        ip_last_connect: std::sync::Mutex::new(HashMap::new()),
         metrics: Metrics::default(),
     });
 
