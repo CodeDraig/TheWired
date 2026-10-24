@@ -174,40 +174,30 @@ impl TunnelStatus {
     }
 }
 
-/// Scan `PATH` for an executable.
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// Resolve a usable `cloudflared`: the managed (downloaded) copy, then a
-/// user-installed one (`~/.local/bin`, `PATH`), and finally download-on-enable
-/// if none is present. So users never have to install it themselves.
+/// Resolve a usable `cloudflared`: the managed copy (pinned release, checksum
+/// and — on macOS — Cloudflare signature verified; see cloudflared.rs) if it is
+/// installed, otherwise download-and-verify it. Only when that is impossible
+/// (offline, GitHub unreachable) fall back to a user-installed binary on `PATH`,
+/// so an unverified copy is never preferred over the verified one.
 async fn resolve_cloudflared(app: &AppHandle) -> Result<PathBuf, String> {
+    use crate::cloudflared::{ensure, path_dirs, resolution_plan, Resolution};
     let base = crate::relay::base_dir(app)?;
-    let bin_name = if cfg!(windows) { "cloudflared.exe" } else { "cloudflared" };
-
-    let managed = crate::cloudflared::binary_path(&base);
-    if managed.is_file() {
-        return Ok(managed);
+    match resolution_plan(&base, &path_dirs()) {
+        Resolution::Managed(p) => Ok(p),
+        Resolution::DownloadThenFallback(fallback) => match ensure(&base).await {
+            Ok(p) => Ok(p),
+            Err(e) => match fallback {
+                Some(p) => {
+                    log::warn!(
+                        "managed cloudflared unavailable ({e}); using the user-installed copy at {}",
+                        p.display()
+                    );
+                    Ok(p)
+                }
+                None => Err(e),
+            },
+        },
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = PathBuf::from(home).join(".local").join("bin").join(bin_name);
-        if p.is_file() {
-            return Ok(p);
-        }
-    }
-    if let Some(p) = find_on_path(bin_name) {
-        return Ok(p);
-    }
-    // Not installed anywhere — fetch it (Cloudflare-signed; see cloudflared.rs).
-    crate::cloudflared::ensure(&base).await
 }
 
 /// Extract a `https://<sub>.trycloudflare.com` URL from a cloudflared log line.
