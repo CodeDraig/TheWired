@@ -170,6 +170,22 @@ ${renderActions(platform, deepLink)}
 `;
 }
 
+/** The share page embeds user-supplied titles, descriptions and image URLs
+ *  (HTML-escaped above). This policy is the second wall: no scripts at all, no
+ *  framing, no form posts or base-URL games; the only remote fetch a page may
+ *  make is the http(s) cover/avatar image, and the inline <style> block is the
+ *  only stylesheet. helmet's global CSP is off (JSON API), so it is set here. */
+export const SHARE_PAGE_CSP = [
+  "default-src 'none'",
+  "script-src 'none'",
+  "style-src 'unsafe-inline'",
+  "img-src https: http:",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+].join("; ");
+
 function sendPreview(
   request: import("fastify").FastifyRequest,
   reply: import("fastify").FastifyReply,
@@ -177,6 +193,7 @@ function sendPreview(
 ) {
   return reply
     .header("Content-Type", "text/html; charset=utf-8")
+    .header("Content-Security-Policy", SHARE_PAGE_CSP)
     .header("Cache-Control", "public, max-age=300")
     .header("Vary", "User-Agent")
     .send(renderPreviewPage(meta, platformFromUserAgent(request.headers["user-agent"])));

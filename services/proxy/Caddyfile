@@ -1,15 +1,55 @@
-api.thewired.app {
-	reverse_proxy gateway:9080
+{
+	# No admin API: nothing on the host or the Docker network should be able to
+	# reload this config at runtime (localhost:2019 is the default otherwise).
+	admin off
 }
 
+# Browser-facing response headers for every public host. `defer` applies them
+# after the upstream answered, so an upstream value (helmet's X-Frame-Options
+# SAMEORIGIN on the backend) is replaced rather than duplicated.
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "DENY"
+		-Server
+		defer
+	}
+}
+
+api.thewired.app {
+	import security_headers
+
+	# Multipart uploads stream files up to the backend's MAX_BLOB_SIZE; every
+	# other API request is small JSON and gets a hard body cap at the edge
+	# (the gateway applies the same cap with a 413, this stops the bytes sooner).
+	@upload {
+		path /upload /api/music/upload /api/music/upload/cover
+	}
+	handle @upload {
+		reverse_proxy gateway:9080
+	}
+	handle {
+		request_body {
+			max_size 2MB
+		}
+		reverse_proxy gateway:9080
+	}
+}
+
+# WebSocket hosts: no header snippet — the relay and LiveKit speak to native
+# clients, and an HSTS/X-Frame-Options surprise there buys nothing.
 relay.thewired.app {
 	reverse_proxy relay:7777
 }
 livekit.thewired.app {
-    reverse_proxy livekit:7880
+	reverse_proxy livekit:7880
 }
 
 thewired.app {
+	import security_headers
+
 	# The handles below reach the backend directly, not through the gateway. Only
 	# the gateway may set these (after NIP-98 verification), so strip any a
 	# client sends — the backend reads X-Auth-Pubkey as the caller's identity.
@@ -33,12 +73,23 @@ thewired.app {
 	}
 
 	# Server-rendered OG share pages for every path soot claims as a universal
-	# link (backend routes/wellKnown.ts). With the app installed these open
-	# in-app; without it the visitor gets a "get soot" page, never a 404.
-	# Read-only: the API lives on api.thewired.app, behind the gateway.
+	# link (backend routes/wellKnown.ts, pages in routes/linkPreview.ts). With
+	# the app installed these open in-app; without it the visitor gets a "get
+	# soot" page, never a 404. Read-only: the API lives on api.thewired.app,
+	# behind the gateway.
+	#
+	# The matcher names the exact page shapes, because the backend mounts the
+	# real music API under the same /music prefix: a bare `path /music/*` let
+	# GET /music/browse, /music/tags/popular, /music/variants/<sha> and
+	# /music/access/<pubkey>/<slug> through here, anonymously and with no
+	# gateway rate limit. Shapes:
+	#   /music/{track|album|playlist}/<64-hex pubkey>/<slug>   (one segment)
+	#   /profile/<64-hex pubkey>
+	#   /space/<id>[/…]           id: letters, digits, _ -
+	#   /note/… /article/… /dm/… /invite/…
 	@share {
-		path /music/* /profile/* /space/* /note/* /article/* /dm/* /invite/*
 		method GET HEAD
+		path_regexp share ^/(?:music/(?:track|album|playlist)/[0-9a-f]{64}/[^/]+|profile/[0-9a-f]{64}|space/[A-Za-z0-9_-]+(?:/.*)?|(?:note|article|dm|invite)/.+)$
 	}
 	handle @share {
 		reverse_proxy backend:3002
@@ -65,6 +116,7 @@ thewired.app {
 # generated from the app's own text) — the soot paths redirect there, so the
 # App Store privacy and support URLs can sit on the app's domain.
 soot.win {
+	import security_headers
 	redir /privacy https://thewired.app/privacy
 	redir /terms https://thewired.app/terms
 	redir /community-guidelines https://thewired.app/community-guidelines
