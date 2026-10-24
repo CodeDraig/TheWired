@@ -57,6 +57,10 @@ pub struct Config {
     /// (`RecvError::Lagged`) and is resynced from storage.
     /// `RELAY_BROADCAST_CAPACITY` (4096).
     pub broadcast_capacity: usize,
+    /// A connection that lags again within this many seconds of a resync is
+    /// closed (1013) instead of resynced a second time.
+    /// `RELAY_RESYNC_COOLDOWN_SECS` (10).
+    pub resync_cooldown_secs: u64,
 }
 
 impl Default for Config {
@@ -80,6 +84,7 @@ impl Default for Config {
             ws_ping_interval_secs: 30,
             ws_idle_timeout_secs: 90,
             broadcast_capacity: 4096,
+            resync_cooldown_secs: 10,
         }
     }
 }
@@ -134,6 +139,7 @@ impl Config {
             ws_ping_interval_secs: env_or("RELAY_WS_PING_SECS", d.ws_ping_interval_secs),
             ws_idle_timeout_secs: env_or("RELAY_WS_IDLE_TIMEOUT_SECS", d.ws_idle_timeout_secs),
             broadcast_capacity: env_or("RELAY_BROADCAST_CAPACITY", d.broadcast_capacity).max(1),
+            resync_cooldown_secs: env_or("RELAY_RESYNC_COOLDOWN_SECS", d.resync_cooldown_secs),
         }
     }
 

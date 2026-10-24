@@ -195,6 +195,14 @@ fn build_conditions(filter: &Filter, ctx: &ReadCtx<'_>) -> (Vec<String>, Vec<Bin
         binds.push(BindValue::Int64(until));
     }
 
+    // first_seen_since (relay-internal, lag resync): rows stored at or after
+    // this server time, whatever their `created_at`.
+    if let Some(first_seen_since) = filter.first_seen_since {
+        param_counter += 1;
+        conditions.push(format!("first_seen >= to_timestamp(${param_counter})"));
+        binds.push(BindValue::Int64(first_seen_since));
+    }
+
     // h_tags: array overlap against the indexed `h_tags` column, so a `#h`
     // filter matches an event whose SECOND (or later) h tag is the filtered id.
     if !filter.h_tags.is_empty() {

@@ -102,40 +102,81 @@ pub fn frame_type(text: &str) -> Option<&str> {
     (!t.is_empty() && !t.contains('\\')).then_some(t)
 }
 
+/// AUTH frames a not-yet-authenticated connection may send uncounted. A real
+/// client needs one, maybe a retry while its signer wakes; past this the
+/// frames count like any other, so a flood of (cheaply rejected) AUTHs still
+/// pays its way.
+pub const FREE_AUTH_FRAMES: u32 = 8;
+
 /// Which inbound frames count toward the per-connection rate budget. Frames
-/// that cost the relay a write or a query (EVENT, REQ, NEG-OPEN) and anything
-/// unparseable count. AUTH, CLOSE, NEG-MSG and NEG-CLOSE do not: AUTH is what
-/// a client needs to *read* at all, and the others only free resources, so
-/// refusing them can never relieve pressure — it only made clients lose their
-/// inbox after a cold-start burst.
-pub fn counts_toward_rate_limit(frame_type: Option<&str>) -> bool {
-    !matches!(frame_type, Some("AUTH" | "CLOSE" | "NEG-MSG" | "NEG-CLOSE"))
+/// that cost the relay a write or a query (EVENT, REQ, NEG-OPEN), a NEG-MSG
+/// (a reconciliation round over up to 20 000 ids) and anything unparseable
+/// count. CLOSE and NEG-CLOSE do not — they only free resources, so refusing
+/// them can never relieve pressure. AUTH is exempt only while `auth_exempt`:
+/// the connection is not yet authenticated (it needs AUTH to *read* at all)
+/// and has not used its [`FREE_AUTH_FRAMES`]. Once authenticated, every AUTH
+/// is a Schnorr verify plus a membership query against a challenge that is
+/// constant for the connection, so a replayed one must count.
+pub fn counts_toward_rate_limit(frame_type: Option<&str>, auth_exempt: bool) -> bool {
+    match frame_type {
+        Some("CLOSE" | "NEG-CLOSE") => false,
+        Some("AUTH") => !auth_exempt,
+        _ => true,
+    }
 }
 
 /// The machine-readable prefix of every rate-limit answer (OK / CLOSED /
 /// NEG-ERR / NOTICE). Clients treat it as retryable with backoff.
 pub const RATE_LIMITED: &str = "rate-limited: slow down";
 
+/// What a refused frame gets: the answer frame, and for a REQ the sub id the
+/// client was just told is CLOSED — an earlier subscription under that id
+/// must stop streaming too, or the client hears "closed" while events keep
+/// arriving.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub reply: String,
+    pub closed_sub: Option<String>,
+}
+
 /// The answer for a counted frame the limiter refused — the frame is NOT
 /// processed, but the client is told so it can retry instead of timing out:
 /// `["OK", id, false, "rate-limited: …"]` for an EVENT (the wrap was not
 /// stored), `["CLOSED", sub, "rate-limited: …"]` for a REQ (the subscription
-/// was not registered), `["NEG-ERR", sub, "rate-limited: …"]` for a NEG-OPEN.
-/// `None` when the frame has nothing to answer to (the per-window NOTICE is
-/// all it gets).
-pub fn rate_limited_reply(text: &str) -> Option<String> {
+/// was not registered), `["NEG-ERR", sub, "rate-limited: …"]` for a NEG-OPEN
+/// or NEG-MSG. `None` when the frame has nothing to answer to (the per-window
+/// NOTICE is all it gets).
+pub fn rate_limited_reply(text: &str) -> Option<Refusal> {
     let msg: serde_json::Value = serde_json::from_str(text).ok()?;
     let kind = msg.get(0)?.as_str()?;
+    let mut closed_sub = None;
     let frame = match kind {
         "EVENT" => {
             let id = msg.get(1)?.get("id")?.as_str()?;
             serde_json::json!(["OK", id, false, RATE_LIMITED])
         }
-        "REQ" => serde_json::json!(["CLOSED", msg.get(1)?.as_str()?, RATE_LIMITED]),
-        "NEG-OPEN" => serde_json::json!(["NEG-ERR", msg.get(1)?.as_str()?, RATE_LIMITED]),
+        "REQ" => {
+            let sub = msg.get(1)?.as_str()?;
+            closed_sub = Some(sub.to_string());
+            serde_json::json!(["CLOSED", sub, RATE_LIMITED])
+        }
+        "NEG-OPEN" | "NEG-MSG" => serde_json::json!(["NEG-ERR", msg.get(1)?.as_str()?, RATE_LIMITED]),
         _ => return None,
     };
-    Some(frame.to_string())
+    Some(Refusal { reply: frame.to_string(), closed_sub })
+}
+
+/// Does this IP get the cold-start allowance? Only the first connection it
+/// opens within a rate window does; `last_connect` is stamped either way and
+/// pruned of entries older than a window.
+pub fn grant_cold_start(
+    last_connect: &mut std::collections::HashMap<std::net::IpAddr, Instant>,
+    ip: std::net::IpAddr,
+    now: Instant,
+    window: Duration,
+) -> bool {
+    last_connect.retain(|_, t| now.duration_since(*t) < window);
+    last_connect.insert(ip, now).is_none()
 }
 
 /// Fixed-window per-connection rate limiter over *counted* frames (see
@@ -204,11 +245,23 @@ impl RateLimiter {
     }
 }
 
-/// A connection whose broadcast receiver lags twice within this window is
-/// too slow to keep up even after a resync; it is closed with a reason so
-/// the client reconnects and re-REQs on its own schedule instead of being
-/// fed a second full resync it cannot drain either.
-const RESYNC_COOLDOWN: Duration = Duration::from_secs(10);
+/// More resync frames than this and the connection missed more than it can
+/// plausibly drain on top of what it is already behind on: close it (1013)
+/// instead of pushing a resync it will lag through again.
+const RESYNC_MAX_FRAMES: usize = 2048;
+
+/// Close a socket that cannot keep up: a NOTICE the client logs, then a
+/// 1013 (Try Again Later) close so its reconnect logic re-REQs.
+async fn close_too_slow(sender: &mut futures::stream::SplitSink<WebSocket, Message>) {
+    let notice = serde_json::json!(["NOTICE", "resync: too slow, reconnect"]).to_string();
+    let _ = sender.send(Message::Text(notice.into())).await;
+    let _ = sender
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: 1013,
+            reason: "slow consumer: reconnect and re-REQ".into(),
+        })))
+        .await;
+}
 
 /// Visibility check for broadcast events (no per-broadcast DB query), with
 /// the DM wire contract's gift-wrap gate and NIP-40 expiration applied:
@@ -285,7 +338,7 @@ pub async fn handle_connection(
             let (mut sender, _) = socket.split();
             let _ = sender
                 .send(Message::Text(
-                    r#"["NOTICE","rate limited: too many connections from your address"]"#.into(),
+                    r#"["NOTICE","rate-limited: too many connections from your address"]"#.into(),
                 ))
                 .await;
             let _ = sender.close().await;
@@ -315,14 +368,29 @@ pub async fn handle_connection(
     let mut memberships_refreshed_at: Instant = Instant::now();
     // Per-connection rate window — always on; nothing else limits WebSocket
     // traffic (the Caddy proxy routes the relay around the gateway).
+    let rate_window = Duration::from_secs(state.config.rate_window_secs.max(1));
+    let cold_start = {
+        let mut m = state.ip_last_connect.lock().unwrap_or_else(|e| e.into_inner());
+        grant_cold_start(&mut m, client_ip, Instant::now(), rate_window)
+    };
     let mut limiter = RateLimiter::new(
-        Duration::from_secs(state.config.rate_window_secs.max(1)),
+        rate_window,
         state.config.rate_max_msgs,
-        state.config.rate_cold_start_max_msgs,
+        if cold_start { state.config.rate_cold_start_max_msgs } else { state.config.rate_max_msgs },
         Instant::now(),
     );
-    // Broadcast lag: when this connection last had to be resynced from storage.
+    // AUTH frames sent before authenticating (see `FREE_AUTH_FRAMES`).
+    let mut auth_frames_unauthed: u32 = 0;
+    // Broadcast lag: when this connection last had to be resynced from storage,
+    // and the last moment (unix seconds) its receiver was known to be caught
+    // up — the start of the window a resync has to cover.
     let mut last_resync_at: Option<Instant> = None;
+    let mut last_kept_up_at: i64 = wrap_gate::unix_now();
+    // A connection whose receiver lags twice within this window is too slow
+    // to keep up even after a resync; it is closed with a reason so the client
+    // reconnects and re-REQs on its own schedule instead of being fed a second
+    // resync it cannot drain either.
+    let resync_cooldown = Duration::from_secs(state.config.resync_cooldown_secs);
     let auth_challenge = nip42::generate_challenge();
     // Keepalive: ping on a timer and drop sockets that stay silent. A socket
     // the OS killed under a backgrounded app never sends a FIN, so without
@@ -365,7 +433,12 @@ pub async fn handle_connection(
                         // the client retries with backoff instead of timing
                         // out on a wrap that was never stored or believing a
                         // REQ that was never registered. One NOTICE per window.
-                        if limiter.enabled() && counts_toward_rate_limit(frame_type(&text)) {
+                        let kind = frame_type(&text);
+                        let auth_exempt = authed_pubkey.is_none() && auth_frames_unauthed < FREE_AUTH_FRAMES;
+                        if kind == Some("AUTH") && authed_pubkey.is_none() {
+                            auth_frames_unauthed = auth_frames_unauthed.saturating_add(1);
+                        }
+                        if limiter.enabled() && counts_toward_rate_limit(kind, auth_exempt) {
                             if let RateVerdict::Refused { first } = limiter.count(Instant::now()) {
                                 state.metrics.rate_limited_frames.fetch_add(1, Ordering::Relaxed);
                                 if first {
@@ -379,8 +452,11 @@ pub async fn handle_connection(
                                         break;
                                     }
                                 }
-                                if let Some(reply) = rate_limited_reply(&text) {
-                                    if sender.send(Message::Text(reply.into())).await.is_err() {
+                                if let Some(refusal) = rate_limited_reply(&text) {
+                                    if let Some(sub_id) = &refusal.closed_sub {
+                                        subscriptions.lock().await.remove(sub_id);
+                                    }
+                                    if sender.send(Message::Text(refusal.reply.into())).await.is_err() {
                                         break;
                                     }
                                 }
@@ -440,6 +516,7 @@ pub async fn handle_connection(
             broadcast_result = broadcast_rx.recv() => {
                 match broadcast_result {
                     Ok(event) => {
+                        last_kept_up_at = wrap_gate::unix_now();
                         // For h-tagged (space-scoped) events, lazily refresh the
                         // membership cache if it's older than MEMBERSHIP_TTL —
                         // otherwise a kicked user holding this socket keeps
@@ -492,7 +569,7 @@ pub async fn handle_connection(
                         state.metrics.broadcast_lagged_connections.fetch_add(1, Ordering::Relaxed);
                         state.metrics.broadcast_skipped_events.fetch_add(n, Ordering::Relaxed);
                         let now = Instant::now();
-                        let too_slow = last_resync_at.is_some_and(|t| now.duration_since(t) < RESYNC_COOLDOWN);
+                        let too_slow = last_resync_at.is_some_and(|t| now.duration_since(t) < resync_cooldown);
                         tracing::warn!(
                             remote = %addr,
                             skipped = n,
@@ -500,14 +577,7 @@ pub async fn handle_connection(
                             "Broadcast receiver lagged"
                         );
                         if too_slow {
-                            let notice = serde_json::json!(["NOTICE", "resync: too slow, reconnect"]).to_string();
-                            let _ = sender.send(Message::Text(notice.into())).await;
-                            let _ = sender
-                                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                                    code: 1013, // Try Again Later
-                                    reason: "slow consumer: reconnect and re-REQ".into(),
-                                })))
-                                .await;
+                            close_too_slow(&mut sender).await;
                             break;
                         }
                         last_resync_at = Some(now);
@@ -515,7 +585,14 @@ pub async fn handle_connection(
                         if sender.send(Message::Text(notice.into())).await.is_err() {
                             break;
                         }
-                        let frames = handler::resync_subscriptions(&state, &subscriptions, &authed_pubkey).await;
+                        let resync_from = last_kept_up_at;
+                        last_kept_up_at = wrap_gate::unix_now();
+                        let frames = handler::resync_subscriptions(&state, &subscriptions, &authed_pubkey, resync_from).await;
+                        if frames.len() > RESYNC_MAX_FRAMES {
+                            tracing::warn!(remote = %addr, frames = frames.len(), "Resync too large; closing");
+                            close_too_slow(&mut sender).await;
+                            break;
+                        }
                         let mut failed = false;
                         for frame in frames {
                             events_sent += 1;
@@ -871,17 +948,38 @@ mod tests {
         assert_eq!(frame_type("garbage"), None);
     }
 
-    /// EVENT, REQ, NEG-OPEN and junk are counted; AUTH, CLOSE and the
-    /// in-memory NEG frames are not.
+    /// EVENT, REQ, NEG-OPEN, NEG-MSG and junk are counted; CLOSE and
+    /// NEG-CLOSE are not; AUTH only while the connection may still AUTH for
+    /// free (unauthenticated, under the free-frame cap).
     #[test]
     fn exempt_frames_do_not_count() {
-        for t in ["EVENT", "REQ", "NEG-OPEN", "COUNT", "BOGUS"] {
-            assert!(counts_toward_rate_limit(Some(t)), "{t} must count");
+        for exempt in [true, false] {
+            for t in ["EVENT", "REQ", "NEG-OPEN", "NEG-MSG", "COUNT", "BOGUS"] {
+                assert!(counts_toward_rate_limit(Some(t), exempt), "{t} must count");
+            }
+            assert!(counts_toward_rate_limit(None, exempt), "unparseable frames count");
+            for t in ["CLOSE", "NEG-CLOSE"] {
+                assert!(!counts_toward_rate_limit(Some(t), exempt), "{t} must be exempt");
+            }
         }
-        assert!(counts_toward_rate_limit(None), "unparseable frames count");
-        for t in ["AUTH", "CLOSE", "NEG-MSG", "NEG-CLOSE"] {
-            assert!(!counts_toward_rate_limit(Some(t)), "{t} must be exempt");
-        }
+        assert!(!counts_toward_rate_limit(Some("AUTH"), true), "pre-auth AUTH is free");
+        assert!(counts_toward_rate_limit(Some("AUTH"), false), "a post-auth (or 9th) AUTH costs a verify + query");
+    }
+
+    /// The cold-start allowance goes to the first connection an IP opens in
+    /// a window; a reconnect loop gets the steady limit; old stamps expire.
+    #[test]
+    fn cold_start_once_per_ip_per_window() {
+        let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let other: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+        let w = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let mut m = std::collections::HashMap::new();
+        assert!(grant_cold_start(&mut m, ip, t0, w));
+        assert!(!grant_cold_start(&mut m, ip, t0 + Duration::from_secs(3), w), "reconnect inside the window");
+        assert!(grant_cold_start(&mut m, other, t0, w), "another IP is unaffected");
+        assert!(grant_cold_start(&mut m, ip, t0 + Duration::from_secs(14), w), "a window later it is granted again");
+        assert_eq!(m.len(), 1, "stale stamps are pruned");
     }
 
     /// Every refused frame that has something to answer to is answered with
@@ -889,20 +987,24 @@ mod tests {
     #[test]
     fn rate_limited_replies_match_the_frame() {
         let ok = rate_limited_reply(r#"["EVENT",{"id":"abc","kind":1}]"#).unwrap();
-        let ok: serde_json::Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(ok.closed_sub, None);
+        let ok: serde_json::Value = serde_json::from_str(&ok.reply).unwrap();
         assert_eq!(ok[0], "OK");
         assert_eq!(ok[1], "abc");
         assert_eq!(ok[2], false);
         assert!(ok[3].as_str().unwrap().starts_with("rate-limited:"));
 
         let closed = rate_limited_reply(r#"["REQ","s\"1",{"kinds":[1]}]"#).unwrap();
-        let closed: serde_json::Value = serde_json::from_str(&closed).unwrap();
+        assert_eq!(closed.closed_sub.as_deref(), Some("s\"1"), "an earlier sub under this id must be dropped");
+        let closed: serde_json::Value = serde_json::from_str(&closed.reply).unwrap();
         assert_eq!(closed[0], "CLOSED");
         assert_eq!(closed[1], "s\"1", "sub ids are JSON-escaped");
         assert!(closed[2].as_str().unwrap().starts_with("rate-limited:"));
 
-        let neg = rate_limited_reply(r#"["NEG-OPEN","n",{},"00"]"#).unwrap();
+        let neg = rate_limited_reply(r#"["NEG-OPEN","n",{},"00"]"#).unwrap().reply;
         assert!(neg.starts_with(r#"["NEG-ERR","n","rate-limited:"#), "{neg}");
+        let neg_msg = rate_limited_reply(r#"["NEG-MSG","n","00"]"#).unwrap().reply;
+        assert!(neg_msg.starts_with(r#"["NEG-ERR","n","rate-limited:"#), "{neg_msg}");
 
         assert_eq!(rate_limited_reply(r#"["EVENT",{"kind":1}]"#), None, "no id → nothing to answer");
         assert_eq!(rate_limited_reply(r#"["AUTH",{}]"#), None);

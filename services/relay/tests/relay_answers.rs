@@ -64,13 +64,12 @@ async fn boot(pool: sqlx::PgPool, tweak: impl FnOnce(&mut Config)) -> String {
         }
     });
     let url = format!("ws://127.0.0.1:{port}");
+    // Probe readiness over plain TCP: a WebSocket probe would reach
+    // `handle_connection` and spend this IP's cold-start grant.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match connect_async(&url).await {
-            Ok((ws, _)) => {
-                drop(ws);
-                return url;
-            }
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(_) => return url,
             Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
             Err(e) => panic!("could not connect to {url}: {e}"),
         }
@@ -182,6 +181,12 @@ async fn store_big_backlog(url: &str, author: &TestIdentity) -> Vec<String> {
     ids
 }
 
+/// Every test truncates the shared Postgres DB and several of them sleep or
+/// build a 16 MB fixture, so a sibling's TRUNCATE between setup and assertion
+/// would break them. `.cargo/config.toml` already forces one test thread;
+/// this mutex keeps the file correct even when that is overridden.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 macro_rules! pool_or_skip {
     () => {
         match setup_test_pool().await {
@@ -194,10 +199,60 @@ macro_rules! pool_or_skip {
     };
 }
 
+/// A wrap for `recipient` with the given `created_at`, from a throwaway key.
+fn wrap_for(recipient: &str, seed: u8, created_at: i64) -> Event {
+    sign_event(
+        &TestIdentity::from_seed(seed),
+        1059,
+        vec![vec!["p".into(), recipient.to_string()]],
+        "ciphertext",
+        created_at,
+    )
+}
+
+/// Drain A until `done(seen, resync_seen)` holds, the socket closes or the
+/// deadline passes. Returns (event ids seen per sub, saw a `resync:` NOTICE,
+/// close frame if the server closed).
+async fn drain_until(
+    rx: &mut Rx,
+    t: Duration,
+    done: impl Fn(&HashSet<(String, String)>, bool) -> bool,
+) -> (HashSet<(String, String)>, bool, Option<Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>>) {
+    let deadline = Instant::now() + t;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut saw_resync = false;
+    while Instant::now() < deadline && !done(&seen, saw_resync) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, rx.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                let v: serde_json::Value = match serde_json::from_str(&t) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                match typ(&v) {
+                    "NOTICE" if s(&v, 1).starts_with("resync:") => saw_resync = true,
+                    "EVENT" => {
+                        if let Some(id) = v.get(2).and_then(|e| e.get("id")).and_then(|x| x.as_str()) {
+                            seen.insert((s(&v, 1).to_string(), id.to_string()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Some(Ok(Message::Close(f)))) => return (seen, saw_resync, Some(f)),
+            Ok(None) | Ok(Some(Err(_))) => return (seen, saw_resync, Some(None)),
+            Ok(Some(Ok(_))) => {}
+            Err(_) => break,
+        }
+    }
+    (seen, saw_resync, None)
+}
+
 // ── (a) rate limiter answers ────────────────────────────────────────────
 
 #[tokio::test]
 async fn over_limit_event_gets_ok_false_rate_limited() {
+    let _serial = SERIAL.lock().await;
     let pool = pool_or_skip!();
     let url = boot(pool, |c| {
         c.rate_max_msgs = 3;
@@ -226,6 +281,7 @@ async fn over_limit_event_gets_ok_false_rate_limited() {
 
 #[tokio::test]
 async fn over_limit_req_gets_closed_rate_limited_and_no_eose() {
+    let _serial = SERIAL.lock().await;
     let pool = pool_or_skip!();
     let url = boot(pool, |c| {
         c.rate_max_msgs = 3;
@@ -255,6 +311,7 @@ async fn over_limit_req_gets_closed_rate_limited_and_no_eose() {
 
 #[tokio::test]
 async fn auth_close_and_neg_close_frames_do_not_consume_the_budget() {
+    let _serial = SERIAL.lock().await;
     let pool = pool_or_skip!();
     let url = boot(pool, |c| {
         c.rate_max_msgs = 3;
@@ -266,7 +323,11 @@ async fn auth_close_and_neg_close_frames_do_not_consume_the_budget() {
     for i in 0..10 {
         send(&mut tx, format!(r#"["CLOSE","never{i}"]"#)).await;
         send(&mut tx, format!(r#"["NEG-CLOSE","never{i}"]"#)).await;
-        send(&mut tx, r#"["AUTH",{"kind":22242}]"#.to_string()).await; // invalid → NOTICE, still exempt
+    }
+    // Pre-auth AUTH frames are free up to FREE_AUTH_FRAMES (8); invalid ones
+    // get a NOTICE and still do not count.
+    for _ in 0..5 {
+        send(&mut tx, r#"["AUTH",{"kind":22242}]"#.to_string()).await;
     }
     for i in 0..3 {
         send(&mut tx, format!(r#"["REQ","s{i}",{{"kinds":[1],"limit":1}}]"#)).await;
@@ -282,6 +343,7 @@ async fn auth_close_and_neg_close_frames_do_not_consume_the_budget() {
 
 #[tokio::test]
 async fn cold_start_window_allows_a_larger_burst() {
+    let _serial = SERIAL.lock().await;
     let pool = pool_or_skip!();
     let url = boot(pool, |c| {
         c.rate_max_msgs = 2;
@@ -317,6 +379,7 @@ async fn cold_start_window_allows_a_larger_burst() {
 
 #[tokio::test]
 async fn req_on_a_failing_db_is_closed_with_no_eose_and_no_live_sub() {
+    let _serial = SERIAL.lock().await;
     let pool = pool_or_skip!();
     let bob = TestIdentity::from_seed(2);
     let (state, tx) = make_app_state_with(pool.clone(), |_| {});
@@ -351,6 +414,7 @@ async fn req_on_a_failing_db_is_closed_with_no_eose_and_no_live_sub() {
 
 #[tokio::test]
 async fn lagged_receiver_gets_a_resync_notice_and_the_missed_events() {
+    let _serial = SERIAL.lock().await;
     let pool = pool_or_skip!();
     let url = boot(pool, |c| c.broadcast_capacity = 4).await;
     let alice = TestIdentity::from_seed(1);
@@ -374,46 +438,98 @@ async fn lagged_receiver_gets_a_resync_notice_and_the_missed_events() {
 
     // Now A drains: it must be told it lagged, and must still end up with
     // every live note (delivered live before the lag, or resynced after it).
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut saw_resync = false;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut closed = false;
-    while Instant::now() < deadline && !(saw_resync && live_ids.is_subset(&seen)) {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match timeout(remaining, a_rx.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => {
-                let v: serde_json::Value = match serde_json::from_str(&t) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                match typ(&v) {
-                    "NOTICE" if s(&v, 1).starts_with("resync:") => saw_resync = true,
-                    "EVENT" => {
-                        if let Some(id) = v.get(2).and_then(|e| e.get("id")).and_then(|x| x.as_str()) {
-                            seen.insert(id.to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
-                closed = true;
-                break;
-            }
-            Ok(Some(Ok(_))) => {}
-            Err(_) => break,
-        }
-    }
-    assert!(!closed, "the lagged socket was closed instead of resynced");
+    let want: HashSet<(String, String)> = live_ids.iter().map(|id| ("feed".to_string(), id.clone())).collect();
+    let (seen, saw_resync, closed) =
+        drain_until(&mut a_rx, Duration::from_secs(60), |seen, resync| resync && want.is_subset(seen)).await;
+    assert!(closed.is_none(), "the lagged socket was closed instead of resynced: {closed:?}");
     assert!(saw_resync, "no `resync:` NOTICE after the receiver lagged");
-    let missing: Vec<&String> = live_ids.difference(&seen).collect();
+    let missing: Vec<&(String, String)> = want.difference(&seen).collect();
     assert!(missing.is_empty(), "live events silently lost by lag: {missing:?}");
+}
+
+/// The DM case the kind-1 test cannot see: wraps published during the lag
+/// carry a NIP-59 backdated `created_at` below the inbox REQ's `since`. The
+/// resync runs by server receipt time (`first_seen`) and drops `since` for
+/// wrap filters, so they are recovered.
+#[tokio::test]
+async fn lag_resync_recovers_backdated_wraps_below_since() {
+    let _serial = SERIAL.lock().await;
+    let pool = pool_or_skip!();
+    let url = boot(pool, |c| c.broadcast_capacity = 4).await;
+    let alice = TestIdentity::from_seed(1);
+    let bob = TestIdentity::from_seed(2);
+    store_big_backlog(&url, &alice).await;
+
+    let (mut a_tx, mut a_rx, challenge) = connect(&url).await;
+    auth_as(&mut a_tx, &mut a_rx, &bob, &url, &challenge).await;
+    let since = now();
+    send(&mut a_tx, format!(r##"["REQ","inbox",{{"kinds":[1059],"#p":["{}"],"since":{since}}}]"##, bob.pubkey)).await;
+    assert!(read_until(&mut a_rx, "EOSE", Duration::from_secs(5)).await.is_some());
+    // The backlog REQ blocks A's task mid-stream while nobody reads.
+    send(&mut a_tx, r#"["REQ","feed",{"kinds":[1],"limit":500}]"#.to_string()).await;
+    sleep(Duration::from_millis(700)).await;
+
+    let (mut b_tx, mut b_rx, _) = connect(&url).await;
+    let mut want = HashSet::new();
+    for i in 0..12u8 {
+        let w = wrap_for(&bob.pubkey, 20 + i, since - 86_400 - i as i64);
+        publish_ok(&mut b_tx, &mut b_rx, &w).await;
+        want.insert(("inbox".to_string(), w.id));
+    }
+
+    let (seen, saw_resync, closed) =
+        drain_until(&mut a_rx, Duration::from_secs(60), |seen, resync| resync && want.is_subset(seen)).await;
+    assert!(closed.is_none(), "closed instead of resynced: {closed:?}");
+    assert!(saw_resync, "no `resync:` NOTICE");
+    let missing: Vec<&(String, String)> = want.difference(&seen).collect();
+    assert!(missing.is_empty(), "backdated wraps lost by lag: {missing:?}");
+}
+
+/// A connection that lags again within the cooldown after a resync is closed
+/// with 1013 and a NOTICE, so the client's own reconnect takes over.
+#[tokio::test]
+async fn lagging_twice_within_the_cooldown_closes_1013() {
+    let _serial = SERIAL.lock().await;
+    let pool = pool_or_skip!();
+    // A long cooldown: reading the 16 MB stream between the two lags takes
+    // the test client (debug build) longer than the production 10 s.
+    let url = boot(pool, |c| {
+        c.broadcast_capacity = 4;
+        c.resync_cooldown_secs = 120;
+    })
+    .await;
+    let alice = TestIdentity::from_seed(1);
+    let carol = TestIdentity::from_seed(3);
+    store_big_backlog(&url, &alice).await;
+    let (mut b_tx, mut b_rx, _) = connect(&url).await;
+
+    // Lag #1: backlog stream blocked, 12 live notes go by.
+    let (mut a_tx, mut a_rx, _) = connect(&url).await;
+    send(&mut a_tx, r#"["REQ","feed",{"kinds":[1],"limit":500}]"#.to_string()).await;
+    sleep(Duration::from_millis(700)).await;
+    for i in 0..12 {
+        publish_ok(&mut b_tx, &mut b_rx, &note(&carol, &format!("live {i}"), now() + i)).await;
+    }
+    let (_, saw_resync, closed) = drain_until(&mut a_rx, Duration::from_secs(60), |_, resync| resync).await;
+    assert!(saw_resync && closed.is_none(), "first lag must resync, not close: {closed:?}");
+
+    // Lag #2 inside the 10 s cooldown: same recipe again.
+    send(&mut a_tx, r#"["REQ","feed2",{"kinds":[1],"limit":500}]"#.to_string()).await;
+    sleep(Duration::from_millis(700)).await;
+    for i in 0..12 {
+        publish_ok(&mut b_tx, &mut b_rx, &note(&carol, &format!("live again {i}"), now() + 100 + i)).await;
+    }
+    let (_, _, closed) = drain_until(&mut a_rx, Duration::from_secs(60), |_, _| false).await;
+    let frame = closed.expect("the second lag must close the socket").expect("a Close frame with a reason");
+    assert_eq!(u16::from(frame.code), 1013, "{frame:?}");
+    assert!(frame.reason.contains("reconnect"), "{frame:?}");
 }
 
 // ── (d) a socket that only receives is not reaped ───────────────────────
 
 #[tokio::test]
 async fn receiving_a_long_backlog_does_not_count_as_idle() {
+    let _serial = SERIAL.lock().await;
     let pool = pool_or_skip!();
     let url = boot(pool, |c| {
         c.ws_ping_interval_secs = 1;
@@ -450,6 +566,7 @@ async fn receiving_a_long_backlog_does_not_count_as_idle() {
 
 #[tokio::test]
 async fn live_backdated_wrap_is_delivered_despite_since() {
+    let _serial = SERIAL.lock().await;
     let pool = pool_or_skip!();
     let url = boot(pool, |_| {}).await;
     let bob = TestIdentity::from_seed(2);
@@ -478,4 +595,101 @@ async fn live_backdated_wrap_is_delivered_despite_since() {
     let evt = read_until(&mut a_rx, "EVENT", Duration::from_secs(5)).await.expect("backdated live wrap not delivered");
     assert_eq!(s(&evt, 1), "inbox");
     assert_eq!(evt.get(2).and_then(|e| e.get("id")).and_then(|x| x.as_str()), Some(wrap.id.as_str()));
+}
+
+// ── review follow-ups ───────────────────────────────────────────────────
+
+/// Once authenticated, each AUTH is a Schnorr verify plus a membership query
+/// against a constant challenge; replaying one must spend budget.
+#[tokio::test]
+async fn post_auth_auth_replays_are_counted() {
+    let _serial = SERIAL.lock().await;
+    let pool = pool_or_skip!();
+    let url = boot(pool, |c| {
+        c.rate_max_msgs = 3;
+        c.rate_cold_start_max_msgs = 3;
+    })
+    .await;
+    let bob = TestIdentity::from_seed(2);
+    let (mut tx, mut rx, challenge) = connect(&url).await;
+    // The first AUTH is free (pre-auth).
+    auth_as(&mut tx, &mut rx, &bob, &url, &challenge).await;
+    // Three replays of the same valid AUTH: each verifies again, each counts.
+    let ev = sign_event(
+        &bob,
+        22242,
+        vec![vec!["relay".into(), url.clone()], vec!["challenge".into(), challenge.clone()]],
+        "",
+        now(),
+    );
+    for _ in 0..3 {
+        send(&mut tx, format!(r#"["AUTH",{}]"#, serde_json::to_string(&ev).unwrap())).await;
+    }
+    send(&mut tx, r#"["REQ","after",{"kinds":[1],"limit":1}]"#.to_string()).await;
+    let frames = collect_for(&mut rx, Duration::from_secs(3)).await;
+    let closed: Vec<&serde_json::Value> = frames.iter().filter(|f| typ(f) == "CLOSED").collect();
+    assert_eq!(closed.len(), 1, "the REQ after an AUTH flood must be refused: {frames:?}");
+    assert_eq!(s(closed[0], 1), "after");
+    assert!(s(closed[0], 2).starts_with("rate-limited:"), "{}", closed[0]);
+    assert!(!frames.iter().any(|f| typ(f) == "EOSE"), "{frames:?}");
+}
+
+/// The cold-start allowance is per IP per window, not per socket: a second
+/// connection from the same address inside the window gets the steady limit.
+#[tokio::test]
+async fn cold_start_is_granted_once_per_ip_per_window() {
+    let _serial = SERIAL.lock().await;
+    let pool = pool_or_skip!();
+    let url = boot(pool, |c| {
+        c.rate_max_msgs = 2;
+        c.rate_cold_start_max_msgs = 6;
+        c.rate_window_secs = 5;
+    })
+    .await;
+    let (mut tx1, mut rx1, _) = connect(&url).await;
+    for i in 0..6 {
+        send(&mut tx1, format!(r#"["REQ","c{i}",{{"kinds":[1],"limit":1}}]"#)).await;
+    }
+    let frames = collect_for(&mut rx1, Duration::from_millis(800)).await;
+    assert_eq!(frames.iter().filter(|f| typ(f) == "EOSE").count(), 6, "{frames:?}");
+
+    // A reconnect from the same IP inside the window: steady limit (2).
+    let (mut tx2, mut rx2, _) = connect(&url).await;
+    for i in 0..3 {
+        send(&mut tx2, format!(r#"["REQ","r{i}",{{"kinds":[1],"limit":1}}]"#)).await;
+    }
+    let frames = collect_for(&mut rx2, Duration::from_millis(800)).await;
+    let eose: Vec<&str> = frames.iter().filter(|f| typ(f) == "EOSE").map(|f| s(f, 1)).collect();
+    assert_eq!(eose, vec!["r0", "r1"], "{frames:?}");
+    let closed: Vec<&serde_json::Value> = frames.iter().filter(|f| typ(f) == "CLOSED").collect();
+    assert_eq!(closed.len(), 1, "{frames:?}");
+    assert!(s(closed[0], 2).starts_with("rate-limited:"), "{}", closed[0]);
+}
+
+/// A multi-filter REQ on a failing store: one CLOSED, no EVENT from any
+/// filter, no EOSE. (`query_merged` aborts on the first failing filter; a
+/// per-filter partial failure has no injection seam here, so this covers the
+/// all-fail shape and the unit of the merge covers the abort.)
+#[tokio::test]
+async fn multi_filter_req_on_a_failing_db_sends_no_partial_events() {
+    let _serial = SERIAL.lock().await;
+    let pool = pool_or_skip!();
+    let bob = TestIdentity::from_seed(2);
+    let (state, tx) = make_app_state_with(pool.clone(), |_| {});
+    pool.close().await;
+
+    let subs = Arc::new(Mutex::new(SubscriptionManager::new()));
+    let mut authed = Some(bob.pubkey.clone());
+    let mut memberships = HashSet::new();
+    let req = format!(r##"["REQ","multi",{{"kinds":[1],"limit":10}},{{"kinds":[1059],"#p":["{}"]}}]"##, bob.pubkey);
+    let frames: Vec<serde_json::Value> =
+        handle_message(&req, &state, &subs, &mut authed, &mut memberships, "c", &tx)
+            .await
+            .into_iter()
+            .map(|r| serde_json::from_str(&r).unwrap())
+            .collect();
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(typ(&frames[0]), "CLOSED");
+    assert!(s(&frames[0], 2).starts_with("error:"), "{frames:?}");
+    assert!(subs.lock().await.snapshot().is_empty(), "sub registered despite CLOSED");
 }
