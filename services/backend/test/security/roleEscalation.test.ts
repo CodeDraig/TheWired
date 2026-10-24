@@ -291,9 +291,15 @@ describe("permission checks are scoped to the space's own roles", () => {
     const evilAdmin = await adminRole(EVIL);
     await db.insert(spaceMembers).values({ spaceId: VICTIM, pubkey: MARCUS.pubkey }).onConflictDoNothing();
     // The composite FK (migration 0036) rejects the row outright…
+    // drizzle wraps the driver error ("Failed query: …") and keeps the Postgres
+    // detail on `cause`, so look for the constraint name on either level.
     await expect(
       db.insert(memberRoles).values({ spaceId: VICTIM, pubkey: MARCUS.pubkey, roleId: evilAdmin.id }),
-    ).rejects.toThrow(/member_roles_role_in_space_fk/);
+    ).rejects.toSatisfy((err: unknown) => {
+      const e = err as { message?: string; cause?: { message?: string; constraint_name?: string; constraint?: string } };
+      const haystack = [e.message, e.cause?.message, e.cause?.constraint_name, e.cause?.constraint].filter(Boolean).join(" ");
+      return /member_roles_role_in_space_fk/.test(haystack);
+    });
     // …and even a row that slipped in (simulated by bypassing the FK) is inert
     // because every role lookup is scoped to the space.
     await db.execute(sql`ALTER TABLE app.member_roles DISABLE TRIGGER ALL`);
