@@ -19,20 +19,29 @@ use std::collections::HashSet;
 
 use crate::nostr::membership_gate::SpaceMembership;
 
-/// Create a new NIP-29 group; the creator becomes a member + admin.
+/// Create a new NIP-29 group; the creator becomes a member + admin. Returns
+/// `true` when the group row was inserted, `false` when the id already existed
+/// — then nothing is written (same contract as the Postgres store; security
+/// audit 2026-10: the member/admin seed must never run for an existing group).
 pub async fn create_group(
     pool: &SqlitePool,
     group_id: &str,
     name: &str,
     creator_pubkey: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query("INSERT OR IGNORE INTO groups (group_id, name) VALUES (?, ?)")
+    let inserted = sqlx::query("INSERT OR IGNORE INTO groups (group_id, name) VALUES (?, ?)")
         .bind(group_id)
         .bind(name)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected()
+        > 0;
+    if !inserted {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     sqlx::query("INSERT OR IGNORE INTO group_members (group_id, pubkey) VALUES (?, ?)")
         .bind(group_id)
@@ -47,7 +56,7 @@ pub async fn create_group(
         .await?;
 
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Does a group row already exist? (mirrors the platform-collision guard:
@@ -288,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn create_seeds_creator_as_admin_member() {
         let p = pool().await;
-        create_group(&p, "g1", "Group One", "alice").await.unwrap();
+        assert!(create_group(&p, "g1", "Group One", "alice").await.unwrap());
 
         assert!(is_member(&p, "g1", "alice").await.unwrap());
         assert!(is_admin(&p, "g1", "alice").await.unwrap());
@@ -296,6 +305,24 @@ mod tests {
         assert!(!group_exists(&p, "nope").await.unwrap());
         assert!(!is_member(&p, "g1", "bob").await.unwrap());
         assert!(!is_admin(&p, "g1", "bob").await.unwrap());
+    }
+
+    /// Security audit 2026-10: a second create of an existing id writes nothing
+    /// — the would-be creator gains neither membership nor the admin role.
+    #[tokio::test]
+    async fn create_of_existing_group_seeds_nothing() {
+        let p = pool().await;
+        assert!(create_group(&p, "g1", "Group One", "alice").await.unwrap());
+        assert!(!create_group(&p, "g1", "Hijack", "bob").await.unwrap());
+
+        assert!(!is_member(&p, "g1", "bob").await.unwrap());
+        assert!(!is_admin(&p, "g1", "bob").await.unwrap());
+        assert!(is_admin(&p, "g1", "alice").await.unwrap());
+        let (name,): (String,) = sqlx::query_as("SELECT name FROM groups WHERE group_id = 'g1'")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(name, "Group One");
     }
 
     #[tokio::test]

@@ -38,6 +38,30 @@ const TUNNEL_SECRET_ID: &str = "embedded_relay_tunnel_secret";
 #[derive(Default)]
 pub struct TunnelState(pub Arc<Mutex<Option<RunningTunnel>>>);
 
+impl TunnelState {
+    /// The public URL the relay is currently exposed under, if any (tunnel or
+    /// custom). The relay adds it to its NIP-42 allow-set.
+    pub async fn public_url(&self) -> Option<String> {
+        self.0.lock().await.as_ref().map(|t| t.url.clone())
+    }
+}
+
+/// Tell the running embedded relay (if any) that `url` is now one of its own
+/// public addresses, so AUTH events naming it are accepted (security audit
+/// 2026-10: the relay checks the 22242 `relay` tag against an allow-set).
+async fn relay_add_public_url(relay_state: &EmbeddedRelayState, url: &str) {
+    if let Some(relay) = relay_state.0.lock().await.as_ref() {
+        relay.add_auth_relay_url(url);
+    }
+}
+
+/// Counterpart of [`relay_add_public_url`] for a tunnel that went away.
+async fn relay_remove_public_url(relay_state: &EmbeddedRelayState, url: &str) {
+    if let Some(relay) = relay_state.0.lock().await.as_ref() {
+        relay.remove_auth_relay_url(url);
+    }
+}
+
 pub struct RunningTunnel {
     /// The cloudflared process for quick/named tunnels. `None` for a
     /// user-supplied custom URL (their own external tunnel — we run no process,
@@ -309,6 +333,7 @@ pub async fn tunnel_start(
             .ok_or_else(|| "named tunnel requires provisioning data from the server".to_string())?;
         let relay = start_named_tunnel(&app, port, cfg).await?;
         let status = TunnelStatus { running: true, url: Some(relay.url.clone()) };
+        relay_add_public_url(&relay_state, &relay.url).await;
         *tunnel_state.0.lock().await = Some(relay);
         return Ok(status);
     }
@@ -364,6 +389,7 @@ pub async fn tunnel_start(
 
     log::info!("Tunnel established: {url}");
     let status = TunnelStatus { running: true, url: Some(url.clone()) };
+    relay_add_public_url(&relay_state, &url).await;
     *tunnel_state.0.lock().await = Some(RunningTunnel { child: Some(child), url, creds_path: None });
     Ok(status)
 }
@@ -387,6 +413,7 @@ fn validate_custom_url(url: &str) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn tunnel_set_custom(
+    relay_state: State<'_, EmbeddedRelayState>,
     tunnel_state: State<'_, TunnelState>,
     url: String,
 ) -> Result<TunnelStatus, String> {
@@ -400,9 +427,11 @@ pub async fn tunnel_set_custom(
         if let Some(p) = prev.creds_path.take() {
             let _ = std::fs::remove_file(p);
         }
+        relay_remove_public_url(&relay_state, &prev.url).await;
     }
 
     let status = TunnelStatus { running: true, url: Some(url.clone()) };
+    relay_add_public_url(&relay_state, &url).await;
     *tunnel_state.0.lock().await = Some(RunningTunnel { child: None, url, creds_path: None });
     log::info!("Custom relay URL set");
     Ok(status)
@@ -410,7 +439,10 @@ pub async fn tunnel_set_custom(
 
 /// Stop the tunnel if running (idempotent).
 #[tauri::command]
-pub async fn tunnel_stop(tunnel_state: State<'_, TunnelState>) -> Result<TunnelStatus, String> {
+pub async fn tunnel_stop(
+    relay_state: State<'_, EmbeddedRelayState>,
+    tunnel_state: State<'_, TunnelState>,
+) -> Result<TunnelStatus, String> {
     let tunnel = tunnel_state.0.lock().await.take();
     if let Some(mut t) = tunnel {
         // Custom URLs have no process; quick/named do.
@@ -422,6 +454,8 @@ pub async fn tunnel_stop(tunnel_state: State<'_, TunnelState>) -> Result<TunnelS
         if let Some(p) = t.creds_path.take() {
             let _ = std::fs::remove_file(p);
         }
+        // The hostname is no longer ours: stop accepting AUTH events naming it.
+        relay_remove_public_url(&relay_state, &t.url).await;
         log::info!("Tunnel stopped");
     }
     Ok(TunnelStatus::stopped())

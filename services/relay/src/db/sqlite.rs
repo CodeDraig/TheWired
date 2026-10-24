@@ -91,6 +91,24 @@ CREATE TABLE IF NOT EXISTS group_roles (
     role     TEXT NOT NULL DEFAULT 'member',
     PRIMARY KEY (group_id, pubkey, role)
 );
+
+-- Deletions stick (security audit 2026-10; mirrors Postgres migration 007):
+-- ids / addresses a NIP-09 or NIP-29 deletion covered are refused on re-insert.
+CREATE TABLE IF NOT EXISTS deleted_events (
+    event_id   TEXT PRIMARY KEY,
+    pubkey     TEXT NOT NULL,
+    deleted_by TEXT NOT NULL,
+    deleted_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE TABLE IF NOT EXISTS deleted_addresses (
+    kind         INTEGER NOT NULL,
+    pubkey       TEXT NOT NULL,
+    d_tag        TEXT NOT NULL,
+    deleted_upto INTEGER NOT NULL,
+    deleted_by   TEXT NOT NULL,
+    deleted_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (kind, pubkey, d_tag)
+);
 "#;
 
 /// Open (and create) a file-backed SQLite database at filesystem `path` and
@@ -199,7 +217,13 @@ pub async fn store_event_flagged(
     event: &Event,
     self_published: bool,
 ) -> anyhow::Result<bool> {
-    let d_tag = event.get_tag_value("d");
+    // NIP-01: an addressable event without `d` has the empty-string address
+    // (NULL would escape the unique index; audit 2026-10).
+    let d_tag = match event.get_tag_value("d") {
+        Some(d) => Some(d),
+        None if is_addressable(event.kind) => Some(String::new()),
+        None => None,
+    };
     // First VALUED h tag (same as Postgres `h_tags[1]`): a value-less leading
     // ["h"] must not leave a space-scoped row looking public.
     let h_tag = event.get_tag_values("h").into_iter().next();
@@ -209,30 +233,43 @@ pub async fn store_event_flagged(
 
     let mut tx = pool.begin().await?;
 
+    // Supersede an older version, or — NIP-01 tie-break — one with the same
+    // created_at and a lexically greater id (the lowest id is retained).
     if is_replaceable(event.kind) {
-        sqlx::query("DELETE FROM events WHERE pubkey = ? AND kind = ? AND created_at < ?")
-            .bind(&event.pubkey)
-            .bind(event.kind)
-            .bind(event.created_at)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "DELETE FROM events WHERE pubkey = ? AND kind = ? \
+             AND (created_at < ?3 OR (created_at = ?3 AND id > ?4))",
+        )
+        .bind(&event.pubkey)
+        .bind(event.kind)
+        .bind(event.created_at)
+        .bind(&event.id)
+        .execute(&mut *tx)
+        .await?;
     } else if is_addressable(event.kind) {
         if let Some(ref d) = d_tag {
             sqlx::query(
-                "DELETE FROM events WHERE pubkey = ? AND kind = ? AND d_tag = ? AND created_at < ?",
+                "DELETE FROM events WHERE pubkey = ? AND kind = ? AND d_tag = ? \
+                 AND (created_at < ?4 OR (created_at = ?4 AND id > ?5))",
             )
             .bind(&event.pubkey)
             .bind(event.kind)
             .bind(d)
             .bind(event.created_at)
+            .bind(&event.id)
             .execute(&mut *tx)
             .await?;
         }
     }
 
+    // The NOT EXISTS legs refuse an event a prior deletion covers (security
+    // audit 2026-10) — same guard as the Postgres store.
     let inserted = sqlx::query(
         "INSERT OR IGNORE INTO events (id, pubkey, created_at, kind, tags, content, sig, d_tag, h_tag, visibility, expires_at, self_published) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12 \
+         WHERE NOT EXISTS (SELECT 1 FROM deleted_events WHERE event_id = ?1 AND pubkey = ?2) \
+           AND NOT EXISTS (SELECT 1 FROM deleted_addresses \
+                           WHERE kind = ?4 AND pubkey = ?2 AND d_tag = COALESCE(?8, '') AND deleted_upto >= ?3)",
     )
     .bind(&event.id)
     .bind(&event.pubkey)
@@ -559,6 +596,64 @@ pub async fn count_groups(pool: &SqlitePool) -> anyhow::Result<i64> {
     Ok(n)
 }
 
+/// Remember a deleted event id (for its author) so a re-publish is refused.
+pub async fn record_deleted_event(
+    pool: &SqlitePool,
+    event_id: &str,
+    pubkey: &str,
+    deleted_by: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO deleted_events (event_id, pubkey, deleted_by) VALUES (?, ?, ?)")
+        .bind(event_id)
+        .bind(pubkey)
+        .bind(deleted_by)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Remember a NIP-09 `a`-tag deletion (versions at/before `deleted_upto`).
+pub async fn record_deleted_address(
+    pool: &SqlitePool,
+    kind: i32,
+    pubkey: &str,
+    d_tag: &str,
+    deleted_upto: i64,
+    deleted_by: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO deleted_addresses (kind, pubkey, d_tag, deleted_upto, deleted_by) VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET deleted_upto = MAX(deleted_upto, excluded.deleted_upto)",
+    )
+    .bind(kind)
+    .bind(pubkey)
+    .bind(d_tag)
+    .bind(deleted_upto)
+    .bind(deleted_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Does a recorded deletion cover this event (id for its author, or address
+/// at/before the deletion)?
+pub async fn is_deleted(pool: &SqlitePool, event: &Event) -> anyhow::Result<bool> {
+    let d_tag = event.get_tag_value("d").unwrap_or_default();
+    let (hit,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM deleted_events WHERE event_id = ? AND pubkey = ?) \
+             OR EXISTS (SELECT 1 FROM deleted_addresses WHERE kind = ? AND pubkey = ? AND d_tag = ? AND deleted_upto >= ?)",
+    )
+    .bind(&event.id)
+    .bind(&event.pubkey)
+    .bind(event.kind)
+    .bind(&event.pubkey)
+    .bind(&d_tag)
+    .bind(event.created_at)
+    .fetch_one(pool)
+    .await?;
+    Ok(hit)
+}
+
 /// Delete an event by id.
 pub async fn delete_event(pool: &SqlitePool, event_id: &str) -> anyhow::Result<bool> {
     let r = sqlx::query("DELETE FROM events WHERE id = ?")
@@ -678,6 +773,35 @@ mod tests {
         let rows = query_events(&p, &filter(serde_json::json!({"kinds": [0]})), None).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content, "new");
+    }
+
+    /// NIP-01 (audit 2026-10): on equal created_at the LOWEST id is retained,
+    /// whichever arrives first; an addressable event without `d` has address ""
+    /// and is replaced like any other.
+    #[tokio::test]
+    async fn replaceable_tie_keeps_lowest_id_and_missing_d_is_empty_address() {
+        let p = pool().await;
+        // Higher id first, then lower id at the same timestamp → lower replaces.
+        assert!(store_event(&p, &ev("bbbb", "alice", 0, 100, vec![], "hi-id")).await.unwrap());
+        assert!(store_event(&p, &ev("aaaa", "alice", 0, 100, vec![], "lo-id")).await.unwrap());
+        let rows = query_events(&p, &filter(serde_json::json!({"kinds": [0]})), None).await.unwrap();
+        assert_eq!(rows.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["aaaa"]);
+        // Lower id already stored, higher id at the same timestamp → refused.
+        assert!(!store_event(&p, &ev("cccc", "alice", 0, 100, vec![], "hi-id-2")).await.unwrap());
+        assert_eq!(query_events(&p, &filter(serde_json::json!({"kinds": [0]})), None).await.unwrap()[0].id, "aaaa");
+
+        // Addressable with no d tag: two versions collapse to one (address "").
+        assert!(store_event(&p, &ev("n1", "alice", 30023, 100, vec![], "no d v1")).await.unwrap());
+        assert!(store_event(&p, &ev("n2", "alice", 30023, 200, vec![], "no d v2")).await.unwrap());
+        let rows = query_events(&p, &filter(serde_json::json!({"kinds": [30023]})), None).await.unwrap();
+        assert_eq!(rows.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["n2"]);
+        let col: (Option<String>,) = sqlx::query_as("SELECT d_tag FROM events WHERE id = 'n2'").fetch_one(&p).await.unwrap();
+        assert_eq!(col.0.as_deref(), Some(""));
+        // Same-timestamp tie for addressable, lowest id wins too.
+        assert!(store_event(&p, &ev("m2", "alice", 30023, 300, vec![vec!["d", "x"]], "")).await.unwrap());
+        assert!(store_event(&p, &ev("m1", "alice", 30023, 300, vec![vec!["d", "x"]], "")).await.unwrap());
+        let rows = query_events(&p, &filter(serde_json::json!({"kinds": [30023], "#d": ["x"]})), None).await.unwrap();
+        assert_eq!(rows.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["m1"]);
     }
 
     #[tokio::test]

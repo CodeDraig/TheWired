@@ -349,3 +349,235 @@ async fn embedded_relay_nonadmin_moddelete_not_stored() {
 
     relay.stop().await;
 }
+
+/// Sign a kind:22242 AUTH response naming `relay_url`.
+fn auth_event(who: &TestIdentity, relay_url: &str, challenge: &str) -> thewired_relay::nostr::event::Event {
+    sign_event(
+        who,
+        22242,
+        vec![
+            vec!["relay".into(), relay_url.to_string()],
+            vec!["challenge".into(), challenge.to_string()],
+        ],
+        "",
+        now(),
+    )
+}
+
+async fn send_auth<S, R>(tx: &mut S, rx: &mut R, ev: &thewired_relay::nostr::event::Event) -> bool
+where
+    S: futures::Sink<Message> + Unpin,
+    S::Error: std::fmt::Debug,
+    R: Stream<Item = Result<Message, WsError>> + Unpin,
+{
+    tx.send(Message::Text(format!(r#"["AUTH",{}]"#, serde_json::to_string(ev).unwrap()).into()))
+        .await
+        .unwrap();
+    let ok = read_until(rx, "OK").await.expect("no OK for AUTH");
+    assert_eq!(ok.get(1).and_then(|v| v.as_str()), Some(ev.id.as_str()));
+    ok.get(2).and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Security audit 2026-10: the embedded (hosted_only) relay used to skip the
+/// NIP-42 `relay` tag check entirely because it is reachable under several
+/// addresses. That enabled challenge forwarding: a hostile relay the victim
+/// connects to relays OUR challenge, the victim signs a 22242 naming the
+/// hostile relay's URL, and that event authenticated the attacker here. The
+/// relay now holds an allow-set of its own addresses (loopback, LAN, tunnel)
+/// and accepts only those.
+#[tokio::test]
+async fn embedded_relay_auth_rejects_foreign_relay_tag_and_accepts_every_own_address() {
+    let alice = TestIdentity::from_seed(7);
+    let db = Db::Sqlite(sqlite::connect_memory().await.unwrap());
+    let relay = server::run_embedded(db, 0, "t".into(), None, Some(alice.pubkey.clone()), false)
+        .await
+        .unwrap();
+    let (ws, _) = connect_async(relay.ws_url()).await.unwrap();
+    let (mut tx, mut rx) = ws.split();
+    let challenge = read_until(&mut rx, "AUTH").await.unwrap()[1].as_str().unwrap().to_string();
+
+    // A 22242 signed for some OTHER relay (what a forwarded challenge yields).
+    assert!(
+        !send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://evil.example.com", &challenge)).await,
+        "a relay tag naming a foreign host must be rejected even on a hosted_only relay"
+    );
+    // A tunnel hostname the relay was never told about is foreign too.
+    assert!(!send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://quick-fox.trycloudflare.com", &challenge)).await);
+
+    // Loopback spellings the local client uses are all accepted.
+    let port = relay.addr.port();
+    for url in [
+        relay.ws_url(),
+        format!("ws://localhost:{port}"),
+        format!("ws://127.0.0.1:{port}/"),
+        format!("WS://LOCALHOST:{port}"),
+    ] {
+        assert!(send_auth(&mut tx, &mut rx, &auth_event(&alice, &url, &challenge)).await, "{url} must be accepted");
+    }
+
+    // Once the host publishes a tunnel, its hostname joins the set (either scheme).
+    relay.add_auth_relay_url("https://quick-fox.trycloudflare.com");
+    assert!(send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://quick-fox.trycloudflare.com", &challenge)).await);
+    assert!(send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://quick-fox.trycloudflare.com/", &challenge)).await);
+    // ...and only that hostname: a sibling subdomain is still foreign.
+    assert!(!send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://lazy-dog.trycloudflare.com", &challenge)).await);
+
+    // Tearing the tunnel down removes it again.
+    relay.remove_auth_relay_url("https://quick-fox.trycloudflare.com");
+    assert!(!send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://quick-fox.trycloudflare.com", &challenge)).await);
+
+    relay.stop().await;
+}
+
+/// Security audit 2026-10: a deleted message stays deleted on the embedded
+/// relay too — re-sending the same signed event after a kind 5 is refused.
+#[tokio::test]
+async fn embedded_relay_refuses_republish_of_deleted_event() {
+    let owner = TestIdentity::from_seed(7);
+    let pool = sqlite::connect_memory().await.unwrap();
+    let relay = server::run_embedded(Db::Sqlite(pool.clone()), 0, "t".into(), None, Some(owner.pubkey.clone()), false)
+        .await
+        .unwrap();
+    let (ws, _) = connect_async(relay.ws_url()).await.unwrap();
+    let (mut tx, mut rx) = ws.split();
+    assert!(read_until(&mut rx, "AUTH").await.is_some());
+
+    let create = sign_event(&owner, 9007, vec![vec!["h".into(), "g".into()]], "G", 1_700_000_000);
+    tx.send(event_frame(&create)).await.unwrap();
+    assert_eq!(read_until(&mut rx, "OK").await.unwrap()[2], true);
+    let chat = sign_event(&owner, 9, vec![vec!["h".into(), "g".into()]], "oops", 1_700_000_001);
+    tx.send(event_frame(&chat)).await.unwrap();
+    assert_eq!(read_until(&mut rx, "OK").await.unwrap()[2], true);
+
+    let del = sign_event(&owner, 5, vec![vec!["e".into(), chat.id.clone()], vec!["h".into(), "g".into()]], "", 1_700_000_002);
+    tx.send(event_frame(&del)).await.unwrap();
+    let ok = read_until(&mut rx, "OK").await.unwrap();
+    assert_eq!(ok[2], true, "{ok}");
+    assert!(sqlite::get_event_by_id(&pool, &chat.id).await.unwrap().is_none());
+
+    tx.send(event_frame(&chat)).await.unwrap();
+    let ok = read_until(&mut rx, "OK").await.unwrap();
+    assert_eq!(ok[2], false, "re-publish of a deleted event must be refused: {ok}");
+    assert!(ok[3].as_str().unwrap().starts_with("deleted:"), "{ok}");
+    assert!(sqlite::get_event_by_id(&pool, &chat.id).await.unwrap().is_none());
+
+    relay.stop().await;
+}
+
+/// Security audit 2026-10: the hosted_only write policy ("only content for
+/// groups this relay hosts") was bypassed by two management kinds that were
+/// answered `OK true` and stored before the policy ran: a kind 5 naming ids the
+/// relay never saw, and a kind 9022 naming any `h` at all. Each was free disk
+/// for a stranger on a publicly tunneled personal relay.
+#[tokio::test]
+async fn embedded_relay_hosted_only_policy_covers_deletions_and_leaves() {
+    let owner = TestIdentity::from_seed(7);
+    let stranger = TestIdentity::from_seed(8);
+    let pool = sqlite::connect_memory().await.unwrap();
+    let relay = server::run_embedded(Db::Sqlite(pool.clone()), 0, "t".into(), None, Some(owner.pubkey.clone()), false)
+        .await
+        .unwrap();
+    let (ws, _) = connect_async(relay.ws_url()).await.unwrap();
+    let (mut tx, mut rx) = ws.split();
+    assert!(read_until(&mut rx, "AUTH").await.is_some());
+
+    // Owner hosts a group and posts in it.
+    let create = sign_event(&owner, 9007, vec![vec!["h".into(), "g".into()]], "G", 1_700_000_000);
+    tx.send(event_frame(&create)).await.unwrap();
+    assert_eq!(read_until(&mut rx, "OK").await.unwrap()[2], true);
+    let chat = sign_event(&owner, 9, vec![vec!["h".into(), "g".into()]], "hi", 1_700_000_001);
+    tx.send(event_frame(&chat)).await.unwrap();
+    assert_eq!(read_until(&mut rx, "OK").await.unwrap()[2], true);
+    let baseline = sqlite::count_events(&pool).await.unwrap();
+
+    async fn send<S, R>(tx: &mut S, rx: &mut R, ev: &thewired_relay::nostr::event::Event) -> serde_json::Value
+    where
+        S: futures::Sink<Message> + Unpin,
+        S::Error: std::fmt::Debug,
+        R: Stream<Item = Result<Message, WsError>> + Unpin,
+    {
+        tx.send(event_frame(ev)).await.unwrap();
+        read_until(rx, "OK").await.unwrap()
+    }
+
+    // Stranger: kind 5 naming ids this relay never saw → refused, not stored.
+    let junk_del = sign_event(&stranger, 5, vec![vec!["e".into(), "ab".repeat(32)]], "", 1_700_000_010);
+    let ok = send(&mut tx, &mut rx, &junk_del).await;
+    assert_eq!(ok[2], false, "stranger kind 5 must be refused: {ok}");
+    // Stranger: kind 5 that merely NAMES the hosted group but deletes nothing of theirs.
+    let tagged_del = sign_event(
+        &stranger,
+        5,
+        vec![vec!["e".into(), chat.id.clone()], vec!["h".into(), "g".into()]],
+        "",
+        1_700_000_011,
+    );
+    let ok = send(&mut tx, &mut rx, &tagged_del).await;
+    assert_eq!(ok[2], false, "stranger kind 5 h-tagged to a hosted group must be refused: {ok}");
+    assert!(sqlite::get_event_by_id(&pool, &chat.id).await.unwrap().is_some(), "owner's message untouched");
+    // Stranger: 9022 leave for an unknown group, and for a hosted group they are not in.
+    for gid in ["nope", "g"] {
+        let leave = sign_event(&stranger, 9022, vec![vec!["h".into(), gid.into()]], "", 1_700_000_012);
+        let ok = send(&mut tx, &mut rx, &leave).await;
+        assert_eq!(ok[2], false, "stranger 9022 for {gid:?} must be refused: {ok}");
+    }
+    assert_eq!(sqlite::count_events(&pool).await.unwrap(), baseline, "nothing of the stranger's was stored");
+
+    // Legitimate paths still work: the owner deletes their own hosted message,
+    // and a real member leaves.
+    let own_del = sign_event(&owner, 5, vec![vec!["e".into(), chat.id.clone()]], "", 1_700_000_020);
+    let ok = send(&mut tx, &mut rx, &own_del).await;
+    assert_eq!(ok[2], true, "owner deleting own message: {ok}");
+    assert!(sqlite::get_event_by_id(&pool, &chat.id).await.unwrap().is_none());
+    let join = sign_event(&stranger, 9021, vec![vec!["h".into(), "g".into()]], "", 1_700_000_021);
+    assert_eq!(send(&mut tx, &mut rx, &join).await[2], true, "open group join");
+    let leave = sign_event(&stranger, 9022, vec![vec!["h".into(), "g".into()]], "", 1_700_000_022);
+    let ok = send(&mut tx, &mut rx, &leave).await;
+    assert_eq!(ok[2], true, "a member may leave: {ok}");
+
+    relay.stop().await;
+}
+
+/// Security audit 2026-10: on the embedded relay the owner-only 9007 path keeps
+/// working for NEW ids, but a second 9007 for an id the relay already hosts is
+/// refused and changes nothing — not even when it comes from the owner and
+/// tries to flip the group's policy flags.
+#[tokio::test]
+async fn embedded_relay_refuses_recreate_of_existing_group() {
+    let owner = TestIdentity::from_seed(7);
+    let pool = sqlite::connect_memory().await.unwrap();
+    let relay = server::run_embedded(Db::Sqlite(pool.clone()), 0, "t".into(), None, Some(owner.pubkey.clone()), false)
+        .await
+        .unwrap();
+    let (ws, _) = connect_async(relay.ws_url()).await.unwrap();
+    let (mut tx, mut rx) = ws.split();
+    assert!(read_until(&mut rx, "AUTH").await.is_some());
+
+    let create = sign_event(&owner, 9007, vec![vec!["h".into(), "g".into()]], "Open", 1_700_000_000);
+    tx.send(event_frame(&create)).await.unwrap();
+    let ok = read_until(&mut rx, "OK").await.unwrap();
+    assert_eq!(ok.get(2).and_then(|v| v.as_bool()), Some(true), "first create: {ok}");
+
+    let again = sign_event(
+        &owner,
+        9007,
+        vec![vec!["h".into(), "g".into()], vec!["private".into()], vec!["closed".into()]],
+        "Flip",
+        1_700_000_001,
+    );
+    tx.send(event_frame(&again)).await.unwrap();
+    let ok2 = read_until(&mut rx, "OK").await.unwrap();
+    assert_eq!(ok2.get(2).and_then(|v| v.as_bool()), Some(false), "re-create must be refused: {ok2}");
+    assert!(ok2.get(3).and_then(|v| v.as_str()).unwrap_or("").contains("already exists"));
+
+    let (name, is_private, is_closed): (String, bool, bool) =
+        sqlx::query_as("SELECT name, is_private, is_closed FROM groups WHERE group_id = 'g'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(name, "Open");
+    assert!(!is_private && !is_closed, "re-create must not flip the flags");
+    assert!(sqlite::get_event_by_id(&pool, &again.id).await.unwrap().is_none(), "refused 9007 not stored");
+
+    relay.stop().await;
+}

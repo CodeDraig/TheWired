@@ -25,8 +25,16 @@ pub struct AppState {
     pub broadcast_tx: broadcast::Sender<Event>,
     pub relay_identity: RelayIdentity,
     pub active_connections: AtomicUsize,
-    /// Relay WebSocket URL used for NIP-42 AUTH challenge verification
+    /// The relay's canonical WebSocket URL (logs, NIP-11).
     pub relay_url: String,
+    /// NIP-42 allow-set: every address a kind-22242 `relay` tag may name —
+    /// `relay_url` plus any extra configured URL; for the embedded relay its
+    /// loopback, LAN and (added at runtime) tunnel addresses. Compared after
+    /// `nip42::normalize_relay_url`. SECURITY (audit 2026-10): the check is
+    /// applied in every deployment mode; an "accept any relay tag" mode let a
+    /// hostile relay forward our challenge and authenticate with a 22242 the
+    /// user signed for it.
+    pub auth_relay_urls: std::sync::RwLock<Vec<String>>,
     /// SECURITY: when true (the embedded relay, which can be publicly tunneled),
     /// only accept events destined for groups this relay actually hosts, and
     /// only let `owner_pubkey` create groups — so a stranger can't turn a
@@ -105,6 +113,9 @@ pub async fn run(config: Config, pool: Db) -> anyhow::Result<()> {
     }
     tracing::info!(gate = ?config.wrap_auth_gate, "Gift-wrap AUTH gate mode");
 
+    let mut auth_relay_urls = vec![relay_url.clone()];
+    auth_relay_urls.extend(config.auth_relay_urls.iter().cloned());
+
     let state = Arc::new(AppState {
         pool,
         config,
@@ -112,6 +123,7 @@ pub async fn run(config: Config, pool: Db) -> anyhow::Result<()> {
         relay_identity,
         active_connections: AtomicUsize::new(0),
         relay_url,
+        auth_relay_urls: std::sync::RwLock::new(auth_relay_urls),
         // Production is a multi-tenant relay; rate limits live in connection.rs.
         hosted_only: false,
         owner_pubkey: None,
@@ -158,6 +170,8 @@ pub struct EmbeddedRelay {
     pub pubkey: String,
     /// `ws://<lan-ip>:<port>` when bound to the LAN (`0.0.0.0`), else None.
     pub lan_url: Option<String>,
+    /// Shared with the server task; holds the NIP-42 allow-set.
+    state: Arc<AppState>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     join: tokio::task::JoinHandle<()>,
     sweeper: tokio::task::JoinHandle<()>,
@@ -165,6 +179,34 @@ pub struct EmbeddedRelay {
 
 #[cfg(feature = "embedded")]
 impl EmbeddedRelay {
+    /// Register a public address this relay is now reachable under (a tunnel
+    /// hostname or a user-supplied public URL) so AUTH events whose `relay`
+    /// tag names it are accepted. Any `ws(s)://` or `https://` spelling works;
+    /// only the host[:port] is compared. Idempotent.
+    pub fn add_auth_relay_url(&self, url: &str) {
+        let normalized = crate::protocol::nip42::normalize_relay_url(url);
+        if normalized.is_empty() {
+            return;
+        }
+        let mut set = self.state.auth_relay_urls.write().unwrap_or_else(|e| e.into_inner());
+        if !set.iter().any(|u| crate::protocol::nip42::normalize_relay_url(u) == normalized) {
+            set.push(url.trim().to_string());
+        }
+    }
+
+    /// Forget a public address (the tunnel went down / the custom URL was
+    /// replaced) so a 22242 naming it is rejected again.
+    pub fn remove_auth_relay_url(&self, url: &str) {
+        let normalized = crate::protocol::nip42::normalize_relay_url(url);
+        let mut set = self.state.auth_relay_urls.write().unwrap_or_else(|e| e.into_inner());
+        set.retain(|u| crate::protocol::nip42::normalize_relay_url(u) != normalized);
+    }
+
+    /// The current NIP-42 allow-set (loopback, LAN, tunnel), as configured.
+    pub fn auth_relay_urls(&self) -> Vec<String> {
+        self.state.auth_relay_urls.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// The `ws://` URL a local client uses to connect. When the relay is bound to
     /// `0.0.0.0`/`::` (LAN mode), the unspecified bind address isn't a connectable
     /// target — report loopback for local clients; the LAN address is surfaced
@@ -228,12 +270,17 @@ pub async fn run_embedded(
         Err(e) => return Err(e.into()),
     };
     let addr = listener.local_addr()?;
-    let relay_url = format!("ws://{}", addr);
+    // Local clients dial loopback (never the unspecified bind address).
+    let relay_url = format!("ws://127.0.0.1:{}", addr.port());
     let lan_url = if bind_lan {
         local_lan_ip().map(|ip| format!("ws://{}:{}", ip, addr.port()))
     } else {
         None
     };
+    // NIP-42 allow-set: loopback (localhost/[::1] normalize to it) and the LAN
+    // address. Tunnel hostnames are added later via `add_auth_relay_url`.
+    let mut auth_relay_urls = vec![relay_url.clone()];
+    auth_relay_urls.extend(lan_url.iter().cloned());
 
     let config = Config {
         database_url: String::new(),
@@ -252,6 +299,7 @@ pub async fn run_embedded(
         relay_identity,
         active_connections: AtomicUsize::new(0),
         relay_url,
+        auth_relay_urls: std::sync::RwLock::new(auth_relay_urls),
         // Personal relay (possibly publicly tunneled): only host its own groups,
         // and only the owner may create them.
         hosted_only: true,
@@ -261,10 +309,11 @@ pub async fn run_embedded(
 
     let sweeper = spawn_sweeper(state.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_state = state.clone();
     let join = tokio::spawn(async move {
         let server = axum::serve(
             listener,
-            build_app(state).into_make_service_with_connect_info::<SocketAddr>(),
+            build_app(server_state).into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.await;
@@ -279,6 +328,7 @@ pub async fn run_embedded(
         addr,
         pubkey,
         lan_url,
+        state,
         shutdown: Some(shutdown_tx),
         join,
         sweeper,
@@ -416,6 +466,13 @@ async fn root_handler(
             let broadcast_rx = state.broadcast_tx.subscribe();
             tracing::debug!(remote = %addr, "WebSocket upgrade");
             let resp: Response = ws
+                // Cap what tungstenite will buffer for one message / one frame
+                // at the advertised limit. Without this the library defaults
+                // (64 MiB message, 16 MiB frame) applied and the 128 KiB check
+                // in the connection loop ran only after the whole frame was in
+                // memory (security audit 2026-10).
+                .max_message_size(connection::MAX_MESSAGE_SIZE)
+                .max_frame_size(connection::MAX_MESSAGE_SIZE)
                 .on_upgrade(move |socket| {
                     connection::handle_connection(socket, state, broadcast_rx, addr, client_ip)
                 })
