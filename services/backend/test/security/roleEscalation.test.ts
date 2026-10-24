@@ -20,7 +20,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { eq, and } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import { buildTestServer, closeTestServer } from "../helpers/testServer.js";
 import { LUNA, MARCUS, DECKARD, ZARA, JAYDEE, type TestUser } from "../helpers/testUsers.js";
 import { db } from "../../src/db/connection.js";
@@ -285,11 +285,21 @@ describe("onboarding answer mappings", () => {
 // ── PROBE B — defence in depth: a foreign role row must be inert ─────────
 
 describe("permission checks are scoped to the space's own roles", () => {
-  it("a foreign admin role row in member_roles grants nothing", async () => {
+  it("a foreign admin role row in member_roles is refused by the database and would grant nothing anyway", async () => {
     await createSpace(LUNA, VICTIM, "Victim");
     await createSpace(MARCUS, EVIL, "Evil");
     const evilAdmin = await adminRole(EVIL);
-    await addMember(VICTIM, MARCUS.pubkey, evilAdmin.id);
+    await db.insert(spaceMembers).values({ spaceId: VICTIM, pubkey: MARCUS.pubkey }).onConflictDoNothing();
+    // The composite FK (migration 0036) rejects the row outright…
+    await expect(
+      db.insert(memberRoles).values({ spaceId: VICTIM, pubkey: MARCUS.pubkey, roleId: evilAdmin.id }),
+    ).rejects.toThrow(/member_roles_role_in_space_fk/);
+    // …and even a row that slipped in (simulated by bypassing the FK) is inert
+    // because every role lookup is scoped to the space.
+    await db.execute(sql`ALTER TABLE app.member_roles DISABLE TRIGGER ALL`);
+    await db.insert(memberRoles).values({ spaceId: VICTIM, pubkey: MARCUS.pubkey, roleId: evilAdmin.id });
+    await db.execute(sql`ALTER TABLE app.member_roles ENABLE TRIGGER ALL`);
+    expect(await roleRowsFor(VICTIM, MARCUS.pubkey)).toHaveLength(1);
 
     expect(await allowed(VICTIM, MARCUS.pubkey, "MANAGE_SPACE")).toBe(false);
     expect(await allowed(VICTIM, MARCUS.pubkey, "SEND_MESSAGES")).toBe(false);
