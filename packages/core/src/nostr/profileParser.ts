@@ -1,4 +1,5 @@
 import type { NostrEvent, UnsignedEvent } from "@ishtarservices/shared-types";
+import { parseUrl } from "../media/url";
 
 /**
  * Parsed kind:0 profile content — the single hardened parser shared by
@@ -56,19 +57,42 @@ export function parseProfile(event: NostrEvent): ParsedProfile | null {
   const str = (v: unknown): string | undefined =>
     typeof v === "string" ? v : undefined;
 
+  // These three land in href/src attributes on every client. The explicit keys
+  // below override the raw copy in `preserved`, so a rejected value is absent
+  // from the parsed profile (and from a later republish) rather than leaking.
   return {
     ...preserved,
     name: str(obj.name),
     display_name: str(obj.display_name),
     about: str(obj.about),
-    picture: str(obj.picture),
-    banner: str(obj.banner),
+    picture: httpUrl(obj.picture),
+    banner: httpUrl(obj.banner),
     nip05: str(obj.nip05),
     lud16: str(obj.lud16),
     lud06: str(obj.lud06),
-    website: str(obj.website),
+    website: httpUrl(obj.website),
     created_at: event.created_at,
   };
+}
+
+/**
+ * Accept only an absolute `http:`/`https:` URL (trimmed, no control chars);
+ * anything else — `javascript:`, `data:`, protocol-relative `//host`, a bare
+ * domain, a relative path — is dropped. Returns the author's string (not the
+ * WHATWG-normalized form) so a valid URL is preserved exactly as published.
+ */
+export function httpUrl(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const s = v.trim();
+  if (!s || s.length > 2048) return undefined;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f\s]/.test(s)) return undefined;
+  try {
+    const u = parseUrl(s);
+    return u.protocol === "http:" || u.protocol === "https:" ? s : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Build an unsigned kind:0 metadata event.
