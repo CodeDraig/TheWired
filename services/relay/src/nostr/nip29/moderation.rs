@@ -58,12 +58,31 @@ pub async fn handle_remove_user(db: &Db, event: &Event) -> anyhow::Result<Vec<St
         .filter_map(|t| t.get(1).cloned())
         .collect();
 
+    // A group must keep at least one admin (audit 2026-10): removing the last
+    // one — including an admin removing themself — would leave it with nobody
+    // able to moderate or delete it. Delete the group (9008) instead.
+    if would_remove_last_admin(db, &group_id, &targets).await? {
+        return Ok(vec![format!(
+            r#"["OK","{}",false,"restricted: a group must keep at least one admin"]"#,
+            event.id
+        )]);
+    }
+
     for pubkey in &targets {
         db.remove_member(&group_id, pubkey).await?;
     }
 
     tracing::info!("Removed {} members from group {}", targets.len(), group_id);
     Ok(vec![format!(r#"["OK","{}",true,""]"#, event.id)])
+}
+
+/// Would removing `leaving` from the group leave it without any admin?
+pub async fn would_remove_last_admin(db: &Db, group_id: &str, leaving: &[String]) -> anyhow::Result<bool> {
+    let admins = db.get_group_admins(group_id).await?;
+    if admins.is_empty() {
+        return Ok(false);
+    }
+    Ok(admins.iter().all(|a| leaving.contains(a)))
 }
 
 /// What a kind-5 did: the OK frame(s), how many distinct `e`/`a` targets it

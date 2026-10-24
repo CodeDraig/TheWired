@@ -225,13 +225,16 @@ pub async fn delete_group(pool: &PgPool, group_id: &str) -> anyhow::Result<()> {
 }
 
 /// SECURITY: does a backend-authoritative (platform / A-lite) space already own
-/// this id? Used to refuse a colliding relay-native 9007 create. `app.*` being
-/// absent (embedded SQLite relay) is treated as "no collision".
+/// this id? Used to refuse a colliding relay-native 9007 create and to pick
+/// the 9005 authority model. Errors propagate (audit 2026-10): a failed lookup
+/// used to read as "no collision", so a transient DB error let a 9007 claim a
+/// platform space's id and a 9005 fall back to relay-group admins. The
+/// embedded SQLite relay never reaches this function (`Db::Sqlite` answers
+/// `false` directly).
 pub async fn platform_space_exists(pool: &PgPool, group_id: &str) -> anyhow::Result<bool> {
     let collides: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM app.spaces WHERE id = $1 LIMIT 1")
         .bind(group_id)
         .fetch_optional(pool)
-        .await
-        .unwrap_or(None);
+        .await?;
     Ok(collides.is_some())
 }

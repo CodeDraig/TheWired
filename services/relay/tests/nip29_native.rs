@@ -13,7 +13,7 @@ mod common;
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use common::{make_app_state, send_event, setup_test_pool, sign_event, sign_h_tagged, TestIdentity};
+use common::{make_app_state, send_event, setup_test_pool, sign_event, sign_h_tagged, test_db_url, TestIdentity};
 use thewired_relay::db::membership_source;
 use thewired_relay::protocol::handler::handle_message;
 use thewired_relay::protocol::subscription::SubscriptionManager;
@@ -373,6 +373,113 @@ async fn private_group_admin_and_member_lists_are_members_only() {
     assert_eq!(h_of(39002, private_id).await.as_deref(), Some(private_id));
     assert_eq!(h_of(39000, private_id).await, None);
     assert_eq!(h_of(39002, public_id).await, None);
+}
+
+/// Audit 2026-10: NIP-29 management kinds the relay does not implement
+/// (9003/9004/9006/9009/9020) were stored for any member as if they were
+/// authoritative group changes. Only the group's admins may publish them.
+#[tokio::test]
+async fn unimplemented_management_kinds_require_admin() {
+    let pool = pool_or_skip!();
+    let (state, tx) = make_app_state(pool.clone());
+    let admin = TestIdentity::from_seed(51);
+    let member = TestIdentity::from_seed(52);
+    let gid = "native-grp-mgmt";
+    assert!(parse_ok(&send_event(&state, &tx, &create_group_event(&admin, gid, "G")).await).0);
+    assert!(parse_ok(&send_event(&state, &tx, &sign_h_tagged(&member, 9021, gid, "")).await).0);
+
+    for kind in [9003, 9004, 9006, 9009, 9020] {
+        let tags = vec![vec!["h".into(), gid.into()], vec!["p".into(), member.pubkey.clone(), "admin".into()]];
+        let from_member = sign_event(&member, kind, tags.clone(), "", 1_700_000_000);
+        let (ok, msg) = parse_ok(&send_event(&state, &tx, &from_member).await);
+        assert!(!ok && msg.starts_with("restricted:"), "kind {kind} from a plain member must be refused, got ok={ok} msg={msg}");
+        assert!(state.pool.get_event_by_id(&from_member.id).await.unwrap().is_none(), "kind {kind} not stored");
+
+        let no_h = sign_event(&admin, kind, vec![], "", 1_700_000_000);
+        assert!(!parse_ok(&send_event(&state, &tx, &no_h).await).0, "kind {kind} without h is refused");
+
+        let from_admin = sign_event(&admin, kind, tags, "", 1_700_000_001);
+        let (ok, msg) = parse_ok(&send_event(&state, &tx, &from_admin).await);
+        assert!(ok, "kind {kind} from an admin is accepted, got {msg}");
+    }
+}
+
+/// Audit 2026-10: a group keeps at least one admin. Any admin could 9001 the
+/// creator (or themself) out and the last admin could 9022 away, leaving a
+/// group nobody can moderate or delete.
+#[tokio::test]
+async fn last_admin_cannot_be_removed_or_leave() {
+    let pool = pool_or_skip!();
+    let (state, tx) = make_app_state(pool.clone());
+    let creator = TestIdentity::from_seed(53);
+    let member = TestIdentity::from_seed(54);
+    let second = TestIdentity::from_seed(55);
+    let gid = "native-grp-last-admin";
+    assert!(parse_ok(&send_event(&state, &tx, &create_group_event(&creator, gid, "G")).await).0);
+    assert!(parse_ok(&send_event(&state, &tx, &sign_h_tagged(&member, 9021, gid, "")).await).0);
+
+    let remove = |who: &TestIdentity, target: &str, ts: i64| {
+        sign_event(who, 9001, vec![vec!["h".into(), gid.into()], vec!["p".into(), target.into()]], "", ts)
+    };
+
+    // Sole admin removing themself, or leaving: refused, still admin + member.
+    let (ok, msg) = parse_ok(&send_event(&state, &tx, &remove(&creator, &creator.pubkey, 1_700_000_001)).await);
+    assert!(!ok && msg.starts_with("restricted:"), "got ok={ok} msg={msg}");
+    let (ok, msg) = parse_ok(&send_event(&state, &tx, &sign_h_tagged(&creator, 9022, gid, "")).await);
+    assert!(!ok && msg.starts_with("restricted:"), "got ok={ok} msg={msg}");
+    assert!(state.pool.is_admin(gid, &creator.pubkey).await.unwrap());
+    assert!(membership_source::is_member(&pool, gid, &creator.pubkey).await.unwrap());
+
+    // Kicking an ordinary member still works; a plain member still cannot kick.
+    assert!(!parse_ok(&send_event(&state, &tx, &remove(&member, &creator.pubkey, 1_700_000_002)).await).0);
+    assert!(parse_ok(&send_event(&state, &tx, &remove(&creator, &member.pubkey, 1_700_000_003)).await).0);
+    assert!(!membership_source::is_member(&pool, gid, &member.pubkey).await.unwrap());
+
+    // With a second admin, either may be removed / leave — but not both at once.
+    sqlx::query("INSERT INTO relay.group_members (group_id, pubkey) VALUES ($1, $2)")
+        .bind(gid).bind(&second.pubkey).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO relay.group_roles (group_id, pubkey, role) VALUES ($1, $2, 'admin')")
+        .bind(gid).bind(&second.pubkey).execute(&pool).await.unwrap();
+    let both = sign_event(
+        &creator,
+        9001,
+        vec![vec!["h".into(), gid.into()], vec!["p".into(), creator.pubkey.clone()], vec!["p".into(), second.pubkey.clone()]],
+        "",
+        1_700_000_004,
+    );
+    assert!(!parse_ok(&send_event(&state, &tx, &both).await).0, "removing every admin at once is refused");
+    assert!(parse_ok(&send_event(&state, &tx, &sign_h_tagged(&creator, 9022, gid, "")).await).0, "creator may leave now");
+    assert!(!state.pool.is_admin(gid, &creator.pubkey).await.unwrap());
+    assert!(state.pool.is_admin(gid, &second.pubkey).await.unwrap());
+    // ...and `second` is now the last admin.
+    assert!(!parse_ok(&send_event(&state, &tx, &sign_h_tagged(&second, 9022, gid, "")).await).0);
+}
+
+/// Audit 2026-10: `platform_space_exists` swallowed DB errors as "no
+/// collision". Against a database without the `app` schema the lookup must
+/// error, and a 9007 must then fail closed instead of creating the group.
+#[tokio::test]
+async fn platform_space_lookup_fails_closed() {
+    // A database this role can reach that has no `app.*` (nor `relay.*`).
+    let url = test_db_url().rsplit_once('/').map(|(base, _)| format!("{base}/postgres")).unwrap();
+    let Ok(bare) = sqlx::PgPool::connect(&url).await else {
+        eprintln!("SKIP: no bare database reachable at {url}");
+        return;
+    };
+    let present: Option<String> = sqlx::query_scalar("SELECT to_regclass('app.spaces')::text")
+        .fetch_one(&bare)
+        .await
+        .unwrap();
+    if present.is_some() {
+        eprintln!("SKIP: {url} has app.spaces");
+        return;
+    }
+    assert!(thewired_relay::db::group_store::platform_space_exists(&bare, "x").await.is_err());
+
+    let (state, tx) = make_app_state(bare);
+    let creator = TestIdentity::from_seed(56);
+    let (ok, msg) = parse_ok(&send_event(&state, &tx, &create_group_event(&creator, "fail-closed", "G")).await);
+    assert!(!ok && msg.starts_with("error:"), "9007 must fail closed on a lookup error, got ok={ok} msg={msg}");
 }
 
 /// Latest relay-signed event of `kind` for the group (tags as JSON text).

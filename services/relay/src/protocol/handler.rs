@@ -199,6 +199,15 @@ async fn handle_event(
         Err(_) => return vec![r#"["NOTICE","invalid event"]"#.to_string()],
     };
 
+    // created_at bounds (audit 2026-10): negative or far-future timestamps are
+    // refused before the (CPU-bound) signature check.
+    if !crate::nostr::event::created_at_in_bounds(event.created_at, wrap_gate::unix_now()) {
+        return vec![format!(
+            r#"["OK","{}",false,"invalid: created_at is negative or too far in the future"]"#,
+            event.id
+        )];
+    }
+
     // NIP-40: an already-expired event is dropped on receipt.
     if wrap_gate::is_expired(&event, wrap_gate::unix_now()) {
         return vec![format!(r#"["OK","{}",false,"invalid: event expired"]"#, event.id)];
@@ -393,6 +402,24 @@ async fn handle_event(
             store_and_broadcast_if_ok(state, broadcast_tx, &result, event).await;
             republish_metadata_if_ok(state, broadcast_tx, &result, group_id).await;
             return result;
+        }
+        // NIP-29 management kinds the relay does not implement (edit status,
+        // add/remove permission, set role, create invite). They used to fall
+        // through to the regular-content path and were stored for any group
+        // member; other NIP-29 clients read them as authoritative group
+        // changes. Accept them from the group's admins only (audit 2026-10).
+        9003 | 9004 | 9006 | 9009 | 9020 => {
+            let authorized = match event.get_tag_value("h") {
+                Some(gid) => state.pool.is_admin(&gid, &event.pubkey).await.unwrap_or(false),
+                None => false,
+            };
+            if !authorized {
+                return vec![format!(
+                    r#"["OK","{}",false,"restricted: not authorized"]"#,
+                    event.id
+                )];
+            }
+            // An admin's event is stored like regular group content below.
         }
         9022 => {
             let group_id = event.get_tag_value("h");

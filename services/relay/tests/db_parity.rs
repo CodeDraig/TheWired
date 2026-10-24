@@ -34,6 +34,10 @@ struct Obs {
     by_id_count: usize,
     by_author_count: usize,
     by_kind_ids_newest_first: Vec<String>,
+    tie_lower_replaces_higher: bool,
+    tie_higher_refused_after_lower: bool,
+    tie_survivor_is_lowest: bool,
+    dless_addressable_count: usize,
     group_created: bool,
     group_recreated: bool,
     recreate_made_bob_admin: bool,
@@ -81,6 +85,32 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
     let inserted_first = db.store_event(&note_a).await.unwrap();
     let inserted_dup = db.store_event(&note_a).await.unwrap(); // same id → ignored
     let inserted_second = db.store_event(&note_b).await.unwrap();
+
+    // --- replaceable tie-break (audit 2026-10): equal created_at → lowest id
+    //     survives whichever arrives first; a d-less addressable collapses to "" ---
+    let (tie_lo, tie_hi) = {
+        let x = sign_event(alice, 10002, vec![], "x", 300);
+        let y = sign_event(alice, 10002, vec![], "y", 300);
+        if x.id < y.id { (x, y) } else { (y, x) }
+    };
+    db.store_event(&tie_hi).await.unwrap();
+    let tie_lower_replaces_higher = db.store_event(&tie_lo).await.unwrap();
+    let tie_higher_refused_after_lower = db.store_event(&tie_hi).await.unwrap();
+    let tie_survivor = db
+        .query_events(&filt(serde_json::json!({ "kinds": [10002], "authors": [alice.pubkey] })), None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect::<Vec<_>>();
+    let tie_survivor_is_lowest = tie_survivor == vec![tie_lo.id.clone()];
+    db.store_event(&sign_event(alice, 30023, vec![], "nod-1", 300)).await.unwrap();
+    db.store_event(&sign_event(alice, 30023, vec![], "nod-2", 301)).await.unwrap();
+    let dless_addressable_count = db
+        .query_events(&filt(serde_json::json!({ "kinds": [30023], "authors": [alice.pubkey] })), None)
+        .await
+        .unwrap()
+        .len();
 
     let by_id = db
         .query_events(&filt(serde_json::json!({ "ids": [note_a.id] })), None)
@@ -193,6 +223,10 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
         by_id_count: by_id.len(),
         by_author_count: by_author.len(),
         by_kind_ids_newest_first: by_kind.iter().map(|e| e.id.clone()).collect(),
+        tie_lower_replaces_higher,
+        tie_higher_refused_after_lower,
+        tie_survivor_is_lowest,
+        dless_addressable_count,
         group_created,
         group_recreated,
         recreate_made_bob_admin,
@@ -250,6 +284,10 @@ fn expected(alice: &TestIdentity, bob: &TestIdentity, note_a_id: &str, note_b_id
         by_author_count: 1,
         // newest-first: note_b (ts 101) before note_a (ts 100)
         by_kind_ids_newest_first: vec![note_b_id.to_string(), note_a_id.to_string()],
+        tie_lower_replaces_higher: true,
+        tie_higher_refused_after_lower: false,
+        tie_survivor_is_lowest: true,
+        dless_addressable_count: 1,
         group_created: true,
         group_recreated: false,
         recreate_made_bob_admin: false,
