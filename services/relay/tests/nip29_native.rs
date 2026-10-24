@@ -279,6 +279,102 @@ async fn open_group_join_adds_member_and_republishes_39002() {
     assert!(members_tags.contains(&joiner.pubkey), "republished 39002 should include the joiner");
 }
 
+/// Kinds of the EVENT frames a REQ with `filter` returns to a connection
+/// authenticated as `authed` (None = anonymous), plus the CLOSED reason if any.
+async fn req_kinds(
+    state: &Arc<thewired_relay::server::AppState>,
+    tx: &tokio::sync::broadcast::Sender<thewired_relay::nostr::event::Event>,
+    authed: Option<&str>,
+    filter: serde_json::Value,
+) -> (Vec<i64>, Option<String>) {
+    let req = serde_json::json!(["REQ", "s", filter]).to_string();
+    let subs = Arc::new(tokio::sync::Mutex::new(SubscriptionManager::new()));
+    let mut authed: Option<String> = authed.map(str::to_string);
+    let mut memberships: HashSet<String> = HashSet::new();
+    let resp = handle_message(&req, state, &subs, &mut authed, &mut memberships, "ch", tx).await;
+    let frames: Vec<serde_json::Value> = resp.iter().map(|r| serde_json::from_str(r).unwrap()).collect();
+    let kinds = frames
+        .iter()
+        .filter(|f| f[0] == "EVENT")
+        .filter_map(|f| f[2]["kind"].as_i64())
+        .collect();
+    let closed = frames.iter().find(|f| f[0] == "CLOSED").map(|f| f[2].as_str().unwrap_or("").to_string());
+    (kinds, closed)
+}
+
+/// Security audit 2026-10: the relay-signed admin (39001) and member (39002)
+/// lists of a PRIVATE group were public — built with only a `d` tag, so the
+/// anonymous visibility predicate let anyone enumerate who is in a members-only
+/// group. They now carry the group's `h` tag and are served to members only;
+/// 39000 (name + private/closed markers) stays public so a non-member can
+/// discover the group and know it must authenticate / request to join.
+#[tokio::test]
+async fn private_group_admin_and_member_lists_are_members_only() {
+    let pool = pool_or_skip!();
+    let (state, tx) = make_app_state(pool.clone());
+    let creator = TestIdentity::from_seed(41);
+    let member = TestIdentity::from_seed(42);
+    let stranger = TestIdentity::from_seed(43);
+    let private_id = "native-grp-private-lists";
+    let public_id = "native-grp-public-lists";
+
+    let create = sign_event(
+        &creator,
+        9007,
+        vec![vec!["h".into(), private_id.into()], vec!["private".into()]],
+        "Secret",
+        1_700_000_000,
+    );
+    assert!(parse_ok(&send_event(&state, &tx, &create).await).0);
+    // Open-but-private: a join adds the member and republishes the lists.
+    assert!(parse_ok(&send_event(&state, &tx, &sign_h_tagged(&member, 9021, private_id, "")).await).0);
+    assert!(parse_ok(&send_event(&state, &tx, &create_group_event(&creator, public_id, "Open")).await).0);
+
+    let lists = |gid: &str| serde_json::json!({ "kinds": [39001, 39002], "#d": [gid] });
+    let meta = |gid: &str| serde_json::json!({ "kinds": [39000], "#d": [gid] });
+
+    // Anonymous and a non-member: no admin/member list for the private group.
+    let (kinds, _) = req_kinds(&state, &tx, None, lists(private_id)).await;
+    assert!(kinds.is_empty(), "anonymous must not read a private group's lists, got {kinds:?}");
+    let (kinds, _) = req_kinds(&state, &tx, Some(&stranger.pubkey), lists(private_id)).await;
+    assert!(kinds.is_empty(), "a non-member must not read a private group's lists, got {kinds:?}");
+    // ...but its 39000 is still discoverable.
+    let (kinds, _) = req_kinds(&state, &tx, None, meta(private_id)).await;
+    assert_eq!(kinds, vec![39000], "39000 of a private group stays public");
+
+    // Members (creator and joiner) read both lists.
+    for who in [&creator, &member] {
+        let (mut kinds, _) = req_kinds(&state, &tx, Some(&who.pubkey), lists(private_id)).await;
+        kinds.sort();
+        assert_eq!(kinds, vec![39001, 39002], "member {} must read the lists", who.pubkey);
+    }
+
+    // Public groups are unchanged: anyone reads all three.
+    let (mut kinds, _) = req_kinds(&state, &tx, None, serde_json::json!({ "kinds": [39000, 39001, 39002], "#d": [public_id] })).await;
+    kinds.sort();
+    assert_eq!(kinds, vec![39000, 39001, 39002]);
+
+    // Stored rows carry the gate: private lists are h-tagged, 39000 and public ones not.
+    let h_of = |kind: i32, gid: &str| {
+        let pool = pool.clone();
+        let gid = gid.to_string();
+        async move {
+            let (h,): (Option<String>,) =
+                sqlx::query_as("SELECT h_tag FROM relay.events WHERE kind = $1 AND d_tag = $2")
+                    .bind(kind)
+                    .bind(&gid)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            h
+        }
+    };
+    assert_eq!(h_of(39001, private_id).await.as_deref(), Some(private_id));
+    assert_eq!(h_of(39002, private_id).await.as_deref(), Some(private_id));
+    assert_eq!(h_of(39000, private_id).await, None);
+    assert_eq!(h_of(39002, public_id).await, None);
+}
+
 /// Latest relay-signed event of `kind` for the group (tags as JSON text).
 async fn latest_metadata(pool: &sqlx::PgPool, kind: i32, group_id: &str) -> Option<String> {
     let row: Option<(String,)> = sqlx::query_as(

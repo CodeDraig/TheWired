@@ -45,6 +45,11 @@ struct Obs {
     unified_member_alice: bool,
     members_of_alice_has_g1: bool,
     any_private_default: bool,
+    private_lists_anon: Vec<String>,
+    private_lists_stranger: Vec<String>,
+    private_lists_member: Vec<String>,
+    private_meta_anon: Vec<String>,
+    public_lists_anon: Vec<String>,
     members_after_remove: Vec<String>,
     group_has_bob_after_remove: bool,
     existed_before_delete: bool,
@@ -104,6 +109,30 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
     let members_of_alice_has_g1 = db.members_of(&alice.pubkey).await.unwrap().contains("g1");
     let any_private_default = db.any_private(&["g1".into()]).await.unwrap();
 
+    // --- relay-signed group lists: private groups' 39001/39002 are members-only
+    //     (security audit 2026-10); 39000 and public groups' lists stay public ---
+    {
+        use thewired_relay::nostr::nip29::metadata::publish_group_metadata;
+        use thewired_relay::relay_identity::RelayIdentity;
+        let identity = RelayIdentity::new(None, "test");
+        let (btx, _) = tokio::sync::broadcast::channel(16);
+        db.create_group("g-priv", "Private", &alice.pubkey).await.unwrap();
+        db.set_group_flags("g-priv", true, false).await.unwrap();
+        publish_group_metadata(db, &identity, &btx, "g-priv").await;
+        publish_group_metadata(db, &identity, &btx, "g1").await; // public, has alice + bob
+    }
+    let lists = |gid: &str| filt(serde_json::json!({ "kinds": [39001, 39002], "#d": [gid] }));
+    let kinds = |evs: Vec<thewired_relay::nostr::event::Event>| sorted(evs.iter().map(|e| e.kind.to_string()).collect());
+    let private_lists_anon = kinds(db.query_events(&lists("g-priv"), None).await.unwrap());
+    let private_lists_stranger = kinds(db.query_events(&lists("g-priv"), Some(&bob.pubkey)).await.unwrap());
+    let private_lists_member = kinds(db.query_events(&lists("g-priv"), Some(&alice.pubkey)).await.unwrap());
+    let private_meta_anon = kinds(
+        db.query_events(&filt(serde_json::json!({ "kinds": [39000], "#d": ["g-priv"] })), None)
+            .await
+            .unwrap(),
+    );
+    let public_lists_anon = kinds(db.query_events(&lists("g1"), None).await.unwrap());
+
     db.remove_member("g1", &bob.pubkey).await.unwrap();
     let members_after_remove = sorted(db.get_members("g1").await.unwrap());
     let group_has_bob_after_remove = db.group_has_member("g1", &bob.pubkey).await.unwrap();
@@ -159,6 +188,11 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
         unified_member_alice,
         members_of_alice_has_g1,
         any_private_default,
+        private_lists_anon,
+        private_lists_stranger,
+        private_lists_member,
+        private_meta_anon,
+        public_lists_anon,
         members_after_remove,
         group_has_bob_after_remove,
         existed_before_delete,
@@ -205,6 +239,11 @@ fn expected(alice: &TestIdentity, bob: &TestIdentity, note_a_id: &str, note_b_id
         unified_member_alice: true,
         members_of_alice_has_g1: true,
         any_private_default: false,
+        private_lists_anon: vec![],
+        private_lists_stranger: vec![],
+        private_lists_member: vec!["39001".into(), "39002".into()],
+        private_meta_anon: vec!["39000".into()],
+        public_lists_anon: vec!["39001".into(), "39002".into()],
         members_after_remove: vec![alice.pubkey.clone()],
         group_has_bob_after_remove: false,
         existed_before_delete: true,
