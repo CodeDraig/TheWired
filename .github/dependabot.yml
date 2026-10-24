@@ -1,0 +1,92 @@
+# Dependabot configuration.
+#
+# Weekly version updates per ecosystem, with minor/patch releases grouped into
+# one PR per ecosystem so the queue stays reviewable. Majors open as their own
+# PRs. Security updates are separate and are enabled in the repository's
+# Security settings (Dependabot alerts + security updates).
+version: 2
+
+updates:
+  # ── GitHub Actions (every workflow under .github/workflows) ─────────────
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  # ── npm (pnpm workspace: client, backend, landing, shared-types) ─────────
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    versioning-strategy: increase
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: chore(deps)
+      prefix-development: chore(deps-dev)
+
+  # ── Cargo: relay + Tauri shell ───────────────────────────────────────────
+  - package-ecosystem: cargo
+    directory: /services/relay
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: chore(deps)
+
+  - package-ecosystem: cargo
+    directory: /client/src-tauri
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: chore(deps)
+
+  # ── Go: gateway ──────────────────────────────────────────────────────────
+  - package-ecosystem: gomod
+    directory: /services/gateway
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      go-minor-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: chore(deps)
+
+  # ── Docker base images ───────────────────────────────────────────────────
+  - package-ecosystem: docker
+    directories:
+      - /services/backend
+      - /services/gateway
+      - /services/relay
+      - /services/proxy
+      - /services/landing
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: chore(docker)

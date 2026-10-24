@@ -114,7 +114,7 @@ This is **mass-shipped in one deploy**. The flag defaults in `docker-compose.pro
 2. **Sanity-check prod memory headroom**:
    ```bash
    ssh ec2-user@<host>
-   free -h              # total should show ~7.5 GiB available on t4g.large
+   free -h              # total should show ~7.5 GiB available on the production host
    docker stats --no-stream | awk 'NR==1 || $1 ~ /backend|postgres|redis/'
    ```
    The backend container is about to jump from 512 MB to 1.5 GB. Confirm you have room.
@@ -148,10 +148,10 @@ This is **mass-shipped in one deploy**. The flag defaults in `docker-compose.pro
 **Monitor for the first 24 hours** (via `/health`, `docker compose logs`, and CloudWatch):
 - `transcode_status.failed` should stay near zero — a small tail is normal (bad files).
 - EBS used % — don't cross 80%.
-- CPU credit balance (t4g.large) — should not fall below ~30% during normal ops. A brief dip during backfill is expected; a sustained drop means concurrency is too high.
+- CPU credit balance (burstable production host) — should not fall below ~30% during normal ops. A brief dip during backfill is expected; a sustained drop means concurrency is too high.
 - Redis `used_memory_peak` — should stay far below 256 MB.
 
-### Cost notes (t4g.large, ARM, burstable)
+### Cost notes (ARM, burstable production host)
 
 - **CPU credits** replenish at baseline (~30% per vCPU combined). Sustained transcode at concurrency ≥ 2 will drain credits in ~30 min.
 - Keep `TRANSCODE_CONCURRENCY=1` as default. Bump to 2 only during explicit backfill windows, and watch CPU credit balance in the EC2 console.
@@ -237,7 +237,7 @@ The sections below are the **manual** checks that aren't worth automating (brows
 10. **Browser with neither native HLS nor MSE** — falls back to original URL. Essentially no one in 2026, but defensive.
 11. **Cover upload fails mid-album** — non-fatal by design. Track still publishes, using the album cover (or no cover) in place of its per-track art.
 12. **Concurrent delete + transcode** — if the track is deleted while its transcode is in flight, the worker's DB update affects 0 rows (row is gone). HLS output files remain until the blob itself is purged by the delete logic. Minor cleanup gap — acceptable.
-13. **t4g.large CPU credit depletion** — API response times can grow during sustained transcode load. Mitigate by keeping concurrency at 1 and running backfill off-peak.
+13. **CPU credit depletion on the production host** — API response times can grow during sustained transcode load. Mitigate by keeping concurrency at 1 and running backfill off-peak.
 14. **Migration 0020 re-run** — all statements are idempotent (`IF NOT EXISTS`, conditional CHECK constraint block). Safe to re-run.
 15. **Client `hls.js` chunk load failure** (e.g. CSP misconfig) — caught, falls back to original URL with a `console.warn`.
 
@@ -245,7 +245,7 @@ The sections below are the **manual** checks that aren't worth automating (brows
 
 ## 6. Failure triggers — are they real? What sets them off?
 
-Short answer: **real but bounded**. The worst case on any of these is "that track falls back to the original URL and plays normally." Here's what each can concretely be triggered by on a t4g.large, 1.5 GB container, single-concurrency worker.
+Short answer: **real but bounded**. The worst case on any of these is "that track falls back to the original URL and plays normally." Here's what each can concretely be triggered by on the production host, 1.5 GB container, single-concurrency worker.
 
 ### ffmpeg OOM (real, narrow window)
 
