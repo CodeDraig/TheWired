@@ -30,8 +30,9 @@ export function downloadMedia(url: string, filename?: string) {
       a.remove();
     })
     .catch(() => {
-      // Fallback: open in new tab if fetch fails (CORS)
-      window.open(url, "_blank");
+      // Fallback: open in new tab if fetch fails (CORS). noopener so the media
+      // host never gets a handle on the app window.
+      window.open(url, "_blank", "noopener,noreferrer");
     });
 }
 
