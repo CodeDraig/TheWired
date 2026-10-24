@@ -71,6 +71,15 @@ impl SubscriptionManager {
             .collect()
     }
 
+    /// Every open subscription with its filters — cloned, so a caller can
+    /// release the lock before running stored queries (lag resync).
+    pub fn snapshot(&self) -> Vec<(String, Vec<Filter>)> {
+        self.subscriptions
+            .iter()
+            .map(|(id, filters)| (id.clone(), filters.clone()))
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.subscriptions.len()

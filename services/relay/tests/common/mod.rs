@@ -488,6 +488,7 @@ pub fn make_app_state_with(
         hosted_only: false,
         owner_pubkey: None,
         ip_conns: std::sync::Mutex::new(Default::default()),
+        metrics: Default::default(),
     };
     (Arc::new(state), tx)
 }
