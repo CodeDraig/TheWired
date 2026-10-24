@@ -15,6 +15,9 @@ const ADMIN_PERMISSIONS = [
   "BAN_MEMBERS", "MUTE_MEMBERS", "MANAGE_SPACE", "VIEW_ANALYTICS",
 ] as const;
 
+/** Every permission name the backend knows; anything else is rejected at the API. */
+export const KNOWN_PERMISSIONS: readonly string[] = ADMIN_PERMISSIONS;
+
 interface CreateRoleParams {
   name: string;
   color?: string;
@@ -144,7 +147,7 @@ export const roleService = {
       }
     }
 
-    const [role] = await db.select().from(spaceRoles).where(eq(spaceRoles.id, roleId)).limit(1);
+    const [role] = await db.select().from(spaceRoles).where(and(eq(spaceRoles.id, roleId), eq(spaceRoles.spaceId, spaceId))).limit(1);
     const perms = await db
       .select({ permission: rolePermissions.permission })
       .from(rolePermissions)
@@ -386,7 +389,10 @@ export const roleService = {
     // Batched (#105): load the member's roles + their permissions in 2 queries
     // instead of 2 per role.
     const roleIds = roles.map((r) => r.roleId);
-    const roleRows = await db.select().from(spaceRoles).where(inArray(spaceRoles.id, roleIds));
+    const roleRows = await db
+      .select()
+      .from(spaceRoles)
+      .where(and(eq(spaceRoles.spaceId, spaceId), inArray(spaceRoles.id, roleIds)));
     if (roleRows.some((r) => r.isAdmin)) {
       return [...ADMIN_PERMISSIONS];
     }
@@ -420,7 +426,10 @@ export const roleService = {
 
     // Check if user is admin — admins have no overrides (all perms everywhere).
     // Batched (#105): one query for the roles + one for all their overrides.
-    const roleRows = await db.select().from(spaceRoles).where(inArray(spaceRoles.id, roleIds));
+    const roleRows = await db
+      .select()
+      .from(spaceRoles)
+      .where(and(eq(spaceRoles.spaceId, spaceId), inArray(spaceRoles.id, roleIds)));
     if (roleRows.some((r) => r.isAdmin)) {
       return { spacePermissions: spacePerms, channelOverrides: {} };
     }
@@ -464,7 +473,7 @@ export const roleService = {
 
     const roles = [];
     for (const { roleId } of rows) {
-      const [role] = await db.select().from(spaceRoles).where(eq(spaceRoles.id, roleId)).limit(1);
+      const [role] = await db.select().from(spaceRoles).where(and(eq(spaceRoles.id, roleId), eq(spaceRoles.spaceId, spaceId))).limit(1);
       if (role) roles.push(role);
     }
     return roles;

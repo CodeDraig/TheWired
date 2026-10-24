@@ -8,6 +8,9 @@ import {
   onboardingTodoItems,
   memberOnboardingState,
 } from "../db/schema/onboarding.js";
+import { spaceMembers } from "../db/schema/members.js";
+import { spaceRoles } from "../db/schema/permissions.js";
+import { spaceChannels } from "../db/schema/channels.js";
 import { eq, and, asc, inArray } from "drizzle-orm";
 import { roleService } from "./roleService.js";
 
@@ -53,6 +56,48 @@ interface CreateTodoParams {
 interface SubmittedAnswer {
   questionId: string;
   answerIds: string[];
+}
+
+// ── Scoping helpers ─────────────────────────────────────────────────
+
+/** Thrown for resources that don't belong to the space (404), non-members (403) or bad input (400). */
+export class OnboardingError extends Error {
+  constructor(message: string, public readonly status: 400 | 403 | 404) {
+    super(message);
+  }
+}
+
+/** Every question/answer/todo mutation is scoped to the URL's space — an id
+ *  from another space is a 404, never a cross-space edit. */
+async function questionInSpace(spaceId: string, questionId: string) {
+  const [q] = await db
+    .select()
+    .from(onboardingQuestions)
+    .where(and(eq(onboardingQuestions.id, questionId), eq(onboardingQuestions.spaceId, spaceId)))
+    .limit(1);
+  if (!q) throw new OnboardingError("Question not found", 404);
+  return q;
+}
+
+async function answerInSpace(spaceId: string, answerId: string) {
+  const [row] = await db
+    .select({ answer: onboardingAnswers })
+    .from(onboardingAnswers)
+    .innerJoin(onboardingQuestions, eq(onboardingQuestions.id, onboardingAnswers.questionId))
+    .where(and(eq(onboardingAnswers.id, answerId), eq(onboardingQuestions.spaceId, spaceId)))
+    .limit(1);
+  if (!row) throw new OnboardingError("Answer not found", 404);
+  return row.answer;
+}
+
+async function todoInSpace(spaceId: string, todoId: string) {
+  const [t] = await db
+    .select()
+    .from(onboardingTodoItems)
+    .where(and(eq(onboardingTodoItems.id, todoId), eq(onboardingTodoItems.spaceId, spaceId)))
+    .limit(1);
+  if (!t) throw new OnboardingError("Todo item not found", 404);
+  return t;
 }
 
 // ── Service ─────────────────────────────────────────────────────────
@@ -151,7 +196,8 @@ export const onboardingService = {
     return { ...question, answers: [] };
   },
 
-  async updateQuestion(questionId: string, params: UpdateQuestionParams) {
+  async updateQuestion(spaceId: string, questionId: string, params: UpdateQuestionParams) {
+    await questionInSpace(spaceId, questionId);
     const updates: Record<string, unknown> = {};
     if (params.title !== undefined) updates.title = params.title;
     if (params.description !== undefined) updates.description = params.description;
@@ -173,8 +219,11 @@ export const onboardingService = {
     return question;
   },
 
-  async deleteQuestion(questionId: string) {
-    await db.delete(onboardingQuestions).where(eq(onboardingQuestions.id, questionId));
+  async deleteQuestion(spaceId: string, questionId: string) {
+    await questionInSpace(spaceId, questionId);
+    await db
+      .delete(onboardingQuestions)
+      .where(and(eq(onboardingQuestions.id, questionId), eq(onboardingQuestions.spaceId, spaceId)));
   },
 
   async reorderQuestions(spaceId: string, orderedIds: string[]) {
@@ -188,7 +237,8 @@ export const onboardingService = {
 
   // ── Answers ─────────────────────────────────────────────────────
 
-  async addAnswer(questionId: string, params: CreateAnswerParams) {
+  async addAnswer(spaceId: string, questionId: string, params: CreateAnswerParams) {
+    await questionInSpace(spaceId, questionId);
     const existing = await db
       .select()
       .from(onboardingAnswers)
@@ -210,7 +260,8 @@ export const onboardingService = {
     return { ...answer, mappings: [] };
   },
 
-  async updateAnswer(answerId: string, params: { label?: string; emoji?: string | null }) {
+  async updateAnswer(spaceId: string, answerId: string, params: { label?: string; emoji?: string | null }) {
+    await answerInSpace(spaceId, answerId);
     const updates: Record<string, unknown> = {};
     if (params.label !== undefined) updates.label = params.label;
     if (params.emoji !== undefined) updates.emoji = params.emoji;
@@ -230,11 +281,13 @@ export const onboardingService = {
     return answer;
   },
 
-  async deleteAnswer(answerId: string) {
+  async deleteAnswer(spaceId: string, answerId: string) {
+    await answerInSpace(spaceId, answerId);
     await db.delete(onboardingAnswers).where(eq(onboardingAnswers.id, answerId));
   },
 
-  async reorderAnswers(questionId: string, orderedIds: string[]) {
+  async reorderAnswers(spaceId: string, questionId: string, orderedIds: string[]) {
+    await questionInSpace(spaceId, questionId);
     for (let i = 0; i < orderedIds.length; i++) {
       await db
         .update(onboardingAnswers)
@@ -245,7 +298,33 @@ export const onboardingService = {
 
   // ── Answer Mappings ─────────────────────────────────────────────
 
-  async setAnswerMappings(answerId: string, mappings: MappingInput[]) {
+  async setAnswerMappings(spaceId: string, answerId: string, mappings: MappingInput[]) {
+    await answerInSpace(spaceId, answerId);
+
+    // Mapped roles/channels must be THIS space's, and onboarding never hands
+    // out an admin role — otherwise a mapping is a self-service escalation.
+    const roleIds = [...new Set(mappings.map((m) => m.roleId).filter((x): x is string => !!x))];
+    const channelIds = [...new Set(mappings.map((m) => m.channelId).filter((x): x is string => !!x))];
+    if (roleIds.length > 0) {
+      const found = await db
+        .select({ id: spaceRoles.id, isAdmin: spaceRoles.isAdmin })
+        .from(spaceRoles)
+        .where(and(eq(spaceRoles.spaceId, spaceId), inArray(spaceRoles.id, roleIds)));
+      const byId = new Map(found.map((r) => [r.id, r]));
+      for (const id of roleIds) {
+        const role = byId.get(id);
+        if (!role) throw new OnboardingError("Role not found", 400);
+        if (role.isAdmin) throw new OnboardingError("Onboarding cannot grant an admin role", 400);
+      }
+    }
+    if (channelIds.length > 0) {
+      const found = await db
+        .select({ id: spaceChannels.id })
+        .from(spaceChannels)
+        .where(and(eq(spaceChannels.spaceId, spaceId), inArray(spaceChannels.id, channelIds)));
+      if (found.length !== channelIds.length) throw new OnboardingError("Channel not found", 400);
+    }
+
     // Replace all mappings for this answer
     await db.delete(onboardingAnswerMappings).where(eq(onboardingAnswerMappings.answerId, answerId));
 
@@ -301,7 +380,8 @@ export const onboardingService = {
     return item;
   },
 
-  async updateTodoItem(todoId: string, params: { title?: string; description?: string | null; linkChannelId?: string | null }) {
+  async updateTodoItem(spaceId: string, todoId: string, params: { title?: string; description?: string | null; linkChannelId?: string | null }) {
+    await todoInSpace(spaceId, todoId);
     const updates: Record<string, unknown> = {};
     if (params.title !== undefined) updates.title = params.title;
     if (params.description !== undefined) updates.description = params.description;
@@ -315,7 +395,8 @@ export const onboardingService = {
     return item;
   },
 
-  async deleteTodoItem(todoId: string) {
+  async deleteTodoItem(spaceId: string, todoId: string) {
+    await todoInSpace(spaceId, todoId);
     await db.delete(onboardingTodoItems).where(eq(onboardingTodoItems.id, todoId));
   },
 
@@ -366,6 +447,15 @@ export const onboardingService = {
   // ── Submit Answers (core onboarding logic) ──────────────────────
 
   async submitAnswers(spaceId: string, pubkey: string, answers: SubmittedAnswer[]) {
+    // 0. Only members onboard — roles are only ever granted to someone who
+    // actually joined this space.
+    const [member] = await db
+      .select({ pubkey: spaceMembers.pubkey })
+      .from(spaceMembers)
+      .where(and(eq(spaceMembers.spaceId, spaceId), eq(spaceMembers.pubkey, pubkey)))
+      .limit(1);
+    if (!member) throw new OnboardingError("Not a member of this space", 403);
+
     // 1. Fetch all questions for this space
     const questions = await db
       .select()
@@ -379,7 +469,7 @@ export const onboardingService = {
       if (q.required) {
         const submitted = answers.find((a) => a.questionId === q.id);
         if (!submitted || submitted.answerIds.length === 0) {
-          throw new Error(`Required question "${q.title}" was not answered`);
+          throw new OnboardingError(`Required question "${q.title}" was not answered`, 400);
         }
       }
     }
@@ -392,15 +482,21 @@ export const onboardingService = {
       return { assignedRoles: [], completed: true };
     }
 
+    // Answer ids are only valid when they belong to one of THIS space's
+    // questions — and to the question they were submitted under. Any other
+    // space's answer (whose mappings the caller may control) is rejected.
     const validAnswers = await db
-      .select()
+      .select({ id: onboardingAnswers.id, questionId: onboardingAnswers.questionId })
       .from(onboardingAnswers)
-      .where(inArray(onboardingAnswers.id, allAnswerIds));
+      .innerJoin(onboardingQuestions, eq(onboardingQuestions.id, onboardingAnswers.questionId))
+      .where(and(eq(onboardingQuestions.spaceId, spaceId), inArray(onboardingAnswers.id, allAnswerIds)));
 
-    const validAnswerIds = new Set(validAnswers.map((a) => a.id));
-    for (const id of allAnswerIds) {
-      if (!validAnswerIds.has(id)) {
-        throw new Error(`Invalid answer ID: ${id}`);
+    const questionOfAnswer = new Map(validAnswers.map((a) => [a.id, a.questionId]));
+    for (const entry of answers) {
+      for (const id of entry.answerIds) {
+        if (questionOfAnswer.get(id) !== entry.questionId) {
+          throw new OnboardingError(`Invalid answer ID: ${id}`, 400);
+        }
       }
     }
 
@@ -408,7 +504,7 @@ export const onboardingService = {
     for (const answer of answers) {
       const question = questionMap.get(answer.questionId);
       if (question && !question.multiple && answer.answerIds.length > 1) {
-        throw new Error(`Question "${question.title}" only allows a single answer`);
+        throw new OnboardingError(`Question "${question.title}" only allows a single answer`, 400);
       }
     }
 
@@ -418,8 +514,17 @@ export const onboardingService = {
       .from(onboardingAnswerMappings)
       .where(inArray(onboardingAnswerMappings.answerId, allAnswerIds));
 
-    // 5. Assign roles
-    const roleIds = [...new Set(mappings.filter((m) => m.roleId).map((m) => m.roleId!))];
+    // 5. Assign roles — only THIS space's non-admin roles (mappings can't name
+    // an admin role since the create-time check, but older rows might).
+    const mappedRoleIds = [...new Set(mappings.map((m) => m.roleId).filter((x): x is string => !!x))];
+    let roleIds: string[] = [];
+    if (mappedRoleIds.length > 0) {
+      const grantable = await db
+        .select({ id: spaceRoles.id })
+        .from(spaceRoles)
+        .where(and(eq(spaceRoles.spaceId, spaceId), eq(spaceRoles.isAdmin, false), inArray(spaceRoles.id, mappedRoleIds)));
+      roleIds = grantable.map((r) => r.id);
+    }
     for (const roleId of roleIds) {
       await roleService.assignRole(spaceId, pubkey, roleId);
     }

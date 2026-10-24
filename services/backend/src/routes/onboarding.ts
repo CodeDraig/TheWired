@@ -1,8 +1,17 @@
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyReply } from "fastify";
 import { z } from "zod";
 import { validate, nonEmptyString } from "../lib/validation.js";
-import { onboardingService } from "../services/onboardingService.js";
+import { onboardingService, OnboardingError } from "../services/onboardingService.js";
 import { permissionService } from "../services/permissionService.js";
+
+/** Scoping/membership errors from the service become 404/403/400; anything else is a 500. */
+function sendServiceError(err: unknown, reply: FastifyReply) {
+  if (err instanceof OnboardingError) {
+    const code = err.status === 404 ? "NOT_FOUND" : err.status === 403 ? "FORBIDDEN" : "BAD_REQUEST";
+    return reply.status(err.status).send({ error: err.message, code });
+  }
+  throw err;
+}
 
 // ── Shared param schemas ──────────────────────────────────────────
 const spaceIdParams = z.object({ spaceId: nonEmptyString });
@@ -160,8 +169,12 @@ export const onboardingRoutes: FastifyPluginAsync = async (server) => {
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_SPACE");
       if (!perm.allowed) return reply.status(403).send({ error: "Forbidden", code: "FORBIDDEN" });
 
-      const question = await onboardingService.updateQuestion(params.qId, body);
-      return { data: question };
+      try {
+        const question = await onboardingService.updateQuestion(params.spaceId, params.qId, body);
+        return { data: question };
+      } catch (err) {
+        return sendServiceError(err, reply);
+      }
     },
   );
 
@@ -178,8 +191,12 @@ export const onboardingRoutes: FastifyPluginAsync = async (server) => {
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_SPACE");
       if (!perm.allowed) return reply.status(403).send({ error: "Forbidden", code: "FORBIDDEN" });
 
-      await onboardingService.deleteQuestion(params.qId);
-      return { data: { success: true } };
+      try {
+        await onboardingService.deleteQuestion(params.spaceId, params.qId);
+        return { data: { success: true } };
+      } catch (err) {
+        return sendServiceError(err, reply);
+      }
     },
   );
 
@@ -226,8 +243,12 @@ export const onboardingRoutes: FastifyPluginAsync = async (server) => {
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_SPACE");
       if (!perm.allowed) return reply.status(403).send({ error: "Forbidden", code: "FORBIDDEN" });
 
-      const answer = await onboardingService.addAnswer(params.qId, body);
-      return { data: answer };
+      try {
+        const answer = await onboardingService.addAnswer(params.spaceId, params.qId, body);
+        return { data: answer };
+      } catch (err) {
+        return sendServiceError(err, reply);
+      }
     },
   );
 
@@ -249,8 +270,12 @@ export const onboardingRoutes: FastifyPluginAsync = async (server) => {
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_SPACE");
       if (!perm.allowed) return reply.status(403).send({ error: "Forbidden", code: "FORBIDDEN" });
 
-      const answer = await onboardingService.updateAnswer(params.aId, body);
-      return { data: answer };
+      try {
+        const answer = await onboardingService.updateAnswer(params.spaceId, params.aId, body);
+        return { data: answer };
+      } catch (err) {
+        return sendServiceError(err, reply);
+      }
     },
   );
 
@@ -267,8 +292,12 @@ export const onboardingRoutes: FastifyPluginAsync = async (server) => {
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_SPACE");
       if (!perm.allowed) return reply.status(403).send({ error: "Forbidden", code: "FORBIDDEN" });
 
-      await onboardingService.deleteAnswer(params.aId);
-      return { data: { success: true } };
+      try {
+        await onboardingService.deleteAnswer(params.spaceId, params.aId);
+        return { data: { success: true } };
+      } catch (err) {
+        return sendServiceError(err, reply);
+      }
     },
   );
 
@@ -292,8 +321,12 @@ export const onboardingRoutes: FastifyPluginAsync = async (server) => {
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_SPACE");
       if (!perm.allowed) return reply.status(403).send({ error: "Forbidden", code: "FORBIDDEN" });
 
-      const mappings = await onboardingService.setAnswerMappings(params.aId, body.mappings);
-      return { data: mappings };
+      try {
+        const mappings = await onboardingService.setAnswerMappings(params.spaceId, params.aId, body.mappings);
+        return { data: mappings };
+      } catch (err) {
+        return sendServiceError(err, reply);
+      }
     },
   );
 
@@ -340,8 +373,12 @@ export const onboardingRoutes: FastifyPluginAsync = async (server) => {
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_SPACE");
       if (!perm.allowed) return reply.status(403).send({ error: "Forbidden", code: "FORBIDDEN" });
 
-      const item = await onboardingService.updateTodoItem(params.tId, body);
-      return { data: item };
+      try {
+        const item = await onboardingService.updateTodoItem(params.spaceId, params.tId, body);
+        return { data: item };
+      } catch (err) {
+        return sendServiceError(err, reply);
+      }
     },
   );
 
@@ -358,8 +395,12 @@ export const onboardingRoutes: FastifyPluginAsync = async (server) => {
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_SPACE");
       if (!perm.allowed) return reply.status(403).send({ error: "Forbidden", code: "FORBIDDEN" });
 
-      await onboardingService.deleteTodoItem(params.tId);
-      return { data: { success: true } };
+      try {
+        await onboardingService.deleteTodoItem(params.spaceId, params.tId);
+        return { data: { success: true } };
+      } catch (err) {
+        return sendServiceError(err, reply);
+      }
     },
   );
 
@@ -407,6 +448,7 @@ export const onboardingRoutes: FastifyPluginAsync = async (server) => {
         const result = await onboardingService.submitAnswers(params.spaceId, pubkey, body.answers);
         return { data: result };
       } catch (err: any) {
+        if (err instanceof OnboardingError) return sendServiceError(err, reply);
         return reply.status(400).send({ error: err.message, code: "BAD_REQUEST" });
       }
     },
