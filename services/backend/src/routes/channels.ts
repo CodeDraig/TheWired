@@ -7,29 +7,32 @@ import { notifySpaceChanged } from "../services/spaceSignalService.js";
 
 const spaceIdParams = z.object({ spaceId: nonEmptyString });
 
+/** Slow mode: 0 (off) to six hours, whole seconds. */
+const slowMode = nonNegativeInt.max(21_600);
+
 const createChannelBody = z.object({
-  type: nonEmptyString,
-  label: nonEmptyString,
-  categoryId: z.string().optional(),
+  type: nonEmptyString.max(32),
+  label: nonEmptyString.max(100),
+  categoryId: z.string().max(128).optional(),
   adminOnly: z.boolean().optional(),
-  slowModeSeconds: nonNegativeInt.optional(),
+  slowModeSeconds: slowMode.optional(),
   feedMode: z.enum(["all", "curated"]).optional(),
 });
 
 const channelParams = z.object({ spaceId: nonEmptyString, channelId: nonEmptyString });
 
 const updateChannelBody = z.object({
-  label: z.string().optional(),
-  categoryId: z.string().nullable().optional(),
+  label: nonEmptyString.max(100).optional(),
+  categoryId: z.string().max(128).nullable().optional(),
   position: nonNegativeInt.optional(),
   adminOnly: z.boolean().optional(),
-  slowModeSeconds: z.number().optional(),
+  slowModeSeconds: slowMode.optional(),
   isDefault: z.boolean().optional(),
   feedMode: z.enum(["all", "curated"]).optional(),
 });
 
 const reorderBody = z.object({
-  orderedIds: z.array(z.string()).min(1),
+  orderedIds: z.array(z.string().max(128)).min(1).max(200),
 });
 
 export const channelsRoutes: FastifyPluginAsync = async (server) => {
