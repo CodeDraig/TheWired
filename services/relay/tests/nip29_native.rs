@@ -278,3 +278,119 @@ async fn open_group_join_adds_member_and_republishes_39002() {
     .unwrap();
     assert!(members_tags.contains(&joiner.pubkey), "republished 39002 should include the joiner");
 }
+
+/// Latest relay-signed event of `kind` for the group (tags as JSON text).
+async fn latest_metadata(pool: &sqlx::PgPool, kind: i32, group_id: &str) -> Option<String> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT tags::text FROM relay.events WHERE kind = $1 AND d_tag = $2 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(kind)
+    .bind(group_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    row.map(|r| r.0)
+}
+
+/// Security audit 2026-10: a second kind:9007 naming an EXISTING relay-native
+/// group must not seed its sender as admin/member, must not flip the group's
+/// private/closed flags, and must not be stored or republish 39001 with the
+/// attacker. Before the fix `create_group` did `ON CONFLICT DO NOTHING` on the
+/// group row and then unconditionally inserted the sender into
+/// `group_members` + `group_roles('admin')`.
+#[tokio::test]
+async fn create_group_rejects_takeover_of_existing_group() {
+    let pool = pool_or_skip!();
+    let group_id = "native-grp-takeover";
+    let (state, tx) = make_app_state(pool.clone());
+    let creator = TestIdentity::from_seed(31);
+    let attacker = TestIdentity::from_seed(32);
+
+    let (ok, _) = parse_ok(&send_event(&state, &tx, &create_group_event(&creator, group_id, "Mine")).await);
+    assert!(ok, "legit create must succeed");
+
+    // Attacker re-sends 9007 for the same id, also trying to flip the policy flags.
+    let hijack = sign_event(
+        &attacker,
+        9007,
+        vec![
+            vec!["h".into(), group_id.into()],
+            vec!["private".into()],
+            vec!["closed".into()],
+        ],
+        "hijacked",
+        1_700_000_010,
+    );
+    let (ok, msg) = parse_ok(&send_event(&state, &tx, &hijack).await);
+    assert!(!ok, "9007 on an existing group must be rejected");
+    assert!(msg.contains("already exists"), "reason should say the group exists, got: {msg}");
+
+    // No membership, no admin role for the attacker; the creator keeps both.
+    assert!(!membership_source::is_member(&pool, group_id, &attacker.pubkey).await.unwrap());
+    assert!(!state.pool.is_admin(group_id, &attacker.pubkey).await.unwrap());
+    assert!(membership_source::is_member(&pool, group_id, &creator.pubkey).await.unwrap());
+    assert!(state.pool.is_admin(group_id, &creator.pubkey).await.unwrap());
+
+    // Flags and name untouched.
+    let (name, is_private, is_closed): (String, bool, bool) =
+        sqlx::query_as("SELECT name, is_private, is_closed FROM relay.groups WHERE group_id = $1")
+            .bind(group_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(name, "Mine");
+    assert!(!is_private && !is_closed, "attacker must not flip private/closed");
+
+    // The rejected 9007 was not stored, and 39001/39002 never list the attacker.
+    assert!(state.pool.get_event_by_id(&hijack.id).await.unwrap().is_none());
+    let admins = latest_metadata(&pool, 39001, group_id).await.unwrap();
+    assert!(!admins.contains(&attacker.pubkey), "39001 must not list the attacker");
+    assert!(admins.contains(&creator.pubkey));
+    let members = latest_metadata(&pool, 39002, group_id).await.unwrap();
+    assert!(!members.contains(&attacker.pubkey), "39002 must not list the attacker");
+
+    // Even the legitimate creator cannot re-create (a different event) — the
+    // store is idempotent-safe, not "last writer wins".
+    let again = sign_event(
+        &creator,
+        9007,
+        vec![vec!["h".into(), group_id.into()], vec!["private".into()]],
+        "Mine",
+        1_700_000_020,
+    );
+    let (ok, _) = parse_ok(&send_event(&state, &tx, &again).await);
+    assert!(!ok, "a second create by the creator is rejected too");
+    let (is_private,): (bool,) = sqlx::query_as("SELECT is_private FROM relay.groups WHERE group_id = $1")
+        .bind(group_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!is_private);
+
+    // An exact re-send of the ORIGINAL create is a harmless duplicate (NIP-01).
+    let (ok, msg) = parse_ok(&send_event(&state, &tx, &create_group_event(&creator, group_id, "Mine")).await);
+    assert!(ok && msg.starts_with("duplicate:"), "re-sent original create → duplicate, got ok={ok} msg={msg}");
+
+    // A fresh id by the attacker still works — only takeovers are blocked.
+    let (ok, _) = parse_ok(&send_event(&state, &tx, &create_group_event(&attacker, "native-grp-attacker-own", "Theirs")).await);
+    assert!(ok, "creating a NEW group must still work");
+}
+
+/// A group id the relay knows only as an admin-less row in `relay.groups`
+/// (the shape the test helper `insert_space` seeds for mirrors) is not
+/// claimable either.
+#[tokio::test]
+async fn create_group_rejects_claiming_adminless_mirror_group() {
+    let pool = pool_or_skip!();
+    let (state, tx) = make_app_state(pool.clone());
+    let attacker = TestIdentity::from_seed(33);
+    sqlx::query("INSERT INTO relay.groups (group_id, name) VALUES ($1, $1)")
+        .bind("native-grp-mirror")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (ok, _) = parse_ok(&send_event(&state, &tx, &create_group_event(&attacker, "native-grp-mirror", "x")).await);
+    assert!(!ok);
+    assert!(!state.pool.is_admin("native-grp-mirror", &attacker.pubkey).await.unwrap());
+    assert!(!membership_source::is_member(&pool, "native-grp-mirror", &attacker.pubkey).await.unwrap());
+}

@@ -176,13 +176,15 @@ impl Db {
 
     // ---- NIP-29 group store ---------------------------------------------
 
-    /// Create a NIP-29 group; the creator becomes admin + member.
+    /// Create a NIP-29 group; the creator becomes admin + member. Returns
+    /// `true` when the group was created, `false` when the id already existed
+    /// (then nothing was written — the caller must treat that as a rejection).
     pub async fn create_group(
         &self,
         group_id: &str,
         name: &str,
         creator_pubkey: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         match self {
             Db::Pg(p) => group_store::create_group(p, group_id, name, creator_pubkey).await,
             #[cfg(feature = "embedded")]

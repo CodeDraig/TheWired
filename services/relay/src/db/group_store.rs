@@ -1,19 +1,32 @@
 use sqlx::PgPool;
 
-/// Create a new NIP-29 group
+/// Create a new NIP-29 group. Returns `true` when the group row was inserted
+/// (and the creator seeded as member + admin), `false` when a group with this
+/// id already existed — in which case NOTHING is written.
+///
+/// SECURITY (audit 2026-10): the member/admin seed is conditional on the row
+/// insert, inside one transaction. Previously `ON CONFLICT DO NOTHING` on the
+/// group row was followed by unconditional member/admin inserts, so any key
+/// re-sending 9007 for an existing id became that group's admin.
 pub async fn create_group(
     pool: &PgPool,
     group_id: &str,
     name: &str,
     creator_pubkey: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query("INSERT INTO relay.groups (group_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-        .bind(group_id)
-        .bind(name)
-        .execute(&mut *tx)
-        .await?;
+    let inserted: Option<(String,)> = sqlx::query_as(
+        "INSERT INTO relay.groups (group_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING group_id",
+    )
+    .bind(group_id)
+    .bind(name)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if inserted.is_none() {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     // Creator becomes admin
     sqlx::query(
@@ -33,7 +46,7 @@ pub async fn create_group(
     .await?;
 
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Does a group with this id exist on the relay?

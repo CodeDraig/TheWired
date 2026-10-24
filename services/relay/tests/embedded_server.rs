@@ -349,3 +349,47 @@ async fn embedded_relay_nonadmin_moddelete_not_stored() {
 
     relay.stop().await;
 }
+
+/// Security audit 2026-10: on the embedded relay the owner-only 9007 path keeps
+/// working for NEW ids, but a second 9007 for an id the relay already hosts is
+/// refused and changes nothing — not even when it comes from the owner and
+/// tries to flip the group's policy flags.
+#[tokio::test]
+async fn embedded_relay_refuses_recreate_of_existing_group() {
+    let owner = TestIdentity::from_seed(7);
+    let pool = sqlite::connect_memory().await.unwrap();
+    let relay = server::run_embedded(Db::Sqlite(pool.clone()), 0, "t".into(), None, Some(owner.pubkey.clone()), false)
+        .await
+        .unwrap();
+    let (ws, _) = connect_async(relay.ws_url()).await.unwrap();
+    let (mut tx, mut rx) = ws.split();
+    assert!(read_until(&mut rx, "AUTH").await.is_some());
+
+    let create = sign_event(&owner, 9007, vec![vec!["h".into(), "g".into()]], "Open", 1_700_000_000);
+    tx.send(event_frame(&create)).await.unwrap();
+    let ok = read_until(&mut rx, "OK").await.unwrap();
+    assert_eq!(ok.get(2).and_then(|v| v.as_bool()), Some(true), "first create: {ok}");
+
+    let again = sign_event(
+        &owner,
+        9007,
+        vec![vec!["h".into(), "g".into()], vec!["private".into()], vec!["closed".into()]],
+        "Flip",
+        1_700_000_001,
+    );
+    tx.send(event_frame(&again)).await.unwrap();
+    let ok2 = read_until(&mut rx, "OK").await.unwrap();
+    assert_eq!(ok2.get(2).and_then(|v| v.as_bool()), Some(false), "re-create must be refused: {ok2}");
+    assert!(ok2.get(3).and_then(|v| v.as_str()).unwrap_or("").contains("already exists"));
+
+    let (name, is_private, is_closed): (String, bool, bool) =
+        sqlx::query_as("SELECT name, is_private, is_closed FROM groups WHERE group_id = 'g'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(name, "Open");
+    assert!(!is_private && !is_closed, "re-create must not flip the flags");
+    assert!(sqlite::get_event_by_id(&pool, &again.id).await.unwrap().is_none(), "refused 9007 not stored");
+
+    relay.stop().await;
+}

@@ -34,6 +34,9 @@ struct Obs {
     by_id_count: usize,
     by_author_count: usize,
     by_kind_ids_newest_first: Vec<String>,
+    group_created: bool,
+    group_recreated: bool,
+    recreate_made_bob_admin: bool,
     admin_alice: bool,
     member_alice_native: bool,
     members_after_create: Vec<String>,
@@ -82,7 +85,12 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
         .unwrap();
 
     // --- NIP-29 group store ---
-    db.create_group("g1", "Group One", &alice.pubkey).await.unwrap();
+    let group_created = db.create_group("g1", "Group One", &alice.pubkey).await.unwrap();
+    // Security audit 2026-10: re-creating an existing id is a no-op on BOTH
+    // backends — the second caller gains no membership and no admin role.
+    let group_recreated = db.create_group("g1", "Hijack", &bob.pubkey).await.unwrap();
+    let recreate_made_bob_admin = db.is_admin("g1", &bob.pubkey).await.unwrap()
+        || db.group_has_member("g1", &bob.pubkey).await.unwrap();
     let admin_alice = db.is_admin("g1", &alice.pubkey).await.unwrap();
     let member_alice_native = db.group_has_member("g1", &alice.pubkey).await.unwrap();
     let members_after_create = sorted(db.get_members("g1").await.unwrap());
@@ -140,6 +148,9 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
         by_id_count: by_id.len(),
         by_author_count: by_author.len(),
         by_kind_ids_newest_first: by_kind.iter().map(|e| e.id.clone()).collect(),
+        group_created,
+        group_recreated,
+        recreate_made_bob_admin,
         admin_alice,
         member_alice_native,
         members_after_create,
@@ -183,6 +194,9 @@ fn expected(alice: &TestIdentity, bob: &TestIdentity, note_a_id: &str, note_b_id
         by_author_count: 1,
         // newest-first: note_b (ts 101) before note_a (ts 100)
         by_kind_ids_newest_first: vec![note_b_id.to_string(), note_a_id.to_string()],
+        group_created: true,
+        group_recreated: false,
+        recreate_made_bob_admin: false,
         admin_alice: true,
         member_alice_native: true,
         members_after_create: vec![alice.pubkey.clone()],
