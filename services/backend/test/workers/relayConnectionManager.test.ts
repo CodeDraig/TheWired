@@ -68,7 +68,9 @@ let stopFn: (() => Promise<void>) | null = null;
 
 async function startManager() {
   const { startRelayIngester } = await import("../../src/workers/relayConnectionManager.js");
-  const handle = startRelayIngester();
+  // The mock relays (`wss://ext.example`) resolve to nothing; the connect-time
+  // dial guard is covered by relayDialGuard.test.ts and bypassed here.
+  const handle = startRelayIngester({ dialGuard: async (url) => ({ ok: true, url }) });
   stopFn = handle.stop;
   return handle;
 }
