@@ -5,6 +5,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/thewired/gateway/internal/gatewayauth"
 )
 
 var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -12,16 +14,30 @@ var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // Router maps API paths to backend services
 type Router struct {
 	backendURL string
+	signer     *gatewayauth.Signer // nil = X-Gateway-Auth disabled
 }
 
-func NewRouter(backendURL string) *Router {
-	return &Router{backendURL: backendURL}
+// NewRouter builds the /api router. `signer` (nil to disable) MACs the
+// forwarded identity headers so the backend can verify they came from here.
+func NewRouter(backendURL string, signer *gatewayauth.Signer) *Router {
+	return &Router{backendURL: backendURL, signer: signer}
+}
+
+// wirePath is the request-target path as it will be written on the outgoing
+// request line: RawPath when it is a valid encoding of Path, else the default
+// escaping of Path. This is the string the backend sees in its request URL.
+func wirePath(path, rawPath string) string {
+	u := url.URL{Path: path, RawPath: rawPath}
+	return u.EscapedPath()
 }
 
 // NewBlossomHandler returns a handler that proxies Blossom endpoints to the backend.
 // Backend handles kind 24242 auth for PUT/DELETE; GET/HEAD are unauthenticated.
-func NewBlossomHandler(backendURL string) http.Handler {
+// The catch-all runs the optional NIP-98 middleware, so a verified pubkey can
+// reach here too — it is signed over the unchanged path.
+func NewBlossomHandler(backendURL string, signer *gatewayauth.Signer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		signer.Apply(r, wirePath(r.URL.Path, r.URL.RawPath))
 		proxy := newReverseProxy(backendURL, r.URL.Path, r.URL.RawPath)
 		proxy.ServeHTTP(w, r)
 	})
@@ -68,6 +84,9 @@ func (rt *Router) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Strip /api prefix (keeping any %2F-style encoding intact)
 		backendPath, backendRawPath := stripAPIPrefix(r.URL)
+
+		// Sign the identity headers over the path the backend will see.
+		rt.signer.Apply(r, wirePath(backendPath, backendRawPath))
 
 		proxy := newReverseProxy(rt.backendURL, backendPath, backendRawPath)
 		proxy.ServeHTTP(w, r)

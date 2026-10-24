@@ -13,6 +13,7 @@ import (
 	"github.com/thewired/gateway/internal/auth"
 	"github.com/thewired/gateway/internal/config"
 	"github.com/thewired/gateway/internal/cors"
+	"github.com/thewired/gateway/internal/gatewayauth"
 	gmiddleware "github.com/thewired/gateway/internal/logging"
 	"github.com/thewired/gateway/internal/proxy"
 	"github.com/thewired/gateway/internal/ratelimit"
@@ -33,7 +34,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize rate limiter: %v", err)
 	}
-	router := proxy.NewRouter(cfg.BackendURL)
+	// Identity-header MAC shared with the backend (GATEWAY_SHARED_SECRET). nil
+	// when unset: nothing new on the wire, the backend keeps topological trust.
+	signer := gatewayauth.NewSigner(cfg.GatewaySharedSecret)
+	if signer == nil {
+		log.Printf("GATEWAY_SHARED_SECRET unset: forwarded identity headers are not signed")
+	}
+	router := proxy.NewRouter(cfg.BackendURL, signer)
+	blossomProxy := proxy.NewBlossomHandler(cfg.BackendURL, signer)
 
 	mux := http.NewServeMux()
 
@@ -48,7 +56,7 @@ func main() {
 	blossomHandler := proxy.TrustedProxyMiddleware(cfg.TrustedProxies,
 		gmiddleware.LoggingMiddleware(
 			cors.BlossomCORSMiddleware(
-				proxy.NewBlossomHandler(cfg.BackendURL),
+				blossomProxy,
 			),
 		),
 	)
@@ -61,7 +69,7 @@ func main() {
 	hlsHandler := proxy.TrustedProxyMiddleware(cfg.TrustedProxies,
 		gmiddleware.LoggingMiddleware(
 			cors.BlossomCORSMiddleware(
-				proxy.NewBlossomHandler(cfg.BackendURL),
+				blossomProxy,
 			),
 		),
 	)
@@ -110,7 +118,7 @@ func main() {
 				auth.NIP98Middleware(
 					http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						if proxy.IsBlossomPath(r.URL.Path) {
-							proxy.NewBlossomHandler(cfg.BackendURL).ServeHTTP(w, r)
+							blossomProxy.ServeHTTP(w, r)
 							return
 						}
 						http.NotFound(w, r)

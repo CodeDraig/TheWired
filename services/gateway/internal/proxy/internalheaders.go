@@ -1,14 +1,20 @@
 package proxy
 
-import "net/http"
+import (
+	"net/http"
 
-// internalHeaders are set by the gateway after verification and trusted blindly
-// by the backend. They MUST be stripped from every inbound request so a client
-// can't forge them. Extend this list when new internal headers are added.
+	"github.com/thewired/gateway/internal/gatewayauth"
+)
+
+// internalHeaders are set by the gateway after verification and trusted by the
+// backend. They MUST be stripped from every inbound request so a client can't
+// forge them. Extend this list when new internal headers are added.
 var internalHeaders = []string{
 	"X-Auth-Pubkey",
 	// Set by the rate limiter for the guest report intake (ratelimit.ClientIPHeader).
 	"X-Client-Ip",
+	// The MAC over the two above, set by the proxy handlers right before forwarding.
+	gatewayauth.Header,
 }
 
 // StripInternalHeaders removes internal/trusted headers from inbound requests

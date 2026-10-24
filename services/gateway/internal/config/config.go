@@ -32,6 +32,12 @@ type Config struct {
 	RateLimitFailMode string
 	// Per-IP cap on FAILED auth attempts per minute (#111).
 	AuthFailPerMin int
+
+	// Shared with the backend (GATEWAY_SHARED_SECRET on both sides). When set,
+	// every forwarded X-Auth-Pubkey / X-Client-Ip is accompanied by an
+	// X-Gateway-Auth HMAC (internal/gatewayauth). Empty = header not sent; the
+	// backend's GATEWAY_AUTH_MODE decides whether it is required.
+	GatewaySharedSecret string
 }
 
 func Load() *Config {
@@ -70,6 +76,8 @@ func Load() *Config {
 
 		RateLimitFailMode: getEnv("RATE_LIMIT_FAIL_MODE", "open"),
 		AuthFailPerMin:    getEnvInt("RATE_LIMIT_AUTH_FAIL_PER_MIN", 60),
+
+		GatewaySharedSecret: os.Getenv("GATEWAY_SHARED_SECRET"),
 	}
 }
 

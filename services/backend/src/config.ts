@@ -19,6 +19,28 @@ function spaceMediaGate(): "off" | "log" | "enforce" {
   return v === "off" || v === "enforce" ? v : "log";
 }
 
+function gatewayAuthMode(): "off" | "warn" | "enforce" {
+  const v = (process.env.GATEWAY_AUTH_MODE ?? "off").trim().toLowerCase();
+  return v === "warn" || v === "enforce" ? v : "off";
+}
+
+/** Fastify `trustProxy`: which upstream hops may set X-Forwarded-For (so
+ *  `request.ip` is the client, not the proxy). `true` trusts every hop (only
+ *  safe when the backend port is not reachable directly); `false` trusts none;
+ *  otherwise a comma list of IPs/CIDRs/keywords (loopback, linklocal,
+ *  uniquelocal). Default: loopback + the RFC1918 ranges Docker's bridge
+ *  networks and the native dev stack use. */
+function trustProxy(): boolean | string[] {
+  const raw = (process.env.TRUST_PROXY ?? "").trim();
+  if (raw === "") return ["loopback", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 export const config = {
   nodeEnv,
   isProduction: nodeEnv === "production",
@@ -71,6 +93,17 @@ export const config = {
    *  MEDIA_TOKEN_SECRET so no new secret is required; the hash only has to be
    *  stable, not secret from the operator. */
   reportIpSalt: process.env.REPORT_IP_SALT || process.env.MEDIA_TOKEN_SECRET || "dev-report-ip-salt",
+  /** Gateway-signed identity headers (gateway internal/gatewayauth). The
+   *  gateway MACs X-Auth-Pubkey / X-Client-Ip with GATEWAY_SHARED_SECRET into
+   *  X-Gateway-Auth; `mode` says what the backend does with it: off = trust
+   *  the headers as before (default), warn = verify and log mismatches, enforce
+   *  = drop the identity unless the MAC verifies. Roll out off → warn → enforce. */
+  gatewayAuth: {
+    secret: process.env.GATEWAY_SHARED_SECRET ?? "",
+    mode: gatewayAuthMode(),
+  },
+  /** Which upstream hops may set X-Forwarded-For (see trustProxy()). */
+  trustProxy: trustProxy(),
   /** Minimum member count for a space to request listing (admin bypass available) */
   minListingMembers: parseInt(process.env.MIN_LISTING_MEMBERS ?? "5", 10),
   /** Decentralized Spaces ingestion (M3): how a newly-registered relay is handled.

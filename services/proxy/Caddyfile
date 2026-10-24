@@ -15,6 +15,7 @@ thewired.app {
 	# client sends — the backend reads X-Auth-Pubkey as the caller's identity.
 	request_header -X-Auth-Pubkey
 	request_header -X-Client-Ip
+	request_header -X-Gateway-Auth
 
 	# NIP-05 identity verification — must be served from the root domain
 	handle /.well-known/nostr.json {

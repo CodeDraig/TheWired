@@ -117,6 +117,10 @@ services:
       BLOSSOM_SERVER_NAMES: ${BLOSSOM_SERVER_NAMES:-}
       UPLOAD_RATE_PER_MIN: ${UPLOAD_RATE_PER_MIN:-30}
       UPLOAD_DAILY_BYTES: ${UPLOAD_DAILY_BYTES:-2147483648}
+      # Gateway-signed identity headers (same secret as the gateway below);
+      # off = trust X-Auth-Pubkey as before, warn = log mismatches, enforce = drop.
+      GATEWAY_SHARED_SECRET: ${GATEWAY_SHARED_SECRET:-}
+      GATEWAY_AUTH_MODE: ${GATEWAY_AUTH_MODE:-off}
     volumes:
       - blobdata:/app/blobs
     depends_on:
@@ -148,6 +152,7 @@ services:
       BACKEND_URL: http://backend:3002
       REDIS_URL: redis://redis:6379
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      GATEWAY_SHARED_SECRET: ${GATEWAY_SHARED_SECRET:-}
     depends_on:
       backend:
         condition: service_started
