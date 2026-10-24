@@ -16,11 +16,11 @@ jobs:
     name: Client Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: pnpm
@@ -39,9 +39,9 @@ jobs:
     name: Gateway Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.22"
           cache-dependency-path: services/gateway/go.sum
@@ -69,11 +69,13 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10)
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: services/relay
 
@@ -102,11 +104,11 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: pnpm
@@ -130,14 +132,91 @@ jobs:
     name: TypeScript Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+
+  # ── Supply-chain audit ─────────────────────────
+  # Blocking: workflow hygiene + critical npm advisories in production deps.
+  # Informational (continue-on-error): the full npm report, cargo audit for
+  # both crates and govulncheck for the gateway, so the signal is in every run
+  # without upstream advisory noise red-blocking merges.
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Check third-party actions are pinned to commit SHAs
+        run: |
+          set -euo pipefail
+          # Every non-local `uses:` must reference a full 40-hex commit SHA.
+          if grep -rnE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^./[:space:]][^@[:space:]]*@' .github/workflows \
+               | grep -vE '@[0-9a-f]{40}([[:space:]]|$)'; then
+            echo "::error::the actions above are not pinned to a commit SHA"
+            exit 1
+          fi
+          echo "all third-party actions are SHA-pinned"
+
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Known exception, tracked for removal:
+      #   GHSA-26w7-cxv4-gfx2 - astro AVIF image optimisation RCE. Build-time
+      #   only (the landing site is prerendered; nothing user-supplied reaches
+      #   the image pipeline) and the fix is in a new astro major. Drop the
+      #   --ignore once the landing moves to astro >= 7.2.8.
+      - name: npm audit (production deps, blocking at critical)
+        run: pnpm audit --prod --audit-level=critical --ignore GHSA-26w7-cxv4-gfx2
+
+      - name: npm audit (full report, informational)
+        continue-on-error: true
+        run: pnpm audit --prod --audit-level=moderate
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10)
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            services/relay
+            client/src-tauri
+          cache-bin: true
+
+      - name: cargo audit (relay + tauri shell, informational)
+        continue-on-error: true
+        run: |
+          cargo install cargo-audit --locked
+          echo "::group::services/relay"
+          (cd services/relay && cargo audit)
+          echo "::endgroup::"
+          echo "::group::client/src-tauri"
+          (cd client/src-tauri && cargo audit)
+          echo "::endgroup::"
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: stable
+          cache-dependency-path: services/gateway/go.sum
+
+      - name: govulncheck (gateway, informational)
+        continue-on-error: true
+        working-directory: services/gateway
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          govulncheck ./...
