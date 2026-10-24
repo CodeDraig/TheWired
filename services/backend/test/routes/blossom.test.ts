@@ -46,9 +46,11 @@ function buildBlossomAuth(
   opts?: { sha256?: string; expired?: boolean; wrongKind?: number },
 ): string {
   const created_at = Math.floor(Date.now() / 1000);
+  // Write tokens may live at most MAX_WRITE_TOKEN_LIFETIME_SEC; 5 min is what
+  // the shared client builder mints right before the request.
   const expiration = opts?.expired
     ? String(created_at - 60) // expired
-    : String(created_at + 3600);
+    : String(created_at + 300);
 
   const tags: string[][] = [
     ["t", action],

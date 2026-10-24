@@ -15,6 +15,14 @@ import { isDenylisted, recordBlobOwner } from "../services/blobStore.js";
 import { spacesMemberOf } from "../services/musicVisibility.js";
 import { blobDescriptorUrl, blobServePolicy, OCTET_STREAM, sniffBlobType } from "../lib/blobMime.js";
 import { recordUploadBytes, takeUploadSlot, uploadQuota } from "../lib/uploadGuard.js";
+import { z } from "zod";
+import { limitParam, nonNegativeInt, validate } from "../lib/validation.js";
+
+/** GET /list/:pubkey query: a non-number used to reach SQL as NaN. */
+const listQuerySchema = z.object({
+  since: nonNegativeInt.optional(),
+  limit: limitParam(100, 500),
+});
 import { parseRange } from "../lib/httpRange.js";
 import {
   coverVariantPath,
@@ -400,17 +408,14 @@ export async function blossomRoutes(server: FastifyInstance) {
     if (authPubkey !== pubkey) {
       return reply.status(403).send({ error: "Can only list your own blobs", code: "FORBIDDEN" });
     }
-    const { since, limit } = request.query as {
-      since?: string;
-      limit?: string;
-    };
-
-    const maxLimit = Math.min(parseInt(limit ?? "100", 10), 500);
+    const query = validate(listQuerySchema, request.query, reply);
+    if (!query) return;
+    const maxLimit = query.limit;
 
     // Build the where condition with optional since filter
     const conditions = [eq(blobOwners.pubkey, pubkey)];
-    if (since) {
-      conditions.push(lt(blobs.uploaded, parseInt(since, 10)));
+    if (query.since !== undefined) {
+      conditions.push(lt(blobs.uploaded, query.since));
     }
 
     const rows = await db
