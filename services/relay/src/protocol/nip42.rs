@@ -91,7 +91,7 @@ pub fn verify_auth_event(
 
     let want = normalize_relay_url(relay_url);
     let has_relay = event.tags.iter().any(|t| {
-        t.get(0).map(|s| s.as_str()) == Some("relay")
+        t.first().map(|s| s.as_str()) == Some("relay")
             && match t.get(1) {
                 Some(u) => !strict_relay_url || normalize_relay_url(u) == want,
                 None => false,
@@ -101,7 +101,7 @@ pub fn verify_auth_event(
     let has_challenge = event
         .tags
         .iter()
-        .any(|t| t.get(0).map(|s| s.as_str()) == Some("challenge") && t.get(1).map(|s| s.as_str()) == Some(challenge));
+        .any(|t| t.first().map(|s| s.as_str()) == Some("challenge") && t.get(1).map(|s| s.as_str()) == Some(challenge));
 
     has_relay && has_challenge && crate::nostr::verify::verify_event(event)
 }

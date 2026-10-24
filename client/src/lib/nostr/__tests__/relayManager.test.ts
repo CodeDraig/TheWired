@@ -320,7 +320,7 @@ describe("relayManager — publishTracked (own-message send state)", () => {
     const { a, b } = openTwo();
     const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"]);
     ok(a, false, "blocked: no");
-    ok(b, false, "rate-limited: slow down");
+    ok(b, false, "restricted: not allowed");
     await expect(t.accepted).resolves.toBeNull();
   });
 
@@ -391,6 +391,49 @@ describe("relayManager — publishTracked (own-message send state)", () => {
       const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"], { countAs: ["wss://a.relay/"] });
       ok(a, false, "duplicate: have it");
       await expect(t.accepted).resolves.toBe("wss://a.relay");
+    });
+
+    // §7.7: `OK false rate-limited:` means the relay did NOT store the event
+    // and wants it again later — neither sent nor failed.
+    it("an OK false rate-limited: from a counting relay is re-sent with backoff; its later OK counts", async () => {
+      vi.useFakeTimers();
+      try {
+        const { a } = openTwo();
+        const t = relayManager.publishTracked(event, ["wss://a.relay"], { timeout: 10_000 });
+        const events = () => a.sent.filter((m) => JSON.parse(m)[0] === "EVENT").length;
+        expect(events()).toBe(1);
+        ok(a, false, "rate-limited: slow down");
+        let settled: string | null | undefined;
+        void t.accepted.then((v) => { settled = v; });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBeUndefined(); // not failed
+        expect(events()).toBe(1); // not re-sent at once
+        await vi.advanceTimersByTimeAsync(1_500);
+        expect(events()).toBe(2);
+        ok(a, true);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBe("wss://a.relay");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("rate-limited refusals alone never fail the send before the timeout; the timeout still does", async () => {
+      vi.useFakeTimers();
+      try {
+        const { a, b } = openTwo();
+        const t = relayManager.publishTracked(event, ["wss://a.relay", "wss://b.relay"], { timeout: 10_000 });
+        ok(a, false, "rate-limited: slow down");
+        ok(b, false, "rate-limited: slow down");
+        let settled: string | null | undefined;
+        void t.accepted.then((v) => { settled = v; });
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(settled).toBeUndefined();
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(settled).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("no counting relay among the targets: the send can never count, so it fails at once", async () => {

@@ -74,7 +74,7 @@ impl RelayIdentity {
         let mut hasher = Sha256::new();
         hasher.update(serialized.as_bytes());
         let id_bytes = hasher.finalize();
-        let id = hex::encode(&id_bytes);
+        let id = hex::encode(id_bytes);
 
         // Sign with schnorr (secp256k1 v0.30 takes &[u8] for message, &[u8; 32] for aux_rand)
         let keypair = Keypair::from_secret_key(&secp, &self.secret_key);

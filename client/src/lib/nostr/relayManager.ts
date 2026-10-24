@@ -584,16 +584,42 @@ class RelayManagerImpl {
         resolve(null);
         return;
       }
-      const waiting = new Set(counting.map((c) => c.url));
+      const byUrl = new Map(counting.map((c) => [c.url, c]));
+      const waiting = new Set(byUrl.keys());
+      // `OK false rate-limited:` (docs/DM_WIRE_CONTRACT.md §7.7): the relay did
+      // NOT store the event and wants it again later. Re-send with backoff
+      // inside the send window; the relay stays "waiting" (neither sent nor
+      // failed) until it answers otherwise or the timeout passes.
+      const rateRetries = new Map<string, number>();
+      const retryTimers = new Set<ReturnType<typeof setTimeout>>();
       const finish = (relay: string | null) => {
         clearTimeout(timer);
+        for (const t of retryTimers) clearTimeout(t);
         this.publishOKCallbacks.delete(event.id);
         resolve(relay);
       };
       this.publishOKCallbacks.set(event.id, (relayUrl, success, message) => {
-        if (!waiting.delete(relayUrl)) return; // not a counting relay, or answered already
-        if (success || message.startsWith("duplicate:")) finish(relayUrl);
-        else if (waiting.size === 0) finish(null);
+        if (!waiting.has(relayUrl)) return; // not a counting relay, or answered already
+        if (success || message.startsWith("duplicate:")) {
+          finish(relayUrl);
+          return;
+        }
+        if (PUBLISH_RATE_LIMITED_RE.test(message)) {
+          const n = (rateRetries.get(relayUrl) ?? 0) + 1;
+          rateRetries.set(relayUrl, n);
+          const conn = byUrl.get(relayUrl);
+          if (conn && n <= PUBLISH_RATE_LIMITED_RETRIES) {
+            const t = setTimeout(() => {
+              retryTimers.delete(t);
+              conn.publish(event);
+            }, PUBLISH_RATE_LIMITED_BASE_MS * 2 ** (n - 1));
+            retryTimers.add(t);
+            return; // still waiting on this relay
+          }
+          // retries exhausted → counts as a refusal
+        }
+        waiting.delete(relayUrl);
+        if (waiting.size === 0) finish(null);
       });
       const timer = setTimeout(() => finish(null), timeout);
     });
@@ -643,6 +669,11 @@ class RelayManagerImpl {
     }
   }
 }
+
+/** `OK false rate-limited:` re-sends inside publishTracked's window (§7.7). */
+const PUBLISH_RATE_LIMITED_RE = /^rate-limited\s*:/i;
+const PUBLISH_RATE_LIMITED_RETRIES = 3;
+const PUBLISH_RATE_LIMITED_BASE_MS = 1_500;
 
 /** Singleton relay manager */
 export const relayManager = new RelayManagerImpl();

@@ -536,21 +536,23 @@ async fn handle_req(
     }
     let ctx = read_ctx(state, authed_pubkey);
 
-    // Query stored events for each filter, merge with id-dedup, newest-first.
-    let mut seen = HashSet::new();
-    let mut merged: Vec<crate::nostr::event::Event> = Vec::new();
-    for filter in &filters {
-        let events = state.pool
-            .query_events_ctx(filter, &ctx)
-            .await
-            .unwrap_or_default();
-        for e in events {
-            if seen.insert(e.id.clone()) {
-                merged.push(e);
-            }
+    // A store that cannot answer (pool exhausted, query error) is told to the
+    // client as CLOSED — never as an empty EOSE. Both clients stamp their
+    // since-watermark on EOSE, so a silent empty answer would put the whole
+    // undelivered backlog outside their next catch-up window. The sub is not
+    // registered either: the client was told it is closed and will re-REQ.
+    let merged = match query_merged(state, &filters, &ctx).await {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::warn!(
+                sub_id,
+                filters = filters.len(),
+                error = %e,
+                "REQ query failed; CLOSED instead of EOSE"
+            );
+            return vec![closed_frame(&sub_id, "error: query failed")];
         }
-    }
-    merged.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    };
 
     tracing::debug!(sub_id, filters = filters.len(), results = merged.len(), "REQ");
 
@@ -575,6 +577,67 @@ async fn handle_req(
 
     responses.push(format!(r#"["EOSE","{}"]"#, sub_id));
     responses
+}
+
+/// `["CLOSED", <subId>, <reason>]`, JSON-escaped (a sub id is client text).
+pub fn closed_frame(sub_id: &str, reason: &str) -> String {
+    serde_json::json!(["CLOSED", sub_id, reason]).to_string()
+}
+
+/// Run the stored query for every filter of a subscription and merge the
+/// results by id, newest first. Fails on the FIRST filter whose query fails:
+/// a partial answer followed by EOSE would read as "backlog delivered".
+async fn query_merged(
+    state: &Arc<AppState>,
+    filters: &[Filter],
+    ctx: &ReadCtx<'_>,
+) -> anyhow::Result<Vec<Event>> {
+    let mut seen = HashSet::new();
+    let mut merged: Vec<Event> = Vec::new();
+    for filter in filters {
+        for e in state.pool.query_events_ctx(filter, ctx).await? {
+            if seen.insert(e.id.clone()) {
+                merged.push(e);
+            }
+        }
+    }
+    merged.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(merged)
+}
+
+/// Re-run the stored query of every open subscription on a connection whose
+/// broadcast receiver lagged, and return the EVENT frames to send (no EOSE:
+/// these subscriptions already had theirs). This is exactly what the client
+/// would get by reconnecting and re-REQing, minus the reconnect; clients
+/// dedupe by id. Ephemeral kinds are not stored, so a lag can still lose
+/// those — they are refetch hints, not history. A subscription whose query
+/// fails is skipped (logged); it is not closed, since the live matching for
+/// it still works.
+pub async fn resync_subscriptions(
+    state: &Arc<AppState>,
+    subscriptions: &Arc<Mutex<SubscriptionManager>>,
+    authed_pubkey: &Option<String>,
+) -> Vec<String> {
+    let ctx = read_ctx(state, authed_pubkey);
+    let snapshot = subscriptions.lock().await.snapshot();
+    let mut frames = Vec::new();
+    for (sub_id, filters) in snapshot {
+        match query_merged(state, &filters, &ctx).await {
+            Ok(events) => {
+                for e in events {
+                    frames.push(format!(
+                        r#"["EVENT","{}",{}]"#,
+                        sub_id,
+                        serde_json::to_string(&e).unwrap_or_default()
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(sub_id, filters = filters.len(), error = %e, "Resync query failed; subscription skipped");
+            }
+        }
+    }
+    frames
 }
 
 /// `["NEG-OPEN", <subId>, <filter>, <initialMessageHex>]` → the relay builds a

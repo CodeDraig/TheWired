@@ -43,6 +43,13 @@ const AUTH_WEDGE_MS = 3000;
 /** Max times a sub is re-deferred after a server CLOSED "too many subscriptions"
  *  before we give up — bounds the retry even if a relay's real cap is below ours. */
 const MAX_CLOSED_RETRIES = 3;
+/** A `CLOSED rate-limited:` / `CLOSED error:` (docs/DM_WIRE_CONTRACT.md §7.7)
+ *  means the REQ was not registered and the relay wants it again later: re-REQ
+ *  with exponential backoff, this many times, before giving the sub up. */
+const MAX_RETRYABLE_CLOSED = 5;
+const RETRYABLE_CLOSED_BASE_MS = 1_000;
+const RETRYABLE_CLOSED_MAX_MS = 30_000;
+const RETRYABLE_CLOSED_RE = /^(rate-limited|error)\s*:/i;
 
 interface NegSession {
   neg: Negentropy;
@@ -78,6 +85,8 @@ export class RelayConnection {
   /** subId → number of times re-deferred after a server CLOSED "too many
    *  subscriptions". Cleared on EOSE (success) or close. Bounds the retry (#A5). */
   private closedRetries = new Map<string, number>();
+  /** subId → pending re-REQ timer after a retryable CLOSED (§7.7). */
+  private reqRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   // Callbacks
   private onEvent: InternalEventCallback | null = null;
@@ -216,6 +225,8 @@ export class RelayConnection {
     this.messageQueue = [];
     this.deferredSubs = [];
     this.closedRetries.clear();
+    for (const t of this.reqRetryTimers.values()) clearTimeout(t);
+    this.reqRetryTimers.clear();
     this.pendingAuthChallenge = null;
     this.reqGate = "open";
     this.heldReqs.clear();
@@ -223,6 +234,28 @@ export class RelayConnection {
     if (this.authWedgeTimer) {
       clearTimeout(this.authWedgeTimer);
       this.authWedgeTimer = null;
+    }
+  }
+
+  /** Re-send a still-tracked subscription's REQ after `delay` (one timer per sub). */
+  private scheduleReqRetry(subId: string, delay: number): void {
+    this.clearReqRetry(subId);
+    const timer = setTimeout(() => {
+      this.reqRetryTimers.delete(subId);
+      const filters = this.subscriptions.get(subId);
+      if (!filters) return; // closed locally in the meantime
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return; // resubscribe() covers reconnects
+      this.pendingEOSE.add(subId);
+      this.sendReq(subId, filters);
+    }, delay);
+    this.reqRetryTimers.set(subId, timer);
+  }
+
+  private clearReqRetry(subId: string): void {
+    const t = this.reqRetryTimers.get(subId);
+    if (t) {
+      clearTimeout(t);
+      this.reqRetryTimers.delete(subId);
     }
   }
 
@@ -384,6 +417,7 @@ export class RelayConnection {
     this.subscriptions.delete(subId);
     this.pendingEOSE.delete(subId);
     this.closedRetries.delete(subId);
+    this.clearReqRetry(subId);
     // Remove from deferred queue if it was never sent
     this.deferredSubs = this.deferredSubs.filter((d) => d.subId !== subId);
     // Drop it from the AUTH hold queue too (so release doesn't resurrect it).
@@ -542,6 +576,27 @@ export class RelayConnection {
               this.warnIfFirstDeferral();
             }
             break; // keep it tracked; a future drainDeferred re-sends it
+          }
+          // out of retries → fall through and drop it
+        }
+        // `rate-limited:` / `error:` (§7.7; checked after the cap case, whose
+        // text is `error: too many subscriptions`): the REQ was not registered and the
+        // relay is asking for it again later, not refusing it. Keep the sub
+        // tracked and re-REQ with backoff (bounded); EOSE resets the counter.
+        if (
+          RETRYABLE_CLOSED_RE.test(reason) &&
+          !/too many subscriptions/i.test(reason) && // the cap case above ran out of retries: drop
+          this.subscriptions.has(subId)
+        ) {
+          const tries = (this.closedRetries.get(subId) ?? 0) + 1;
+          if (tries <= MAX_RETRYABLE_CLOSED) {
+            this.closedRetries.set(subId, tries);
+            this.pendingEOSE.delete(subId);
+            this.scheduleReqRetry(
+              subId,
+              Math.min(RETRYABLE_CLOSED_BASE_MS * 2 ** (tries - 1), RETRYABLE_CLOSED_MAX_MS),
+            );
+            break;
           }
           // out of retries → fall through and drop it
         }

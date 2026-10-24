@@ -179,7 +179,7 @@ pub async fn connect_memory() -> anyhow::Result<SqlitePool> {
 }
 
 fn is_replaceable(kind: i32) -> bool {
-    kind == 0 || kind == 3 || (kind >= 10000 && kind < 20000)
+    kind == 0 || kind == 3 || (10000..20000).contains(&kind)
 }
 fn is_addressable(kind: i32) -> bool {
     (30000..40000).contains(&kind)

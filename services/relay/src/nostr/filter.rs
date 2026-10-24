@@ -98,7 +98,14 @@ impl Filter {
             return false;
         }
         if let Some(since) = self.since {
-            if event.created_at < since {
+            // NIP-59 ("Timestamps") backdates a gift wrap's `created_at` by up
+            // to two days, so a wrap published *now* can sit below a live
+            // subscription's `since` — clients set it near "now" on reconnect.
+            // Live matching therefore ignores `since` for kind 1059; a wrap's
+            // recipient `#p` is what scopes it. Stored queries are unchanged:
+            // there the client asked for a window and the wrap's own
+            // timestamp is the only one the relay has.
+            if event.kind != super::wrap_gate::KIND_GIFT_WRAP && event.created_at < since {
                 return false;
             }
         }
@@ -261,6 +268,34 @@ mod tests {
             ..Default::default()
         };
         assert!(!filter2.matches(&make_event(None))); // 1000 < 1001
+    }
+
+    /// Live matching ignores `since` for kind 1059 only (NIP-59 backdating);
+    /// every other kind still honours it.
+    #[test]
+    fn test_since_ignored_for_live_gift_wraps() {
+        let filter = Filter {
+            kinds: vec![1059],
+            since: Some(5000),
+            ..Default::default()
+        };
+        let backdated_wrap = Event {
+            kind: 1059,
+            created_at: 1000,
+            ..make_event(None)
+        };
+        assert!(filter.matches(&backdated_wrap), "a live wrap below `since` must still match");
+        let note_filter = Filter {
+            since: Some(5000),
+            ..Default::default()
+        };
+        assert!(!note_filter.matches(&make_event(None)), "kind 1 keeps honouring since");
+        let until = Filter {
+            kinds: vec![1059],
+            until: Some(500),
+            ..Default::default()
+        };
+        assert!(!until.matches(&backdated_wrap), "`until` still applies to wraps");
     }
 
     #[test]

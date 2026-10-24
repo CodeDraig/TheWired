@@ -1,8 +1,8 @@
-/// Custom music-related event kinds for The Wired
-///
-/// - 31683: Music track metadata (addressable, title in tags)
-/// - 33123: Album (addressable, title in tags)
-/// - 30119: Playlist (addressable, title in tags)
+//! Custom music-related event kinds for The Wired
+//!
+//! - 31683: Music track metadata (addressable, title in tags)
+//! - 33123: Album (addressable, title in tags)
+//! - 30119: Playlist (addressable, title in tags)
 
 /// Check if an event kind is a music-related kind
 pub fn is_music_kind(kind: i32) -> bool {

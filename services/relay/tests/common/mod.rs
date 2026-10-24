@@ -386,7 +386,7 @@ pub fn sign_event(
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     let hash = hasher.finalize();
-    let id = hex::encode(&hash);
+    let id = hex::encode(hash);
 
     let sig = secp.sign_schnorr_no_aux_rand(&hash, &identity.keypair);
 
@@ -488,6 +488,7 @@ pub fn make_app_state_with(
         hosted_only: false,
         owner_pubkey: None,
         ip_conns: std::sync::Mutex::new(Default::default()),
+        metrics: Default::default(),
     };
     (Arc::new(state), tx)
 }
