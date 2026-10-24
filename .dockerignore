@@ -1,8 +1,10 @@
 client/
 reference/
 .git
-.env
-.env.*
+# Env files anywhere in the tree (a bare `.env` only matches the context root)
+**/.env
+**/.env.*
+!**/.env.example
 *.md
 node_modules/
 services/relay/
