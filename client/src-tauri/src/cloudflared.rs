@@ -54,8 +54,9 @@ pub const CLOUDFLARE_TEAM_ID: &str = "68WVV388M8";
 /// belongs to Cloudflare's team. Any other valid signature (ad-hoc, another
 /// developer) fails the check.
 #[cfg(target_os = "macos")]
-pub const CODESIGN_REQUIREMENT: &str =
-    "anchor apple generic and certificate leaf[subject.OU] = \"68WVV388M8\"";
+pub fn codesign_requirement() -> String {
+    format!("anchor apple generic and certificate leaf[subject.OU] = \"{CLOUDFLARE_TEAM_ID}\"")
+}
 
 /// Download URL of a release asset of the pinned version.
 fn download_url(asset: &str) -> String {
@@ -201,7 +202,7 @@ pub async fn ensure(base_dir: &Path) -> Result<PathBuf, String> {
 async fn verify_macos_signature(path: &Path) -> Result<(), String> {
     let out = tokio::process::Command::new("/usr/bin/codesign")
         .args(["--verify", "--strict"])
-        .arg(format!("-R={CODESIGN_REQUIREMENT}"))
+        .arg(format!("-R={}", codesign_requirement()))
         .arg(path)
         .output()
         .await
@@ -340,8 +341,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_signature_requirement_pins_cloudflares_team_id() {
-        assert!(CODESIGN_REQUIREMENT.contains("anchor apple generic"));
-        assert!(CODESIGN_REQUIREMENT.contains(&format!("certificate leaf[subject.OU] = \"{CLOUDFLARE_TEAM_ID}\"")));
+        let req = codesign_requirement();
+        assert!(req.starts_with("anchor apple generic and "));
+        assert!(req.ends_with("certificate leaf[subject.OU] = \"68WVV388M8\""));
         assert_eq!(CLOUDFLARE_TEAM_ID.len(), 10);
+        assert!(CLOUDFLARE_TEAM_ID.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 }
