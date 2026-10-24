@@ -54,6 +54,12 @@ struct Obs {
     group_has_bob_after_remove: bool,
     existed_before_delete: bool,
     exists_after_delete: bool,
+    deleted_is_flagged: bool,
+    deleted_reinsert: bool,
+    deleted_reinsert_row: bool,
+    other_is_flagged: bool,
+    deleted_address_old_inserted: bool,
+    deleted_address_new_inserted: bool,
     // --- DM wire contract §7: gift-wrap gate, self-wrap flag, NIP-40 ---
     wrap_anon_count: usize,
     wrap_recipient_count: usize,
@@ -137,10 +143,20 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
     let members_after_remove = sorted(db.get_members("g1").await.unwrap());
     let group_has_bob_after_remove = db.group_has_member("g1", &bob.pubkey).await.unwrap();
 
-    // --- delete round-trip ---
+    // --- delete round-trip; a tombstoned event stays gone (audit 2026-10) ---
     let existed_before_delete = db.get_event_by_id(&note_a.id).await.unwrap().is_some();
+    db.record_deleted_event(&note_a.id, &alice.pubkey, &alice.pubkey).await.unwrap();
     db.delete_event(&note_a.id).await.unwrap();
     let exists_after_delete = db.get_event_by_id(&note_a.id).await.unwrap().is_some();
+    let deleted_is_flagged = db.is_deleted(&note_a).await.unwrap();
+    let deleted_reinsert = db.store_event(&note_a).await.unwrap();
+    let deleted_reinsert_row = db.get_event_by_id(&note_a.id).await.unwrap().is_some();
+    let other_is_flagged = db.is_deleted(&note_b).await.unwrap();
+    db.record_deleted_address(30023, &alice.pubkey, "p", 100, &alice.pubkey).await.unwrap();
+    let addr_old = sign_event(alice, 30023, vec![vec!["d".into(), "p".into()]], "old", 100);
+    let addr_new = sign_event(alice, 30023, vec![vec!["d".into(), "p".into()]], "new", 101);
+    let deleted_address_old_inserted = db.store_event(&addr_old).await.unwrap();
+    let deleted_address_new_inserted = db.store_event(&addr_new).await.unwrap();
 
     // --- gift wraps: served only to the authenticated recipient (or ingest) ---
     use thewired_relay::nostr::wrap_gate::ReadCtx;
@@ -197,6 +213,12 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
         group_has_bob_after_remove,
         existed_before_delete,
         exists_after_delete,
+        deleted_is_flagged,
+        deleted_reinsert,
+        deleted_reinsert_row,
+        other_is_flagged,
+        deleted_address_old_inserted,
+        deleted_address_new_inserted,
         wrap_anon_count,
         wrap_recipient_count,
         wrap_stranger_count,
@@ -248,6 +270,12 @@ fn expected(alice: &TestIdentity, bob: &TestIdentity, note_a_id: &str, note_b_id
         group_has_bob_after_remove: false,
         existed_before_delete: true,
         exists_after_delete: false,
+        deleted_is_flagged: true,
+        deleted_reinsert: false,
+        deleted_reinsert_row: false,
+        other_is_flagged: false,
+        deleted_address_old_inserted: false,
+        deleted_address_new_inserted: true,
         wrap_anon_count: 0,
         wrap_recipient_count: 1,
         wrap_stranger_count: 0,

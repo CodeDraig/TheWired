@@ -151,6 +151,44 @@ impl Db {
         }
     }
 
+    /// Remember that `event_id` (authored by `pubkey`) was deleted, so a
+    /// re-publish is refused (security audit 2026-10). `deleted_by` is the
+    /// author (kind 5) or the moderator (kind 9005).
+    pub async fn record_deleted_event(&self, event_id: &str, pubkey: &str, deleted_by: &str) -> anyhow::Result<()> {
+        match self {
+            Db::Pg(p) => event_store::record_deleted_event(p, event_id, pubkey, deleted_by).await,
+            #[cfg(feature = "embedded")]
+            Db::Sqlite(p) => sqlite::record_deleted_event(p, event_id, pubkey, deleted_by).await,
+        }
+    }
+
+    /// Remember a NIP-09 `a`-tag deletion: versions of `(kind, pubkey, d_tag)`
+    /// created at or before `deleted_upto` are refused from now on.
+    pub async fn record_deleted_address(
+        &self,
+        kind: i32,
+        pubkey: &str,
+        d_tag: &str,
+        deleted_upto: i64,
+        deleted_by: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Db::Pg(p) => event_store::record_deleted_address(p, kind, pubkey, d_tag, deleted_upto, deleted_by).await,
+            #[cfg(feature = "embedded")]
+            Db::Sqlite(p) => sqlite::record_deleted_address(p, kind, pubkey, d_tag, deleted_upto, deleted_by).await,
+        }
+    }
+
+    /// Does a recorded deletion cover this event? The write path answers
+    /// `deleted:` when it does.
+    pub async fn is_deleted(&self, event: &Event) -> anyhow::Result<bool> {
+        match self {
+            Db::Pg(p) => event_store::is_deleted(p, event).await,
+            #[cfg(feature = "embedded")]
+            Db::Sqlite(p) => sqlite::is_deleted(p, event).await,
+        }
+    }
+
     /// Delete an event by id.
     pub async fn delete_event(&self, event_id: &str) -> anyhow::Result<bool> {
         match self {

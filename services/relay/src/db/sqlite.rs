@@ -91,6 +91,24 @@ CREATE TABLE IF NOT EXISTS group_roles (
     role     TEXT NOT NULL DEFAULT 'member',
     PRIMARY KEY (group_id, pubkey, role)
 );
+
+-- Deletions stick (security audit 2026-10; mirrors Postgres migration 007):
+-- ids / addresses a NIP-09 or NIP-29 deletion covered are refused on re-insert.
+CREATE TABLE IF NOT EXISTS deleted_events (
+    event_id   TEXT PRIMARY KEY,
+    pubkey     TEXT NOT NULL,
+    deleted_by TEXT NOT NULL,
+    deleted_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE TABLE IF NOT EXISTS deleted_addresses (
+    kind         INTEGER NOT NULL,
+    pubkey       TEXT NOT NULL,
+    d_tag        TEXT NOT NULL,
+    deleted_upto INTEGER NOT NULL,
+    deleted_by   TEXT NOT NULL,
+    deleted_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (kind, pubkey, d_tag)
+);
 "#;
 
 /// Open (and create) a file-backed SQLite database at filesystem `path` and
@@ -230,9 +248,14 @@ pub async fn store_event_flagged(
         }
     }
 
+    // The NOT EXISTS legs refuse an event a prior deletion covers (security
+    // audit 2026-10) — same guard as the Postgres store.
     let inserted = sqlx::query(
         "INSERT OR IGNORE INTO events (id, pubkey, created_at, kind, tags, content, sig, d_tag, h_tag, visibility, expires_at, self_published) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12 \
+         WHERE NOT EXISTS (SELECT 1 FROM deleted_events WHERE event_id = ?1 AND pubkey = ?2) \
+           AND NOT EXISTS (SELECT 1 FROM deleted_addresses \
+                           WHERE kind = ?4 AND pubkey = ?2 AND d_tag = COALESCE(?8, '') AND deleted_upto >= ?3)",
     )
     .bind(&event.id)
     .bind(&event.pubkey)
@@ -557,6 +580,64 @@ pub async fn count_groups(pool: &SqlitePool) -> anyhow::Result<i64> {
         .fetch_one(pool)
         .await?;
     Ok(n)
+}
+
+/// Remember a deleted event id (for its author) so a re-publish is refused.
+pub async fn record_deleted_event(
+    pool: &SqlitePool,
+    event_id: &str,
+    pubkey: &str,
+    deleted_by: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO deleted_events (event_id, pubkey, deleted_by) VALUES (?, ?, ?)")
+        .bind(event_id)
+        .bind(pubkey)
+        .bind(deleted_by)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Remember a NIP-09 `a`-tag deletion (versions at/before `deleted_upto`).
+pub async fn record_deleted_address(
+    pool: &SqlitePool,
+    kind: i32,
+    pubkey: &str,
+    d_tag: &str,
+    deleted_upto: i64,
+    deleted_by: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO deleted_addresses (kind, pubkey, d_tag, deleted_upto, deleted_by) VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET deleted_upto = MAX(deleted_upto, excluded.deleted_upto)",
+    )
+    .bind(kind)
+    .bind(pubkey)
+    .bind(d_tag)
+    .bind(deleted_upto)
+    .bind(deleted_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Does a recorded deletion cover this event (id for its author, or address
+/// at/before the deletion)?
+pub async fn is_deleted(pool: &SqlitePool, event: &Event) -> anyhow::Result<bool> {
+    let d_tag = event.get_tag_value("d").unwrap_or_default();
+    let (hit,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM deleted_events WHERE event_id = ? AND pubkey = ?) \
+             OR EXISTS (SELECT 1 FROM deleted_addresses WHERE kind = ? AND pubkey = ? AND d_tag = ? AND deleted_upto >= ?)",
+    )
+    .bind(&event.id)
+    .bind(&event.pubkey)
+    .bind(event.kind)
+    .bind(&event.pubkey)
+    .bind(&d_tag)
+    .bind(event.created_at)
+    .fetch_one(pool)
+    .await?;
+    Ok(hit)
 }
 
 /// Delete an event by id.

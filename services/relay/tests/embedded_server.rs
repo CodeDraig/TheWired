@@ -429,6 +429,41 @@ async fn embedded_relay_auth_rejects_foreign_relay_tag_and_accepts_every_own_add
     relay.stop().await;
 }
 
+/// Security audit 2026-10: a deleted message stays deleted on the embedded
+/// relay too — re-sending the same signed event after a kind 5 is refused.
+#[tokio::test]
+async fn embedded_relay_refuses_republish_of_deleted_event() {
+    let owner = TestIdentity::from_seed(7);
+    let pool = sqlite::connect_memory().await.unwrap();
+    let relay = server::run_embedded(Db::Sqlite(pool.clone()), 0, "t".into(), None, Some(owner.pubkey.clone()), false)
+        .await
+        .unwrap();
+    let (ws, _) = connect_async(relay.ws_url()).await.unwrap();
+    let (mut tx, mut rx) = ws.split();
+    assert!(read_until(&mut rx, "AUTH").await.is_some());
+
+    let create = sign_event(&owner, 9007, vec![vec!["h".into(), "g".into()]], "G", 1_700_000_000);
+    tx.send(event_frame(&create)).await.unwrap();
+    assert_eq!(read_until(&mut rx, "OK").await.unwrap()[2], true);
+    let chat = sign_event(&owner, 9, vec![vec!["h".into(), "g".into()]], "oops", 1_700_000_001);
+    tx.send(event_frame(&chat)).await.unwrap();
+    assert_eq!(read_until(&mut rx, "OK").await.unwrap()[2], true);
+
+    let del = sign_event(&owner, 5, vec![vec!["e".into(), chat.id.clone()], vec!["h".into(), "g".into()]], "", 1_700_000_002);
+    tx.send(event_frame(&del)).await.unwrap();
+    let ok = read_until(&mut rx, "OK").await.unwrap();
+    assert_eq!(ok[2], true, "{ok}");
+    assert!(sqlite::get_event_by_id(&pool, &chat.id).await.unwrap().is_none());
+
+    tx.send(event_frame(&chat)).await.unwrap();
+    let ok = read_until(&mut rx, "OK").await.unwrap();
+    assert_eq!(ok[2], false, "re-publish of a deleted event must be refused: {ok}");
+    assert!(ok[3].as_str().unwrap().starts_with("deleted:"), "{ok}");
+    assert!(sqlite::get_event_by_id(&pool, &chat.id).await.unwrap().is_none());
+
+    relay.stop().await;
+}
+
 /// Security audit 2026-10: on the embedded relay the owner-only 9007 path keeps
 /// working for NEW ids, but a second 9007 for an id the relay already hosts is
 /// refused and changes nothing — not even when it comes from the owner and

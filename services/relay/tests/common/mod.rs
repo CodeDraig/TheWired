@@ -184,6 +184,8 @@ async fn truncate_all(pool: &PgPool) -> sqlx::Result<()> {
             relay.invite_codes,
             relay.suspended_pubkeys,
             relay.tombstones,
+            relay.deleted_events,
+            relay.deleted_addresses,
             app.space_members,
             app.member_roles,
             app.role_permissions,

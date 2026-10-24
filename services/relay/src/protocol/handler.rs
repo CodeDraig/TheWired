@@ -203,6 +203,23 @@ async fn handle_event(
         }
     }
 
+    // Deletions stick (security audit 2026-10): an event a prior NIP-09 /
+    // NIP-29 deletion covers is refused, whoever re-sends it. Fails closed.
+    match state.pool.is_deleted(&event).await {
+        Ok(true) => {
+            tracing::debug!(event_id = log_prefix(&event.id), kind = event.kind, "Rejected publish: deleted");
+            return vec![format!(r#"["OK","{}",false,"deleted: this event was deleted"]"#, event.id)];
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(error = %e, event_id = log_prefix(&event.id), "Deletion lookup failed; rejecting publish");
+            return vec![format!(
+                r#"["OK","{}",false,"error: could not check deletion state"]"#,
+                event.id
+            )];
+        }
+    }
+
     // #115 — music events (31683/33123/30119) must carry the structural tags the
     // client relies on (title + d). Previously stored unvalidated.
     if crate::music::kinds::is_music_kind(event.kind)
@@ -275,9 +292,10 @@ async fn handle_event(
             return result;
         }
         5 => {
-            let result = crate::nostr::nip29::moderation::handle_deletion(&state.pool, &event)
-                .await
-                .unwrap_or_else(|e| vec![format!(r#"["OK","{}",false,"error: {e}"]"#, event.id)]);
+            let result = match crate::nostr::nip29::moderation::handle_deletion(&state.pool, &event).await {
+                Ok(outcome) => outcome.frames,
+                Err(e) => vec![format!(r#"["OK","{}",false,"error: {e}"]"#, event.id)],
+            };
             // Store the deletion event itself for history
             store_and_broadcast_if_ok(state, broadcast_tx, &result, event).await;
             return result;
