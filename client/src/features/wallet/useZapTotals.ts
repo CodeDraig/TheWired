@@ -8,7 +8,11 @@ import { relayManager } from "../../lib/nostr/relayManager";
  * Subscribe to kind:9735 zap receipts for an event and expose the running total.
  * Use sparingly (each call opens a relay subscription) — bounded single-item views.
  */
-export function useZapTotals(eventId: string | undefined): {
+export function useZapTotals(
+  eventId: string | undefined,
+  /** The zapped event's author — pass it so receipts naming anyone else are ignored. */
+  recipientPubkey?: string,
+): {
   msat: number;
   count: number;
 } {
@@ -19,13 +23,18 @@ export function useZapTotals(eventId: string | undefined): {
 
   useEffect(() => {
     if (!eventId) return;
-    const subId = fetchZapTotals(eventId, [], (t) => {
-      dispatch(setZapTotal({ eventId, msat: t.msat, count: t.count }));
-    });
+    const subId = fetchZapTotals(
+      eventId,
+      [],
+      (t) => {
+        dispatch(setZapTotal({ eventId, msat: t.msat, count: t.count }));
+      },
+      { recipientPubkey },
+    );
     return () => {
       relayManager.closeSubscription(subId);
     };
-  }, [eventId, dispatch]);
+  }, [eventId, recipientPubkey, dispatch]);
 
   return total ?? { msat: 0, count: 0 };
 }

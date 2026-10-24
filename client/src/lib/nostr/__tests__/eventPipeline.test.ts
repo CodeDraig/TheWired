@@ -48,6 +48,63 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("eventPipeline — zap receipt plausibility", () => {
+  // 1000 sats; padded past the 50-char HRP window the parser reads.
+  const BOLT11 = "lnbc10u1p3unwfusp5t9r3yymhpfqculx78u027lxspgxcr2n2987";
+  const MSAT = 1_000_000;
+
+  function receipt(id: number, target: string, recipient: string, description: string | null): NostrEvent {
+    const tags: string[][] = [["p", recipient], ["e", target], ["bolt11", BOLT11]];
+    if (description !== null) tags.push(["description", description]);
+    return makeEvent(id, { kind: 9735, pubkey: hex64(0x5e7), tags, content: "" });
+  }
+  function request(target: string, recipient: string, zapper = hex64(0x2a9)): string {
+    return JSON.stringify({
+      id: hex64(0x9734), pubkey: zapper, created_at: 1, kind: 9734, content: "gm", sig: SIG,
+      tags: [["p", recipient], ["e", target], ["amount", String(MSAT)]],
+    });
+  }
+
+  it("folds a consistent receipt into the zap aggregate", async () => {
+    const note = hex64(0xd01);
+    const author = hex64(0xa01);
+    await processIncomingEvent(receipt(0x9001, note, author, request(note, author)), WS);
+    vi.advanceTimersByTime(50);
+    const z = store.getState().zaps.byTarget[note];
+    expect(z && Object.values(z)[0]).toMatchObject({ msat: MSAT, zapper: hex64(0x2a9), comment: "gm" });
+  });
+
+  it("ignores a receipt with no embedded 9734 (bare bolt11 + e tag)", async () => {
+    const note = hex64(0xd02);
+    await processIncomingEvent(receipt(0x9002, note, hex64(0xa02), null), WS);
+    vi.advanceTimersByTime(50);
+    expect(store.getState().zaps.byTarget[note]).toBeUndefined();
+  });
+
+  it("ignores a receipt whose embedded request targets another event", async () => {
+    const note = hex64(0xd03);
+    const author = hex64(0xa03);
+    await processIncomingEvent(receipt(0x9003, note, author, request(hex64(0xd99), author)), WS);
+    vi.advanceTimersByTime(50);
+    expect(store.getState().zaps.byTarget[note]).toBeUndefined();
+  });
+
+  it("ignores a receipt naming a recipient other than the note's author once the note is known", async () => {
+    const note = hex64(0xd04);
+    const author = hex64(0xa04);
+    const mallory = hex64(0x666);
+    await processIncomingEvent(makeEvent(0xd04, { pubkey: author, kind: 1, content: "zap me" }), WS);
+    vi.advanceTimersByTime(50);
+    await processIncomingEvent(receipt(0x9004, note, mallory, request(note, mallory)), WS);
+    vi.advanceTimersByTime(50);
+    expect(store.getState().zaps.byTarget[note]).toBeUndefined();
+    // The same receipt shape for the real author counts.
+    await processIncomingEvent(receipt(0x9005, note, author, request(note, author)), WS);
+    vi.advanceTimersByTime(50);
+    expect(Object.keys(store.getState().zaps.byTarget[note] ?? {})).toEqual([hex64(0x9005)]);
+  });
+});
+
 describe("eventPipeline — un-react ordering", () => {
   it("a kind:5 that arrives before the kind:7 it retracts suppresses that reaction", async () => {
     const note = hex64(0xccc);

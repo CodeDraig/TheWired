@@ -151,3 +151,53 @@ describe("profileDisplayName", () => {
     expect(profileDisplayName({ display_name: "  " }, pk)).toBe("abcdef01…");
   });
 });
+
+describe("parseProfile — URL field hardening", () => {
+  // kind:0 content is attacker-controlled and `website`/`picture`/`banner` land
+  // in href/src attributes on every client. Only absolute http(s) survives.
+  it("keeps absolute http(s) website/picture/banner", () => {
+    const p = parseProfile(
+      k0(JSON.stringify({ website: "https://luna.example", picture: "http://cdn.example/p.png", banner: "https://cdn.example/b.jpg" })),
+    );
+    expect(p?.website).toBe("https://luna.example");
+    expect(p?.picture).toBe("http://cdn.example/p.png");
+    expect(p?.banner).toBe("https://cdn.example/b.jpg");
+  });
+
+  it("drops javascript:/data:/vbscript: URLs", () => {
+    const p = parseProfile(
+      k0(JSON.stringify({ website: "javascript:alert(1)", picture: "data:image/svg+xml,<svg onload=alert(1)>", banner: "vbscript:msgbox" })),
+    );
+    expect(p?.website).toBeUndefined();
+    expect(p?.picture).toBeUndefined();
+    expect(p?.banner).toBeUndefined();
+  });
+
+  it("drops protocol-relative and relative URLs (they resolve against the app origin)", () => {
+    const p = parseProfile(
+      k0(JSON.stringify({ website: "//evil.example/x", picture: "/local/path.png", banner: "evil.example/b.jpg" })),
+    );
+    expect(p?.website).toBeUndefined();
+    expect(p?.picture).toBeUndefined();
+    expect(p?.banner).toBeUndefined();
+  });
+
+  it("drops URLs with embedded control characters or whitespace-only values", () => {
+    const p = parseProfile(
+      k0(JSON.stringify({ website: "https://luna.example/\n<script>", picture: "   ", banner: "https://cdn.example/\u0000b.jpg" })),
+    );
+    expect(p?.website).toBeUndefined();
+    expect(p?.picture).toBeUndefined();
+    expect(p?.banner).toBeUndefined();
+  });
+
+  it("trims surrounding whitespace on an otherwise valid URL", () => {
+    const p = parseProfile(k0(JSON.stringify({ website: "  https://luna.example  " })));
+    expect(p?.website).toBe("https://luna.example");
+  });
+
+  it("the sanitized value overrides the raw preserved field", () => {
+    const p = parseProfile(k0(JSON.stringify({ website: "javascript:alert(1)", name: "Luna" })));
+    expect((p as unknown as Record<string, unknown>).website).toBeUndefined();
+  });
+});

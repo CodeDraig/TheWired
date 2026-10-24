@@ -9,6 +9,8 @@
 
 import { stripMediaGrant } from "@ishtarservices/core";
 import { LRUCache } from "lru-cache";
+import { ownBlossomOrigin } from "@/lib/api/blossom";
+import { isUnsafeHost } from "@/lib/security/ssrfGuard";
 
 const CACHE_MAX = 300;
 
@@ -25,11 +27,33 @@ export function peekProbedType(url: string): string | null | undefined {
   return exact && "type" in exact ? exact.type : undefined;
 }
 
+/**
+ * May this URL be HEAD-probed at render time? It comes straight from an event,
+ * so only public http(s) hosts qualify — never loopback / private / link-local
+ * (an attacker's note must not make every reader's app knock on their local
+ * services). The app's own API origin is exempt: it is loopback in dev.
+ */
+export function isProbeableUrl(url: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+  if (u.origin === ownBlossomOrigin()) return true;
+  return !isUnsafeHost(u.hostname);
+}
+
 export function probeContentType(url: string): Promise<string | null> {
   const known = peekProbedType(url);
   if (known !== undefined) return Promise.resolve(known);
   const inflight = cache.get(url);
   if (inflight && "pending" in inflight) return inflight.pending;
+  if (!isProbeableUrl(url)) {
+    cache.set(url, { type: null });
+    return Promise.resolve(null);
+  }
   const pending = fetch(url, { method: "HEAD" })
     .then((res) => (res.ok ? (res.headers.get("content-type")?.split(";")[0].trim().toLowerCase() || null) : null))
     .catch(() => null)

@@ -83,9 +83,37 @@ fn get_account_list_account() -> String {
 }
 
 /// Generic secret keychain account name (NIP-46 bunker connection, NWC URI).
-/// `key` is a caller-namespaced id like `nip46_<pubkey>` or `nwc_<pubkey>`.
+/// `key` is a caller-namespaced id like `nip46_<pubkey>` or `nwc_<pubkey>`,
+/// already checked by [`validate_secret_key`] at the IPC boundary.
 fn get_secret_account_for(key: &str) -> String {
     format!("nostr_secret_{}{}", key, instance_suffix())
+}
+
+/// Validate a transport-secret `key` at the IPC boundary. The key becomes part
+/// of a keychain account name and of a fallback FILENAME under the app data dir,
+/// so it must be a single safe path component: starts with an ASCII letter or
+/// digit, then `[A-Za-z0-9_.-]`, no `..`, at most 192 bytes. That covers every
+/// id the app generates (`nip46_<hex>`, `nwc_wallets_<hex>`,
+/// `llm_apikey_<hex>_<nanoid>`, `music.projectKey.<hex>.<hex>`,
+/// `embedded_relay_*`) and nothing a compromised webview could steer into `../`,
+/// a hidden file, or a control-character payload.
+fn validate_secret_key(key: &str) -> Result<String, String> {
+    const MAX: usize = 192;
+    let bytes = key.as_bytes();
+    let first_ok = bytes.first().is_some_and(|b| b.is_ascii_alphanumeric());
+    let rest_ok = bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    if !first_ok || !rest_ok || bytes.len() > MAX || key.contains("..") {
+        return Err("invalid secret key".to_string());
+    }
+    Ok(key.to_string())
+}
+
+/// Fallback file for a (validated) secret key inside `dir` — a pure helper so
+/// the path shape is unit-testable without an app handle.
+fn secret_fallback_path_in(dir: &Path, key: &str) -> PathBuf {
+    dir.join(format!("{}.secret", get_secret_account_for(key)))
 }
 
 /// Multi-key in-memory cache: pubkey → SecretKey
@@ -691,7 +719,7 @@ fn delete_legacy_fallback_key() {
 
 /// File-based fallback path for a generic secret (mirrors the per-account key fallback files).
 fn secret_fallback_path(key: &str) -> Option<PathBuf> {
-    Some(app_data_dir()?.join(format!("{}.secret", get_secret_account_for(key))))
+    Some(secret_fallback_path_in(&app_data_dir()?, key))
 }
 
 fn write_secret_fallback(key: &str, value: &str) {
@@ -1241,6 +1269,7 @@ pub fn keystore_nip44_decrypt(
 /// (consistent with the existing per-account key fallback).
 #[tauri::command]
 pub fn keystore_set_secret(key: String, value: String) -> Result<(), String> {
+    let key = validate_secret_key(&key)?;
     let account = get_secret_account_for(&key);
     let marker = format!("{}_marker", account);
     // Keychain-first, but only drop the plaintext file fallback once we've VERIFIED
@@ -1270,6 +1299,7 @@ fn store_secret_verified(account: &str, marker: &str, value: &[u8]) -> bool {
 /// Read a secret stored via keystore_set_secret. Returns None if absent.
 #[tauri::command]
 pub fn keystore_get_secret(key: String) -> Result<Option<String>, String> {
+    let key = validate_secret_key(&key)?;
     let account = get_secret_account_for(&key);
     if let Ok(Some(data)) = platform::read_key(SERVICE_NAME, &account) {
         if let Ok(s) = String::from_utf8(data) {
@@ -1297,6 +1327,7 @@ pub fn keystore_get_secret(key: String) -> Result<Option<String>, String> {
 /// Delete a secret stored via keystore_set_secret.
 #[tauri::command]
 pub fn keystore_delete_secret(key: String) -> Result<(), String> {
+    let key = validate_secret_key(&key)?;
     let account = get_secret_account_for(&key);
     let marker = format!("{}_marker", account);
     let _ = platform::delete_items(SERVICE_NAME, &account, &marker);
@@ -1337,6 +1368,104 @@ mod sign_guard_tests {
     fn rejects_malformed_event() {
         assert!(assert_event_pubkey("not json", ACTIVE).is_err());
         assert!(assert_event_pubkey("[0]", ACTIVE).is_err());
+    }
+}
+
+/// `keystore_{set,get,delete}_secret` take a caller-supplied `key` that ends up
+/// in a keychain account name AND a fallback filename under the app data dir.
+/// These pin the IPC-boundary validator so a compromised webview can't turn the
+/// key into a path (`../`), a hidden file, or a control-character payload.
+#[cfg(test)]
+mod secret_key_tests {
+    use super::*;
+
+    const HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn accepts_every_key_shape_the_app_uses() {
+        for k in [
+            format!("nip46_{HEX}"),
+            format!("nwc_wallets_{HEX}"),
+            format!("llm_providers_{HEX}"),
+            format!("llm_apikey_{HEX}_V1StGXR8_Z5jdHi6B-myT"), // nanoid provider id
+            format!("llm_apikey_{HEX}_ollama"),
+            format!("ai_websearch_key_{HEX}"),
+            format!("music.projectKey.{HEX}.{HEX}"),
+            format!("music.projectKeys.{HEX}"),
+            "embedded_relay_identity".to_string(),
+            "embedded_relay_tunnel_secret".to_string(),
+        ] {
+            assert_eq!(validate_secret_key(&k).as_deref(), Ok(k.as_str()), "{k}");
+        }
+    }
+
+    #[test]
+    fn rejects_path_separators_traversal_and_control_characters() {
+        for bad in [
+            "",
+            "../nostr_pk_x.key",
+            "..",
+            "a..b",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "C:\\x",
+            ".hidden",
+            "-dash-first",
+            "_underscore_first",
+            "a b",
+            "a\nb",
+            "a\0b",
+            "a\tb",
+            "a%2e%2e",
+            "ключ",
+            "a:b",
+            "a*b",
+            "a?b",
+            "a\"b",
+            "a'b",
+            "a$b",
+            "a;b",
+            "a|b",
+        ] {
+            assert!(validate_secret_key(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn bounds_the_length() {
+        let max = format!("a{}", "b".repeat(191));
+        assert!(validate_secret_key(&max).is_ok());
+        let too_long = format!("a{}", "b".repeat(192));
+        assert!(validate_secret_key(&too_long).is_err());
+    }
+
+    #[test]
+    fn a_validated_key_always_yields_a_file_directly_inside_the_data_dir() {
+        let dir = Path::new("/tmp/wired-data");
+        for k in [
+            format!("nip46_{HEX}"),
+            format!("music.projectKey.{HEX}.{HEX}"),
+            format!("llm_apikey_{HEX}_V1StGXR8_Z5jdHi6B-myT"),
+        ] {
+            let key = validate_secret_key(&k).unwrap();
+            let p = secret_fallback_path_in(dir, &key);
+            assert_eq!(p.parent(), Some(dir), "{p:?}");
+            let name = p.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("nostr_secret_"), "{name}");
+            assert!(name.ends_with(".secret"), "{name}");
+            assert!(!name.contains(".."), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_ipc_commands_reject_a_bad_key_before_touching_storage() {
+        // Each command must fail on validation alone (no keychain / fs access
+        // happens for an invalid key, so this is safe to run anywhere).
+        assert!(keystore_set_secret("../x".into(), "v".into()).is_err());
+        assert!(keystore_get_secret("../x".into()).is_err());
+        assert!(keystore_delete_secret("../x".into()).is_err());
+        assert!(keystore_set_secret(String::new(), "v".into()).is_err());
     }
 }
 

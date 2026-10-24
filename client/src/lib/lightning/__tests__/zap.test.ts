@@ -17,9 +17,12 @@ vi.mock("../../nostr/nip65", () => ({ fetchRelayList: vi.fn(() => "sub") }));
 import { getSatoshisAmountFromBolt11 } from "nostr-tools/nip57";
 import {
   validateZapReceipt,
+  validateReceiptShape,
+  fetchZapTotals,
   buildAndSignZapRequest,
   type ZapValidation,
 } from "../zap";
+import { relayManager } from "../../nostr/relayManager";
 import type { NostrEvent } from "../../../types/nostr";
 
 // 10 micro-BTC = 1000 sats; padded past the 50-char HRP window the parser reads.
@@ -125,5 +128,118 @@ describe("buildAndSignZapRequest (anonymous)", () => {
     });
     expect(ev.tags.find((t) => t[0] === "e")?.[1]).toBe(target.id);
     expect(ev.tags.find((t) => t[0] === "k")?.[1]).toBe("1");
+  });
+});
+
+// --- Receipt plausibility (any zap, not just ours) -------------------------
+// A kind:9735 is published by the recipient's LNURL server, but anyone can
+// publish a 9735 with an `e` tag. Totals must only count receipts whose
+// embedded kind:9734 request is consistent with the receipt and the target.
+
+const RECIP = "b".repeat(64);
+const ZAPPER = "c".repeat(64);
+const TARGET = "f".repeat(64);
+
+function request9734(over: Partial<Record<string, unknown>> = {}, tags?: string[][]) {
+  return JSON.stringify({
+    id: "q".repeat(64),
+    pubkey: ZAPPER,
+    created_at: 1,
+    kind: 9734,
+    content: "gm",
+    sig: "s".repeat(128),
+    tags: tags ?? [["p", RECIP], ["e", TARGET], ["amount", String(MSAT)], ["relays", "wss://r"]],
+    ...over,
+  });
+}
+
+function fullReceipt(over: Partial<NostrEvent> = {}, description: string | null = request9734()): NostrEvent {
+  const tags: string[][] = [["p", RECIP], ["e", TARGET], ["bolt11", BOLT11]];
+  if (description !== null) tags.push(["description", description]);
+  return { id: "r1", pubkey: SERVER_PK, created_at: 1, kind: 9735, content: "", sig: "x", tags, ...over };
+}
+
+describe("validateReceiptShape", () => {
+  it("accepts a consistent receipt and surfaces amount, zapper and comment", () => {
+    expect(validateReceiptShape(fullReceipt(), { targetEventId: TARGET })).toEqual({
+      msat: MSAT,
+      zapper: ZAPPER,
+      comment: "gm",
+    });
+  });
+
+  it("rejects a receipt without a description (no embedded 9734)", () => {
+    expect(validateReceiptShape(fullReceipt({}, null), { targetEventId: TARGET })).toBeNull();
+  });
+
+  it("rejects a description that is not a kind:9734 or is malformed", () => {
+    expect(validateReceiptShape(fullReceipt({}, request9734({ kind: 1 })), { targetEventId: TARGET })).toBeNull();
+    expect(validateReceiptShape(fullReceipt({}, "not json"), { targetEventId: TARGET })).toBeNull();
+    expect(validateReceiptShape(fullReceipt({}, request9734({ pubkey: "nope" })), { targetEventId: TARGET })).toBeNull();
+  });
+
+  it("rejects when the embedded request targets a different event", () => {
+    const desc = request9734({}, [["p", RECIP], ["e", "e".repeat(64)], ["amount", String(MSAT)]]);
+    expect(validateReceiptShape(fullReceipt({}, desc), { targetEventId: TARGET })).toBeNull();
+  });
+
+  it("rejects when the receipt's p tag disagrees with the embedded request", () => {
+    const tags: string[][] = [["p", "d".repeat(64)], ["e", TARGET], ["bolt11", BOLT11], ["description", request9734()]];
+    expect(validateReceiptShape(fullReceipt({ tags }), { targetEventId: TARGET })).toBeNull();
+  });
+
+  it("rejects when the recipient is known and the receipt names someone else", () => {
+    expect(validateReceiptShape(fullReceipt(), { targetEventId: TARGET, recipientPubkey: "d".repeat(64) })).toBeNull();
+    expect(validateReceiptShape(fullReceipt(), { targetEventId: TARGET, recipientPubkey: RECIP })).not.toBeNull();
+  });
+
+  it("rejects an amount tag that disagrees with the bolt11, tolerates a missing one", () => {
+    const wrong = request9734({}, [["p", RECIP], ["e", TARGET], ["amount", String(MSAT + 1000)]]);
+    expect(validateReceiptShape(fullReceipt({}, wrong), { targetEventId: TARGET })).toBeNull();
+    const none = request9734({}, [["p", RECIP], ["e", TARGET]]);
+    expect(validateReceiptShape(fullReceipt({}, none), { targetEventId: TARGET })?.msat).toBe(MSAT);
+  });
+
+  it("pins the receipt author to the LNURL server key when known", () => {
+    expect(validateReceiptShape(fullReceipt(), { targetEventId: TARGET, zapperPubkey: SERVER_PK })).not.toBeNull();
+    expect(validateReceiptShape(fullReceipt({ pubkey: "e".repeat(64) }), { targetEventId: TARGET, zapperPubkey: SERVER_PK })).toBeNull();
+  });
+
+  it("rejects a missing or zero-amount bolt11", () => {
+    const tags: string[][] = [["p", RECIP], ["e", TARGET], ["description", request9734()]];
+    expect(validateReceiptShape(fullReceipt({ tags }), { targetEventId: TARGET })).toBeNull();
+  });
+});
+
+describe("fetchZapTotals", () => {
+  it("only sums receipts that pass validateReceiptShape and pins authors when the zapper key is known", () => {
+    const subscribe = vi.mocked(relayManager.subscribe);
+    subscribe.mockClear();
+    const totals: { msat: number; count: number }[] = [];
+    fetchZapTotals(TARGET, [], (t) => totals.push(t), { recipientPubkey: RECIP, zapperPubkey: SERVER_PK });
+
+    const params = subscribe.mock.calls[0][0] as { filters: { authors?: string[] }[]; onEvent: (e: NostrEvent) => void };
+    expect(params.filters[0].authors).toEqual([SERVER_PK]);
+
+    params.onEvent(fullReceipt({ id: "forged-1" }, null)); // no description
+    params.onEvent(fullReceipt({ id: "forged-2", pubkey: "e".repeat(64) })); // wrong author
+    params.onEvent(fullReceipt({ id: "forged-3", tags: [["p", "d".repeat(64)], ["e", TARGET], ["bolt11", BOLT11], ["description", request9734()]] }));
+    expect(totals).toEqual([]);
+
+    params.onEvent(fullReceipt({ id: "real-1" }));
+    params.onEvent(fullReceipt({ id: "real-1" })); // duplicate delivery
+    params.onEvent(fullReceipt({ id: "real-2" }));
+    expect(totals).toEqual([
+      { msat: MSAT, count: 1 },
+      { msat: MSAT * 2, count: 2 },
+    ]);
+  });
+
+  it("does not pin authors when the zapper key is unknown", () => {
+    const subscribe = vi.mocked(relayManager.subscribe);
+    subscribe.mockClear();
+    fetchZapTotals(TARGET, [], () => {});
+    const params = subscribe.mock.calls[0][0] as { filters: { authors?: string[] }[] };
+    expect(params.filters[0].authors).toBeUndefined();
   });
 });
