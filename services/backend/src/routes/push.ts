@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
-import { pushService } from "../services/pushService.js";
+import { isAllowedPushEndpoint, pushService } from "../services/pushService.js";
 import { validate, nonEmptyString } from "../lib/validation.js";
 import { getRedis } from "../lib/redis.js";
 import { enqueueNotification } from "../services/notificationEnqueue.js";
@@ -14,16 +14,26 @@ export const TEST_PUSH = {
 } as const;
 
 // ── Web Push (desktop) ──
+/** The dispatcher POSTs to `endpoint` from inside the deployment, so it must
+ *  be https on a known push service (pushService.isAllowedPushEndpoint). */
+const pushEndpoint = z
+  .string()
+  .max(2048)
+  .url()
+  .refine((u) => isAllowedPushEndpoint(u).ok, {
+    message: "endpoint must be an https URL on a known push service",
+  });
+
 const subscribeBody = z.object({
-  endpoint: z.string().url(),
+  endpoint: pushEndpoint,
   keys: z.object({
-    p256dh: nonEmptyString,
-    auth: nonEmptyString,
+    p256dh: nonEmptyString.max(256),
+    auth: nonEmptyString.max(128),
   }),
 });
 
 const unsubscribeBody = z.object({
-  endpoint: z.string().url(),
+  endpoint: z.string().max(2048).url(),
 });
 
 // ── Mobile devices ──
@@ -57,7 +67,10 @@ export const pushRoutes: FastifyPluginAsync = async (server) => {
     const body = validate(subscribeBody, request.body, reply);
     if (!body) return;
 
-    await pushService.subscribe(pubkey, body.endpoint, body.keys);
+    const stored = await pushService.subscribe(pubkey, body.endpoint, body.keys);
+    if (!stored) {
+      return reply.status(400).send({ error: "Too many subscriptions", code: "TOO_MANY_SUBSCRIPTIONS" });
+    }
     return { data: { success: true } };
   });
 

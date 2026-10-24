@@ -7,6 +7,7 @@ import {
 import { eq, and, lt, gt, or, isNotNull, sql, inArray } from "drizzle-orm";
 import { config } from "../config.js";
 import * as webPush from "web-push";
+import { isAllowedPushEndpoint } from "../services/pushService.js";
 import { runWithWorkerLock, startLockedInterval } from "../lib/workerLock.js";
 import { getRedis } from "../lib/redis.js";
 import { pushService } from "../services/pushService.js";
@@ -261,6 +262,14 @@ export async function dispatchOnce(deps: DispatchDeps): Promise<DispatchStats> {
         type: folded.type,
       });
       for (const sub of subs) {
+        // Rows written before the endpoint guard existed (or by a client that
+        // slipped past it) get the same check here, where the POST is made.
+        if (!isAllowedPushEndpoint(sub.endpoint).ok) {
+          await db
+            .delete(pushSubscriptions)
+            .where(and(eq(pushSubscriptions.pubkey, sub.pubkey), eq(pushSubscriptions.endpoint, sub.endpoint)));
+          continue;
+        }
         try {
           await webPush.sendNotification(
             { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
