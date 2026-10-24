@@ -68,21 +68,30 @@ impl<'de> Deserialize<'de> for Filter {
                 }
             }
         }
+        // Hex-valued fields are compared as strings against stored lowercase
+        // values; normalize the client's spelling (security audit 2026-10).
         Ok(Filter {
-            ids: raw.ids,
-            authors: raw.authors,
+            ids: lowercase_all(raw.ids),
+            authors: lowercase_all(raw.authors),
             kinds: raw.kinds,
             since: raw.since,
             until: raw.until,
             limit: raw.limit,
             search: raw.search,
             h_tags: raw.h_tags,
-            p_tags: raw.p_tags,
-            e_tags: raw.e_tags,
+            p_tags: lowercase_all(raw.p_tags),
+            e_tags: lowercase_all(raw.e_tags),
             d_tags: raw.d_tags,
             generic_tags,
         })
     }
+}
+
+fn lowercase_all(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|v| if v.bytes().any(|b| b.is_ascii_uppercase()) { v.to_ascii_lowercase() } else { v })
+        .collect()
 }
 
 impl Filter {
@@ -381,6 +390,39 @@ mod tests {
             ..Default::default()
         };
         assert!(filter.matches(&make_event(None))); // kind 1, pubkey1 -- both match
+    }
+
+    /// Security audit 2026-10: hex values in `ids` / `authors` / `#p` / `#e`
+    /// are lowercased on parse so an uppercase spelling still matches stored
+    /// (lowercase) events instead of silently returning nothing.
+    #[test]
+    fn test_hex_filter_values_are_lowercased() {
+        let f: Filter = serde_json::from_value(serde_json::json!({
+            "ids": ["ABC123"],
+            "authors": ["PUBKEY1"],
+            "#p": ["PK_TARGET"],
+            "#e": ["EVT_REF"],
+            "#d": ["My-Slug"],
+            "#t": ["NoStr"]
+        }))
+        .unwrap();
+        assert_eq!(f.ids, vec!["abc123"]);
+        assert_eq!(f.authors, vec!["pubkey1"]);
+        assert_eq!(f.p_tags, vec!["pk_target"]);
+        assert_eq!(f.e_tags, vec!["evt_ref"]);
+        // Non-hex tag values keep their case.
+        assert_eq!(f.d_tags, vec!["My-Slug"]);
+        assert_eq!(f.generic_tags, vec![("t".to_string(), vec!["NoStr".to_string()])]);
+
+        // An uppercase spelling of the fixture's lowercase values matches it.
+        let hex_only: Filter = serde_json::from_value(serde_json::json!({
+            "ids": ["ABC123"],
+            "authors": ["PUBKEY1"],
+            "#p": ["PK_TARGET"],
+            "#e": ["EVT_REF"]
+        }))
+        .unwrap();
+        assert!(hex_only.matches(&make_event(None)));
     }
 
     // #69 — a generic single-letter `#x` filter is parsed (not dropped) and
