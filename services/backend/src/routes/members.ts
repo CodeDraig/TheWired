@@ -10,6 +10,7 @@ import { eq, and, sql, asc } from "drizzle-orm";
 import { onboardingService } from "../services/onboardingService.js";
 import { profileCacheService, toMemberProfile, PROFILE_JOIN_CAP } from "../services/profileCacheService.js";
 import { notifySpaceChanged } from "../services/spaceSignalService.js";
+import { moderationService } from "../services/moderationService.js";
 import { requirePubkey, requireSpace, requireSpacePermission } from "../lib/authz.js";
 
 const idParams = z.object({ id: nonEmptyString });
@@ -70,6 +71,9 @@ export const membersRoutes: FastifyPluginAsync = async (server) => {
     const [space] = await db.select().from(spaces).where(eq(spaces.id, id)).limit(1);
     if (!space) return reply.status(404).send({ error: "Space not found", code: "NOT_FOUND" });
     if (!space.listed) return reply.status(403).send({ error: "Space is not publicly listed", code: "FORBIDDEN" });
+    if (await moderationService.isBanned(id, pubkey)) {
+      return reply.status(403).send({ error: "You are banned from this space", code: "BANNED" });
+    }
 
     // Check if already a member — if so, skip insert but still return space data
     const [existing] = await db

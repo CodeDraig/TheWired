@@ -1,9 +1,19 @@
 import { z } from "zod";
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyReply } from "fastify";
 import { roleService } from "../services/roleService.js";
 import { permissionService } from "../services/permissionService.js";
 import { profileCacheService, toMemberProfile, PROFILE_JOIN_CAP } from "../services/profileCacheService.js";
-import { requirePubkey, requireSpaceCreator, isSpaceCreator } from "../lib/authz.js";
+import {
+  requirePubkey,
+  requireSpaceCreator,
+  isSpaceCreator,
+  requireRoleInSpace,
+  getActorRank,
+  canManageRole,
+  unknownPermissions,
+  ungrantablePermissions,
+  type ActorRank,
+} from "../lib/authz.js";
 import { notifySpaceChanged } from "../services/spaceSignalService.js";
 import { validate, hexId, nonEmptyString } from "../lib/validation.js";
 
@@ -28,17 +38,32 @@ const spaceRolePubkeyParamsSchema = z.object({
 });
 
 const createRoleBodySchema = z.object({
-  name: nonEmptyString,
-  color: z.string().optional(),
-  permissions: z.array(z.string()),
+  name: nonEmptyString.max(100),
+  color: z.string().max(32).optional(),
+  permissions: z.array(z.string()).max(64),
   isAdmin: z.boolean().optional(),
 });
 
 const updateRoleBodySchema = z.object({
-  name: z.string().optional(),
-  color: z.string().optional(),
-  permissions: z.array(z.string()).optional(),
+  name: z.string().max(100).optional(),
+  color: z.string().max(32).optional(),
+  permissions: z.array(z.string()).max(64).optional(),
 });
+
+/** 400 for permission names that don't exist, 403 for ones the actor may not grant. */
+function checkGrantable(rank: ActorRank, perms: string[], reply: FastifyReply): boolean {
+  const unknown = unknownPermissions(perms);
+  if (unknown.length > 0) {
+    reply.status(400).send({ error: `Unknown permissions: ${unknown.join(", ")}`, code: "INVALID_PERMISSION" });
+    return false;
+  }
+  const denied = ungrantablePermissions(rank, perms);
+  if (denied.length > 0) {
+    reply.status(403).send({ error: `Cannot grant permissions you do not hold: ${denied.join(", ")}`, code: "FORBIDDEN" });
+    return false;
+  }
+  return true;
+}
 
 const reorderBodySchema = z.object({
   orderedIds: z.array(z.string()).min(1),
@@ -89,6 +114,13 @@ export const rolesRoutes: FastifyPluginAsync = async (server) => {
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_ROLES");
       if (!perm.allowed) return reply.status(403).send({ error: "Missing MANAGE_ROLES permission", code: "FORBIDDEN" });
 
+      // Only the creator mints admin roles; everyone else grants only what they hold.
+      const rank = await getActorRank(params.spaceId, pubkey);
+      if (body.isAdmin && !rank.isCreator) {
+        return reply.status(403).send({ error: "Only the space creator can create admin roles", code: "CREATOR_ONLY" });
+      }
+      if (!checkGrantable(rank, body.permissions, reply)) return;
+
       const role = await roleService.createRole(params.spaceId, body);
       notifySpaceChanged(params.spaceId, "roles");
       return { data: role };
@@ -113,6 +145,14 @@ export const rolesRoutes: FastifyPluginAsync = async (server) => {
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_ROLES");
       if (!perm.allowed) return reply.status(403).send({ error: "Missing MANAGE_ROLES permission", code: "FORBIDDEN" });
 
+      const target = await requireRoleInSpace(params.spaceId, params.roleId, reply);
+      if (!target) return;
+      const rank = await getActorRank(params.spaceId, pubkey);
+      if (!canManageRole(rank, target)) {
+        return reply.status(403).send({ error: "Cannot modify a role equal to or above your own", code: "FORBIDDEN" });
+      }
+      if (body.permissions !== undefined && !checkGrantable(rank, body.permissions, reply)) return;
+
       try {
         const role = await roleService.updateRole(params.spaceId, params.roleId, body);
         notifySpaceChanged(params.spaceId, "roles");
@@ -135,6 +175,13 @@ export const rolesRoutes: FastifyPluginAsync = async (server) => {
 
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_ROLES");
       if (!perm.allowed) return reply.status(403).send({ error: "Missing MANAGE_ROLES permission", code: "FORBIDDEN" });
+
+      const target = await requireRoleInSpace(params.spaceId, params.roleId, reply);
+      if (!target) return;
+      const rank = await getActorRank(params.spaceId, pubkey);
+      if (!canManageRole(rank, target)) {
+        return reply.status(403).send({ error: "Cannot delete a role equal to or above your own", code: "FORBIDDEN" });
+      }
 
       try {
         await roleService.deleteRole(params.spaceId, params.roleId);
@@ -164,6 +211,22 @@ export const rolesRoutes: FastifyPluginAsync = async (server) => {
 
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_ROLES");
       if (!perm.allowed) return reply.status(403).send({ error: "Missing MANAGE_ROLES permission", code: "FORBIDDEN" });
+
+      // Non-creators may only shuffle roles strictly below their own: nothing
+      // at or above their rank (or any admin role) may change position, and
+      // nothing may be moved up into that band.
+      const rank = await getActorRank(params.spaceId, pubkey);
+      if (!rank.isCreator) {
+        const byId = new Map((await roleService.listRoles(params.spaceId)).map((r) => [r.id, r]));
+        for (let i = 0; i < body.orderedIds.length; i++) {
+          const role = byId.get(body.orderedIds[i]);
+          if (!role) return reply.status(404).send({ error: "Role not found", code: "NOT_FOUND" });
+          const protectedBand = role.isAdmin || role.position <= rank.bestPosition || i <= rank.bestPosition;
+          if (protectedBand && role.position !== i) {
+            return reply.status(403).send({ error: "Cannot move roles equal to or above your own", code: "FORBIDDEN" });
+          }
+        }
+      }
 
       await roleService.reorderRoles(params.spaceId, body.orderedIds);
       notifySpaceChanged(params.spaceId, "roles");
@@ -212,6 +275,13 @@ export const rolesRoutes: FastifyPluginAsync = async (server) => {
 
       const perm = await permissionService.check(params.spaceId, pubkey, "MANAGE_ROLES");
       if (!perm.allowed) return reply.status(403).send({ error: "Missing MANAGE_ROLES permission", code: "FORBIDDEN" });
+
+      const target = await requireRoleInSpace(params.spaceId, params.roleId, reply);
+      if (!target) return;
+      const rank = await getActorRank(params.spaceId, pubkey);
+      if (!canManageRole(rank, target)) {
+        return reply.status(403).send({ error: "Cannot override a role equal to or above your own", code: "FORBIDDEN" });
+      }
 
       try {
         await roleService.setChannelOverrides(params.spaceId, params.roleId, body.overrides);
@@ -281,21 +351,15 @@ export const rolesRoutes: FastifyPluginAsync = async (server) => {
       if (!perm.allowed) return reply.status(403).send({ error: "Missing MANAGE_MEMBERS permission", code: "FORBIDDEN" });
 
       // The role must belong to this space (a foreign id would otherwise be
-      // inserted as-is and, via the unscoped role lookup in permissionService,
-      // could carry another space's Admin flag).
-      const allRoles = await roleService.listRoles(params.spaceId);
-      const assignedRole = allRoles.find((r) => r.id === body.roleId);
-      if (!assignedRole) return reply.status(404).send({ error: "Role not found", code: "NOT_FOUND" });
-
-      // Hierarchy: the creator outranks every role; anyone else's best role
-      // must strictly outrank the role being assigned (so an Admin can hand
-      // out every role below Admin, and only the creator can mint admins).
-      if (!(await isSpaceCreator(params.spaceId, authPubkey))) {
-        const actorRoles = await roleService.getMemberRoles(params.spaceId, authPubkey);
-        const actorBestPos = Math.min(...actorRoles.map((r) => r.position));
-        if (assignedRole.position <= actorBestPos) {
-          return reply.status(403).send({ error: "Cannot assign a role equal to or above your own", code: "FORBIDDEN" });
-        }
+      // inserted as-is). Hierarchy: the creator outranks every role; anyone
+      // else may only hand out non-admin roles strictly below their own best
+      // role — so an Admin gives out everything below Admin, and only the
+      // creator mints admins, wherever the Admin role sits in the order.
+      const assignedRole = await requireRoleInSpace(params.spaceId, body.roleId, reply);
+      if (!assignedRole) return;
+      const rank = await getActorRank(params.spaceId, authPubkey);
+      if (!canManageRole(rank, assignedRole)) {
+        return reply.status(403).send({ error: "Cannot assign a role equal to or above your own", code: "FORBIDDEN" });
       }
 
       await roleService.assignRole(params.spaceId, params.pubkey, body.roleId);

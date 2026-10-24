@@ -5,7 +5,7 @@ import { spaces } from "../db/schema/spaces.js";
 import { spaceChannels } from "../db/schema/channels.js";
 import { spaceRoles } from "../db/schema/permissions.js";
 import { permissionService } from "../services/permissionService.js";
-import { roleService } from "../services/roleService.js";
+import { roleService, KNOWN_PERMISSIONS } from "../services/roleService.js";
 import { config } from "../config.js";
 
 type SpaceRow = typeof spaces.$inferSelect;
@@ -153,4 +153,45 @@ export async function requireRoleInSpace(
     return null;
   }
   return row;
+}
+
+/** Where an actor sits in a space's role hierarchy, resolved once per request. */
+export interface ActorRank {
+  isCreator: boolean;
+  /** Lowest `position` among the actor's roles (0 = top); Infinity with none. */
+  bestPosition: number;
+  /** Effective space permissions (every known one for the creator). */
+  permissions: string[];
+}
+
+export async function getActorRank(spaceId: string, pubkey: string): Promise<ActorRank> {
+  const isCreator = await isSpaceCreator(spaceId, pubkey);
+  const roles = await roleService.getMemberRoles(spaceId, pubkey);
+  const bestPosition = roles.length > 0 ? Math.min(...roles.map((r) => r.position)) : Infinity;
+  const permissions = isCreator ? [...KNOWN_PERMISSIONS] : await roleService.getEffectivePermissions(spaceId, pubkey);
+  return { isCreator, bestPosition, permissions };
+}
+
+/**
+ * May `rank` manage this role (edit, delete, reorder, override, hand out)?
+ * The creator may touch any role. Everyone else may only touch NON-admin roles
+ * strictly below their own best role — so two Admins can't demote each other,
+ * a MANAGE_ROLES holder can't rewrite their own role, and only the creator
+ * mints admins (even if the Admin role was reordered to the bottom).
+ */
+export function canManageRole(rank: ActorRank, role: { position: number; isAdmin: boolean }): boolean {
+  if (rank.isCreator) return true;
+  if (role.isAdmin) return false;
+  return role.position > rank.bestPosition;
+}
+
+/** Permission names the backend does not define at all. */
+export function unknownPermissions(perms: string[]): string[] {
+  return perms.filter((p) => !KNOWN_PERMISSIONS.includes(p));
+}
+
+/** Known permissions the actor may NOT grant: non-creators grant only what they hold. */
+export function ungrantablePermissions(rank: ActorRank, perms: string[]): string[] {
+  if (rank.isCreator) return [];
+  return perms.filter((p) => KNOWN_PERMISSIONS.includes(p) && !rank.permissions.includes(p));
 }

@@ -57,6 +57,21 @@ export const permissionService = {
       }
     }
 
+    // Permissions require current membership. Kicked members keep their
+    // member_roles rows (so a rejoin restores them), and nothing stops a row
+    // from being planted — so roles alone must grant nothing. The creator is
+    // auto-recovered below (legacy spaces / failed registerSpace).
+    const [membership] = await db
+      .select({ pubkey: spaceMembers.pubkey })
+      .from(spaceMembers)
+      .where(and(eq(spaceMembers.spaceId, spaceId), eq(spaceMembers.pubkey, pubkey)))
+      .limit(1);
+    if (!membership) {
+      const [space] = await db.select({ creatorPubkey: spaces.creatorPubkey }).from(spaces).where(eq(spaces.id, spaceId)).limit(1);
+      if (space?.creatorPubkey !== pubkey) return { allowed: false, reason: "Not a member" };
+      await db.insert(spaceMembers).values({ spaceId, pubkey }).onConflictDoNothing();
+    }
+
     // Get member's roles
     const roles = await db
       .select({ roleId: memberRoles.roleId })
@@ -99,7 +114,12 @@ export const permissionService = {
     const roleIds = roles.map((r) => r.roleId);
 
     // Admin bypass.
-    const roleRows = await db.select().from(spaceRoles).where(inArray(spaceRoles.id, roleIds));
+    // Scoped to THIS space: a member_roles row naming another space's role
+    // (however it got there) must never carry that space's Admin flag here.
+    const roleRows = await db
+      .select()
+      .from(spaceRoles)
+      .where(and(eq(spaceRoles.spaceId, spaceId), inArray(spaceRoles.id, roleIds)));
     if (roleRows.some((r) => r.isAdmin)) return { allowed: true, reason: "Admin role" };
 
     // Per-role channel override for this channel+permission (first wins per role,
@@ -170,7 +190,11 @@ export const permissionService = {
     let actorBestPosition = Infinity;
     let actorIsAdmin = false;
     for (const { roleId } of actorRoleRows) {
-      const [role] = await db.select().from(spaceRoles).where(eq(spaceRoles.id, roleId)).limit(1);
+      const [role] = await db
+        .select()
+        .from(spaceRoles)
+        .where(and(eq(spaceRoles.id, roleId), eq(spaceRoles.spaceId, spaceId)))
+        .limit(1);
       if (role) {
         if (role.position < actorBestPosition) actorBestPosition = role.position;
         if (role.isAdmin) actorIsAdmin = true;
@@ -186,7 +210,11 @@ export const permissionService = {
     let targetBestPosition = Infinity;
     let targetIsAdmin = false;
     for (const { roleId } of targetRoleRows) {
-      const [role] = await db.select().from(spaceRoles).where(eq(spaceRoles.id, roleId)).limit(1);
+      const [role] = await db
+        .select()
+        .from(spaceRoles)
+        .where(and(eq(spaceRoles.id, roleId), eq(spaceRoles.spaceId, spaceId)))
+        .limit(1);
       if (role) {
         if (role.position < targetBestPosition) targetBestPosition = role.position;
         if (role.isAdmin) targetIsAdmin = true;
