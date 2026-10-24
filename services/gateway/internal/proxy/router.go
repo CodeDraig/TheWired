@@ -13,14 +13,21 @@ var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // Router maps API paths to backend services
 type Router struct {
-	backendURL string
-	signer     *gatewayauth.Signer // nil = X-Gateway-Auth disabled
+	target    *url.URL
+	transport http.RoundTripper
+	signer    *gatewayauth.Signer // nil = X-Gateway-Auth disabled
 }
 
 // NewRouter builds the /api router. `signer` (nil to disable) MACs the
 // forwarded identity headers so the backend can verify they came from here.
+// backendURL must satisfy ValidateBackendURL (main checks it first); an
+// invalid one panics rather than 502-ing every request.
 func NewRouter(backendURL string, signer *gatewayauth.Signer) *Router {
-	return &Router{backendURL: backendURL, signer: signer}
+	return &Router{
+		target:    mustParseBackend(backendURL),
+		transport: newBackendTransport(DefaultResponseHeaderTimeout),
+		signer:    signer,
+	}
 }
 
 // wirePath is the request-target path as it will be written on the outgoing
@@ -31,16 +38,28 @@ func wirePath(path, rawPath string) string {
 	return u.EscapedPath()
 }
 
+// blossomHandler proxies Blossom endpoints to the backend unchanged.
+type blossomHandler struct {
+	target    *url.URL
+	transport http.RoundTripper
+	signer    *gatewayauth.Signer
+}
+
 // NewBlossomHandler returns a handler that proxies Blossom endpoints to the backend.
 // Backend handles kind 24242 auth for PUT/DELETE; GET/HEAD are unauthenticated.
 // The catch-all runs the optional NIP-98 middleware, so a verified pubkey can
 // reach here too — it is signed over the unchanged path.
 func NewBlossomHandler(backendURL string, signer *gatewayauth.Signer) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		signer.Apply(r, wirePath(r.URL.Path, r.URL.RawPath))
-		proxy := newReverseProxy(backendURL, r.URL.Path, r.URL.RawPath)
-		proxy.ServeHTTP(w, r)
-	})
+	return &blossomHandler{
+		target:    mustParseBackend(backendURL),
+		transport: newBackendTransport(DefaultResponseHeaderTimeout),
+		signer:    signer,
+	}
+}
+
+func (b *blossomHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	b.signer.Apply(r, wirePath(r.URL.Path, r.URL.RawPath))
+	newReverseProxy(b.target, b.transport, r.URL.Path, r.URL.RawPath).ServeHTTP(w, r)
 }
 
 // stripAPIPrefix removes the leading "/api" from both the decoded path and its
@@ -88,7 +107,6 @@ func (rt *Router) Handler() http.Handler {
 		// Sign the identity headers over the path the backend will see.
 		rt.signer.Apply(r, wirePath(backendPath, backendRawPath))
 
-		proxy := newReverseProxy(rt.backendURL, backendPath, backendRawPath)
-		proxy.ServeHTTP(w, r)
+		newReverseProxy(rt.target, rt.transport, backendPath, backendRawPath).ServeHTTP(w, r)
 	})
 }
