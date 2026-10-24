@@ -1,6 +1,6 @@
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
-import { musicService } from "../services/musicService.js";
+import { musicService, UploadQuotaError } from "../services/musicService.js";
 import { db } from "../db/connection.js";
 import { eq, and, sql } from "drizzle-orm";
 import { savedVersionService } from "../services/savedVersionService.js";
@@ -18,6 +18,40 @@ import {
   hasProtectedVisibility,
 } from "../services/musicVisibility.js";
 import { authorizeProtectedRefs, getProtectedRefsForBlob } from "../services/blobAccess.js";
+import { recordUploadBytes, takeUploadSlot, uploadQuota } from "../lib/uploadGuard.js";
+import type { UploadLimits } from "../services/musicService.js";
+
+/**
+ * The same per-pubkey abuse guard BUD-02 `PUT /upload` has (uploads per
+ * minute, bytes per UTC day), for the two multipart music uploads. Answers the
+ * 429 itself and returns null; otherwise the limits the service enforces on
+ * the stream. The declared Content-Length is checked up front so an oversize
+ * body is refused before it is read.
+ */
+async function guardUpload(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  pubkey: string,
+): Promise<UploadLimits | null> {
+  const slot = await takeUploadSlot(pubkey);
+  if (!slot.ok) {
+    reply
+      .status(429)
+      .header("Retry-After", String(slot.retryAfter))
+      .send({ error: "Upload rate exceeded", code: "UPLOAD_RATE_LIMITED" });
+    return null;
+  }
+  const quota = await uploadQuota(pubkey);
+  const declaredLength = Number(request.headers["content-length"]);
+  if (quota.remaining <= 0 || (Number.isFinite(declaredLength) && declaredLength > quota.remaining)) {
+    reply
+      .status(429)
+      .header("Retry-After", String(quota.retryAfter))
+      .send({ error: "Daily upload quota exceeded", code: "UPLOAD_QUOTA_EXCEEDED" });
+    return null;
+  }
+  return { quotaRemaining: quota.remaining, quotaRetryAfter: quota.retryAfter };
+}
 
 const pubkeySlugParams = z.object({
   pubkey: hexId,
@@ -274,6 +308,9 @@ export const musicRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(401).send({ error: "Authentication required", code: "UNAUTHORIZED" });
     }
 
+    const limits = await guardUpload(request, reply, pubkey);
+    if (!limits) return;
+
     const data = await request.file();
     if (!data) {
       return reply.status(400).send({ error: "No file uploaded", code: "NO_FILE" });
@@ -290,8 +327,19 @@ export const musicRoutes: FastifyPluginAsync = async (server) => {
         ? parsedDuration
         : undefined;
 
-    const result = await musicService.uploadAudio(data, pubkey, clientDuration);
-    return { data: result };
+    try {
+      const result = await musicService.uploadAudio(data, pubkey, clientDuration, limits);
+      await recordUploadBytes(pubkey, result.size);
+      return { data: result };
+    } catch (err) {
+      if (err instanceof UploadQuotaError) {
+        return reply
+          .status(429)
+          .header("Retry-After", String(err.retryAfter))
+          .send({ error: err.message, code: err.code });
+      }
+      throw err;
+    }
   });
 
   // GET /music/uploads -- List user's uploads
@@ -521,13 +569,27 @@ export const musicRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(401).send({ error: "Authentication required", code: "UNAUTHORIZED" });
     }
 
+    const limits = await guardUpload(request, reply, pubkey);
+    if (!limits) return;
+
     const data = await request.file();
     if (!data) {
       return reply.status(400).send({ error: "No file uploaded", code: "NO_FILE" });
     }
 
-    const result = await musicService.uploadCover(data, pubkey);
-    return { data: result };
+    try {
+      const result = await musicService.uploadCover(data, pubkey, limits);
+      await recordUploadBytes(pubkey, result.size);
+      return { data: { url: result.url, sha256: result.sha256 } };
+    } catch (err) {
+      if (err instanceof UploadQuotaError) {
+        return reply
+          .status(429)
+          .header("Retry-After", String(err.retryAfter))
+          .send({ error: err.message, code: err.code });
+      }
+      throw err;
+    }
   });
 
   // GET /music/variants/:sha -- Lookup transcode variants by blob sha256.

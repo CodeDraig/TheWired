@@ -15,7 +15,7 @@ export function startTranscodeWorker(): { stop: () => Promise<void> } {
   const worker = new Worker<TranscodeJobData>(
     TRANSCODE_QUEUE,
     async (job: Job<TranscodeJobData>) => {
-      const { sha256, storagePath } = job.data;
+      const { sha256, storagePath, mimeType } = job.data;
 
       await db
         .update(musicUploads)
@@ -27,6 +27,7 @@ export function startTranscodeWorker(): { stop: () => Promise<void> } {
           inputPath: storagePath,
           sha256,
           blobDir: resolve(process.cwd(), config.blobDir),
+          mimeType,
         });
         await db
           .update(musicUploads)

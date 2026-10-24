@@ -18,6 +18,7 @@ import type { FastifyInstance } from "fastify";
 import { eq } from "drizzle-orm";
 import { buildTestServer, closeTestServer } from "../helpers/testServer.js";
 import { LUNA, MARCUS } from "../helpers/testUsers.js";
+import { m4aBytes, mp3Bytes } from "../helpers/audio.js";
 import { db } from "../../src/db/connection.js";
 import { musicUploads } from "../../src/db/schema/music.js";
 import { blobs } from "../../src/db/schema/blobs.js";
@@ -123,7 +124,7 @@ function tmpFiles(): string[] {
 
 describe("POST /music/upload — content types", () => {
   it("accepts iOS's audio/x-m4a as audio/mp4 and stores the canonical type", async () => {
-    const res = await upload("audio/x-m4a", Buffer.from(`fake-m4a-${Date.now()}-${"x".repeat(64)}`));
+    const res = await upload("audio/x-m4a", m4aBytes(`ios-${Date.now()}`));
     expect(res.statusCode).toBe(200);
     const data = res.json().data;
     expect(data.mimeType).toBe("audio/mp4");
@@ -135,7 +136,7 @@ describe("POST /music/upload — content types", () => {
   });
 
   it("accepts mixed case and codec parameters", async () => {
-    const res = await upload("Audio/MP4; codecs=mp4a.40.2", Buffer.from(`fake-params-${Date.now()}-${"y".repeat(64)}`));
+    const res = await upload("Audio/MP4; codecs=mp4a.40.2", m4aBytes(`params-${Date.now()}`));
     expect(res.statusCode).toBe(200);
     expect(res.json().data.mimeType).toBe("audio/mp4");
   });
@@ -188,7 +189,7 @@ describe("POST /music/upload — duration", () => {
 
   it("falls back to a fractional client duration, rounded for the BIGINT column", async () => {
     // Unprobeable bytes: ffprobe (if present) fails, so the client field wins.
-    const res = await upload("audio/mpeg", Buffer.from(`fake-mp3-${Date.now()}-${"z".repeat(64)}`), {
+    const res = await upload("audio/mpeg", mp3Bytes(`fractional-${Date.now()}`), {
       duration: "183.6",
     });
     expect(res.statusCode).toBe(200);
@@ -199,7 +200,7 @@ describe("POST /music/upload — duration", () => {
   });
 
   it("omits duration when neither the probe nor the client has one", async () => {
-    const res = await upload("audio/mpeg", Buffer.from(`fake-mp3-none-${Date.now()}-${"w".repeat(64)}`));
+    const res = await upload("audio/mpeg", mp3Bytes(`none-${Date.now()}`));
     expect(res.statusCode).toBe(200);
     expect(res.json().data).not.toHaveProperty("duration");
     const [row] = await db.select().from(musicUploads).where(eq(musicUploads.sha256, res.json().data.sha256));
