@@ -732,17 +732,20 @@ async fn handle_auth(
         Err(_) => return vec![r#"["NOTICE","invalid AUTH event"]"#.to_string()],
     };
 
-    let relay_url = &state.relay_url;
-
-    // A personal (hosted_only) relay is reachable via several addresses
-    // (loopback/LAN/tunnel), so the AUTH `relay` tag can't match one canonical
-    // URL — relax the URL check there (the random challenge stays the binding).
-    let strict_relay_url = !state.hosted_only;
+    // The `relay` tag must name one of this relay's own addresses. A personal
+    // (hosted_only) relay is reachable via several (loopback/LAN/tunnel), so
+    // the set holds all of them — it is never "any URL" (security audit
+    // 2026-10: that allowed challenge forwarding from a hostile relay).
+    let allowed_relay_urls = state
+        .auth_relay_urls
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if !crate::protocol::nip42::verify_auth_event(&event, challenge, relay_url, strict_relay_url, now) {
+    if !crate::protocol::nip42::verify_auth_event(&event, challenge, &allowed_relay_urls, now) {
         tracing::debug!(
             event_id = log_prefix(&event.id),
             "AUTH failed: invalid challenge/relay/signature"

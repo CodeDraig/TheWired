@@ -67,19 +67,28 @@ fn collapse_loopback(hp: &str) -> String {
     }
 }
 
+/// Is `url` one of the relay's own addresses? Both sides are normalized the
+/// same way, so scheme, case, a trailing slash, default ports and loopback
+/// aliases never matter.
+pub fn relay_url_allowed(url: &str, allowed_relay_urls: &[String]) -> bool {
+    let got = normalize_relay_url(url);
+    !got.is_empty() && allowed_relay_urls.iter().any(|a| normalize_relay_url(a) == got)
+}
+
 /// Verify a NIP-42 AUTH response (kind:22242 event).
 ///
-/// `strict_relay_url`: when true (the multi-tenant production relay), the event's
-/// `relay` tag must MATCH (after normalization) `relay_url`. When false (a
-/// single-tenant *embedded* relay reachable via many addresses), the URL value is
-/// not checked; a `relay` tag must still be present, and the random per-connection
-/// `challenge` remains the real replay binding. `now` is the current unix time,
-/// for the ±10-minute `created_at` freshness window.
+/// The event's `relay` tag must name one of `allowed_relay_urls` — every
+/// address this relay is legitimately reachable under (the production relay
+/// has one; an embedded relay has loopback + LAN + its tunnel hostname). The
+/// check is never skipped (security audit 2026-10): without it a hostile relay
+/// the user connects to can forward OUR challenge, have the user sign a 22242
+/// naming the hostile relay, and present that event here. An empty set accepts
+/// nothing. `now` is the current unix time, for the ±10-minute `created_at`
+/// freshness window.
 pub fn verify_auth_event(
     event: &crate::nostr::event::Event,
     challenge: &str,
-    relay_url: &str,
-    strict_relay_url: bool,
+    allowed_relay_urls: &[String],
     now: i64,
 ) -> bool {
     if event.kind != 22242 {
@@ -89,13 +98,9 @@ pub fn verify_auth_event(
         return false;
     }
 
-    let want = normalize_relay_url(relay_url);
     let has_relay = event.tags.iter().any(|t| {
-        t.get(0).map(|s| s.as_str()) == Some("relay")
-            && match t.get(1) {
-                Some(u) => !strict_relay_url || normalize_relay_url(u) == want,
-                None => false,
-            }
+        t.first().map(|s| s.as_str()) == Some("relay")
+            && t.get(1).is_some_and(|u| relay_url_allowed(u, allowed_relay_urls))
     });
 
     let has_challenge = event
@@ -147,5 +152,81 @@ mod tests {
         );
         // Public urls untouched.
         assert_eq!(normalize_relay_url("wss://relay.thewired.app"), "relay.thewired.app");
+    }
+
+    /// A real schnorr-signed kind:22242 naming `relay` and `challenge`.
+    fn signed_auth(relay: &str, challenge: &str, created_at: i64) -> crate::nostr::event::Event {
+        use secp256k1::{Keypair, Secp256k1, SecretKey};
+        use sha2::{Digest, Sha256};
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[0x42; 32]).unwrap());
+        let pubkey = hex::encode(keypair.x_only_public_key().0.serialize());
+        let tags = vec![
+            vec!["relay".to_string(), relay.to_string()],
+            vec!["challenge".to_string(), challenge.to_string()],
+        ];
+        let canonical = serde_json::to_string(&serde_json::json!([0, &pubkey, created_at, 22242, &tags, ""])).unwrap();
+        let hash = Sha256::digest(canonical.as_bytes());
+        let sig = secp.sign_schnorr_no_aux_rand(&hash, &keypair);
+        crate::nostr::event::Event {
+            id: hex::encode(hash),
+            pubkey,
+            created_at,
+            kind: 22242,
+            tags,
+            content: String::new(),
+            sig: hex::encode(sig.to_byte_array()),
+        }
+    }
+
+    fn urls(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Security audit 2026-10: the relay-tag check is an allow-SET and is never
+    /// skipped. A 22242 signed for another host (what challenge forwarding
+    /// yields) is rejected whatever the deployment mode.
+    #[test]
+    fn auth_rejects_relay_tag_outside_the_allow_set() {
+        let allowed = urls(&["ws://127.0.0.1:7787", "ws://192.168.1.20:7787", "https://me.relay.thewired.app"]);
+        let now = 1_700_000_000;
+        assert!(!verify_auth_event(&signed_auth("wss://evil.example.com", "c1", now), "c1", &allowed, now));
+        assert!(!verify_auth_event(&signed_auth("wss://other.relay.thewired.app", "c1", now), "c1", &allowed, now));
+        assert!(!verify_auth_event(&signed_auth("ws://192.168.1.21:7787", "c1", now), "c1", &allowed, now));
+        assert!(!verify_auth_event(&signed_auth("ws://127.0.0.1:7788", "c1", now), "c1", &allowed, now), "port matters");
+        // An empty set accepts nothing — there is no "any relay" mode.
+        assert!(!verify_auth_event(&signed_auth("ws://127.0.0.1:7787", "c1", now), "c1", &[], now));
+        // An empty relay tag never matches, even if the set were to hold "".
+        assert!(!verify_auth_event(&signed_auth("", "c1", now), "c1", &urls(&[""]), now));
+    }
+
+    #[test]
+    fn auth_accepts_every_configured_address_in_any_spelling() {
+        let allowed = urls(&["ws://127.0.0.1:7787", "ws://192.168.1.20:7787", "https://me.relay.thewired.app"]);
+        let now = 1_700_000_000;
+        for url in [
+            "ws://127.0.0.1:7787",
+            "ws://localhost:7787/",
+            "WS://[::1]:7787",
+            "ws://192.168.1.20:7787",
+            "wss://me.relay.thewired.app",
+            "wss://ME.relay.thewired.app:443/",
+        ] {
+            assert!(verify_auth_event(&signed_auth(url, "c1", now), "c1", &allowed, now), "{url}");
+        }
+    }
+
+    #[test]
+    fn auth_still_binds_challenge_kind_and_freshness() {
+        let allowed = urls(&["ws://127.0.0.1:7787"]);
+        let now = 1_700_000_000;
+        assert!(!verify_auth_event(&signed_auth("ws://127.0.0.1:7787", "other", now), "c1", &allowed, now));
+        assert!(!verify_auth_event(&signed_auth("ws://127.0.0.1:7787", "c1", now - 601), "c1", &allowed, now));
+        let mut tampered = signed_auth("ws://127.0.0.1:7787", "c1", now);
+        tampered.kind = 1;
+        assert!(!verify_auth_event(&tampered, "c1", &allowed, now));
+        let mut forged = signed_auth("ws://127.0.0.1:7787", "c1", now);
+        forged.sig = "0".repeat(128);
+        assert!(!verify_auth_event(&forged, "c1", &allowed, now));
     }
 }

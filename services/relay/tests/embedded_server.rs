@@ -350,6 +350,85 @@ async fn embedded_relay_nonadmin_moddelete_not_stored() {
     relay.stop().await;
 }
 
+/// Sign a kind:22242 AUTH response naming `relay_url`.
+fn auth_event(who: &TestIdentity, relay_url: &str, challenge: &str) -> thewired_relay::nostr::event::Event {
+    sign_event(
+        who,
+        22242,
+        vec![
+            vec!["relay".into(), relay_url.to_string()],
+            vec!["challenge".into(), challenge.to_string()],
+        ],
+        "",
+        now(),
+    )
+}
+
+async fn send_auth<S, R>(tx: &mut S, rx: &mut R, ev: &thewired_relay::nostr::event::Event) -> bool
+where
+    S: futures::Sink<Message> + Unpin,
+    S::Error: std::fmt::Debug,
+    R: Stream<Item = Result<Message, WsError>> + Unpin,
+{
+    tx.send(Message::Text(format!(r#"["AUTH",{}]"#, serde_json::to_string(ev).unwrap()).into()))
+        .await
+        .unwrap();
+    let ok = read_until(rx, "OK").await.expect("no OK for AUTH");
+    assert_eq!(ok.get(1).and_then(|v| v.as_str()), Some(ev.id.as_str()));
+    ok.get(2).and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Security audit 2026-10: the embedded (hosted_only) relay used to skip the
+/// NIP-42 `relay` tag check entirely because it is reachable under several
+/// addresses. That enabled challenge forwarding: a hostile relay the victim
+/// connects to relays OUR challenge, the victim signs a 22242 naming the
+/// hostile relay's URL, and that event authenticated the attacker here. The
+/// relay now holds an allow-set of its own addresses (loopback, LAN, tunnel)
+/// and accepts only those.
+#[tokio::test]
+async fn embedded_relay_auth_rejects_foreign_relay_tag_and_accepts_every_own_address() {
+    let alice = TestIdentity::from_seed(7);
+    let db = Db::Sqlite(sqlite::connect_memory().await.unwrap());
+    let relay = server::run_embedded(db, 0, "t".into(), None, Some(alice.pubkey.clone()), false)
+        .await
+        .unwrap();
+    let (ws, _) = connect_async(relay.ws_url()).await.unwrap();
+    let (mut tx, mut rx) = ws.split();
+    let challenge = read_until(&mut rx, "AUTH").await.unwrap()[1].as_str().unwrap().to_string();
+
+    // A 22242 signed for some OTHER relay (what a forwarded challenge yields).
+    assert!(
+        !send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://evil.example.com", &challenge)).await,
+        "a relay tag naming a foreign host must be rejected even on a hosted_only relay"
+    );
+    // A tunnel hostname the relay was never told about is foreign too.
+    assert!(!send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://quick-fox.trycloudflare.com", &challenge)).await);
+
+    // Loopback spellings the local client uses are all accepted.
+    let port = relay.addr.port();
+    for url in [
+        relay.ws_url(),
+        format!("ws://localhost:{port}"),
+        format!("ws://127.0.0.1:{port}/"),
+        format!("WS://LOCALHOST:{port}"),
+    ] {
+        assert!(send_auth(&mut tx, &mut rx, &auth_event(&alice, &url, &challenge)).await, "{url} must be accepted");
+    }
+
+    // Once the host publishes a tunnel, its hostname joins the set (either scheme).
+    relay.add_auth_relay_url("https://quick-fox.trycloudflare.com");
+    assert!(send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://quick-fox.trycloudflare.com", &challenge)).await);
+    assert!(send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://quick-fox.trycloudflare.com/", &challenge)).await);
+    // ...and only that hostname: a sibling subdomain is still foreign.
+    assert!(!send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://lazy-dog.trycloudflare.com", &challenge)).await);
+
+    // Tearing the tunnel down removes it again.
+    relay.remove_auth_relay_url("https://quick-fox.trycloudflare.com");
+    assert!(!send_auth(&mut tx, &mut rx, &auth_event(&alice, "wss://quick-fox.trycloudflare.com", &challenge)).await);
+
+    relay.stop().await;
+}
+
 /// Security audit 2026-10: on the embedded relay the owner-only 9007 path keeps
 /// working for NEW ids, but a second 9007 for an id the relay already hosts is
 /// refused and changes nothing — not even when it comes from the owner and

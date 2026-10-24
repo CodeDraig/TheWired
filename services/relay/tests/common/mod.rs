@@ -478,6 +478,9 @@ pub fn make_app_state_with(
     };
     tweak(&mut config);
     let relay_identity = RelayIdentity::new(config.relay_secret_key.clone(), &config.rust_env);
+    // Same shape `server::run` builds: the canonical URL plus any extras.
+    let mut auth_relay_urls = vec!["ws://localhost:7777".to_string()];
+    auth_relay_urls.extend(config.auth_relay_urls.iter().cloned());
     let state = AppState {
         pool: thewired_relay::db::Db::Pg(pool),
         config,
@@ -485,6 +488,7 @@ pub fn make_app_state_with(
         relay_identity,
         active_connections: std::sync::atomic::AtomicUsize::new(0),
         relay_url: "ws://localhost:7777".to_string(),
+        auth_relay_urls: std::sync::RwLock::new(auth_relay_urls),
         hosted_only: false,
         owner_pubkey: None,
         ip_conns: std::sync::Mutex::new(Default::default()),

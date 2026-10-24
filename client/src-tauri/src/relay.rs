@@ -157,6 +157,7 @@ fn load_or_create_identity(dir: &Path) -> Result<String, String> {
 pub async fn relay_start(
     app: AppHandle,
     state: State<'_, EmbeddedRelayState>,
+    tunnel_state: State<'_, crate::tunnel::TunnelState>,
     owner_pubkey: Option<String>,
     lan: Option<bool>,
 ) -> Result<RelayStatus, String> {
@@ -184,6 +185,15 @@ pub async fn relay_start(
     )
     .await
     .map_err(|e| format!("start embedded relay: {e}"))?;
+
+    // NIP-42 allow-set (security audit 2026-10): `run_embedded` seeded loopback
+    // + LAN. A public address recorded BEFORE the relay started (a custom URL
+    // set via `tunnel_set_custom`) joins it here; tunnels that come up later
+    // register themselves from `tunnel.rs`. Only these addresses may appear in
+    // an AUTH event's `relay` tag.
+    if let Some(public_url) = tunnel_state.public_url().await {
+        relay.add_auth_relay_url(&public_url);
+    }
 
     let status = RelayStatus::from_relay(&relay);
     *guard = Some(relay);
