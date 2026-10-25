@@ -484,9 +484,12 @@ describe("relay manager — flood rate cap", () => {
     }
     expect(ext.closed).toBe(true);
 
-    const [row] = await db.select().from(spaceRelays).where(eq(spaceRelays.relayUrl, "wss://ext.flood"));
-    expect(row.errorCount).toBeGreaterThan(0);
-    expect(row.lastError).toContain("rate cap");
+    // The error row is written fire-and-forget, so wait for it to land.
+    await vi.waitFor(async () => {
+      const [row] = await db.select().from(spaceRelays).where(eq(spaceRelays.relayUrl, "wss://ext.flood"));
+      expect(row.errorCount).toBeGreaterThan(0);
+      expect(row.lastError).toContain("rate cap");
+    });
   });
 });
 
