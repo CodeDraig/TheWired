@@ -1,11 +1,15 @@
 import { store } from "@/store";
 import {
   restoreDMState,
+  clearDMSyncWarning,
   type DMMessage,
   type DMContact,
   type DMFlags,
+  type PendingDMControl,
 } from "@/store/slices/dmSlice";
 import { saveUserState, getUserState } from "@/lib/db/userStateStore";
+import { publishOutbox } from "@/lib/nostr/publishOutbox";
+import { EVENT_KINDS } from "@/types/nostr";
 
 const DM_STATE_KEY = "dm_state";
 const DEBOUNCE_MS = 3_000;
@@ -22,6 +26,8 @@ interface PersistedDMState {
   processedWrapIds: string[];
   lastReadTimestamps?: Record<string, number>;
   flags?: DMFlags;
+  /** Edits / deletes still waiting for their anchor message. */
+  pendingControl?: Record<string, PendingDMControl[]>;
 }
 
 /** Build a trimmed snapshot of DM state suitable for IndexedDB persistence */
@@ -43,6 +49,7 @@ function buildPersistedState(): PersistedDMState {
     processedWrapIds: state.processedWrapIds.slice(-MAX_PERSISTED_WRAP_IDS),
     lastReadTimestamps: state.lastReadTimestamps,
     flags: state.flags,
+    pendingControl: state.pendingControl,
   };
 }
 
@@ -58,6 +65,7 @@ export async function loadDMState(): Promise<void> {
       processedWrapIds: persisted.processedWrapIds,
       lastReadTimestamps: persisted.lastReadTimestamps,
       flags: persisted.flags,
+      pendingControl: persisted.pendingControl,
     }),
   );
 }
@@ -107,4 +115,17 @@ export function startDMPersistence(): () => void {
     unsubscribe();
     window.removeEventListener("beforeunload", handleBeforeUnload);
   };
+}
+
+/**
+ * A self-wrap the platform relay did not accept waits in the publish outbox
+ * while its message carries the (persisted) sync warning. Both outlive the
+ * session, so the warning is cleared by the outbox's ack, whichever session
+ * it lands in: later this one, or a replay after a relaunch. Idempotent (one
+ * handler per kind); loginFlow wires it before the first replay.
+ */
+export function wireSelfWrapOutboxAcks(): void {
+  publishOutbox.setAckHandler(EVENT_KINDS.GIFT_WRAP, (wrapId) => {
+    store.dispatch(clearDMSyncWarning(wrapId));
+  });
 }

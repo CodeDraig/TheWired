@@ -1,6 +1,7 @@
 import { buildRumor, createGiftWrappedDM, createSelfWrap } from "./giftWrap";
 import { relayManager } from "./relayManager";
-import { getDMRelaysForPublish, getOwnDMRelays } from "./dmRelayList";
+import { recipientTargets, selfWrapTargets, APP_RELAY_URL } from "./dmRelayList";
+import { publishOutbox } from "./publishOutbox";
 import { store } from "@/store";
 import {
   addFriendRequest,
@@ -34,19 +35,24 @@ async function publishFriendWrap(
   const { wrap: recipientWrap } = await createGiftWrappedDM(content, partnerPubkey, undefined, rumor);
   const { wrap: selfWrap } = await createSelfWrap(content, partnerPubkey, undefined, rumor);
 
-  // Publish to partner's DM relays (falls back to all write relays)
-  const recipientRelays = await getDMRelaysForPublish(partnerPubkey);
-  const confirmations = await relayManager.publishWithConfirmation(recipientWrap, recipientRelays);
-  const anyAccepted = confirmations.some((r) => r.success);
+  // Same relay rules as a DM (dmService): the recipient wrap goes to their
+  // kind-10050 relays ∪ the platform relay and counts only when one of those
+  // accepts; the self-wrap always reaches the platform relay too (so our own
+  // other devices learn about the request) and is tracked against it.
+  const { targets, countAs } = await recipientTargets(partnerPubkey);
+  const recipient = relayManager.publishTracked(recipientWrap, targets, { countAs });
 
-  // If no relay accepted or we had no specific DM relays, also publish to bootstrap
-  if (!anyAccepted || !recipientRelays) {
+  const selfTargets = selfWrapTargets();
+  const self = relayManager.publishTracked(selfWrap, selfTargets, { countAs: [APP_RELAY_URL] });
+  void self.accepted.then((relay) => {
+    // The outbox re-publishes it to the platform relay on reconnect / next launch.
+    if (relay === null) publishOutbox.record(selfWrap, [APP_RELAY_URL]);
+  });
+
+  // No counting relay took it: also publish to bootstrap (legacy fan-out).
+  if ((await recipient.accepted) === null) {
     relayManager.publish(recipientWrap, BOOTSTRAP_RELAYS);
   }
-
-  // Publish self-wrap to our own DM relays (falls back to all write relays)
-  const ownRelays = getOwnDMRelays();
-  relayManager.publish(selfWrap, ownRelays.length > 0 ? ownRelays : undefined);
 
   return { selfWrapId: selfWrap.id, createdAt: rumor.created_at };
 }

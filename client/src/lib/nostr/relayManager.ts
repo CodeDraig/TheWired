@@ -552,40 +552,94 @@ class RelayManagerImpl {
   }
 
   /**
-   * Publish like `publish` (same targets, same count), and report whether
-   * any relay took it: `accepted` resolves true at the first OK true (or a
-   * `duplicate:` refusal — the relay already holds it), false once every
-   * target refused or `timeout` passed without one. A socket that is
+   * Publish like `publish` (same targets, same count), and report whether a
+   * relay that COUNTS took it: `accepted` resolves with that relay's URL at
+   * the first OK true (or a `duplicate:` refusal — the relay already holds
+   * it), and with null once every counting relay refused or `timeout` passed
+   * without one. `countAs` names the relays whose OK counts (default: every
+   * target); for a DM that is the platform relay — the only one the push
+   * ingester and the phone read — plus the recipient's kind-10050 relays, so
+   * a public relay's OK alone leaves the send pending. A socket that is
    * reconnecting queues the event, so the count alone proves nothing.
+   *
+   * `outcome` settles later — when every target answered, or at the timeout —
+   * with each target's verdict, so a caller can see that the platform relay
+   * refused even though another relay accepted (no push will follow).
    */
   publishTracked(
     event: NostrEvent,
     targets?: string[],
-    timeout = 10_000,
-  ): { sent: number; accepted: Promise<boolean> } {
+    opts: { timeout?: number; countAs?: string[] } = {},
+  ): TrackedPublish {
+    const timeout = opts.timeout ?? 10_000;
     const relays = targets
       ? targets
           .map((url) => this.connections.get(this.key(url)))
           .filter((c): c is RelayConnection => !!c)
       : this.getWriteRelays();
-    if (relays.length === 0) return { sent: 0, accepted: Promise.resolve(false) };
+    if (relays.length === 0) {
+      return { sent: 0, accepted: Promise.resolve(null), outcome: Promise.resolve({ acceptedBy: null, byRelay: {} }) };
+    }
 
-    const accepted = new Promise<boolean>((resolve) => {
-      const waiting = new Set(relays.map((c) => c.url));
-      const finish = (ok: boolean) => {
-        clearTimeout(timer);
-        this.publishOKCallbacks.delete(event.id);
-        resolve(ok);
-      };
-      this.publishOKCallbacks.set(event.id, (relayUrl, success, message) => {
-        if (!waiting.delete(relayUrl)) return;
-        if (success || message.startsWith("duplicate:")) finish(true);
-        else if (waiting.size === 0) finish(false);
-      });
-      const timer = setTimeout(() => finish(false), timeout);
+    const countKeys = opts.countAs ? new Set(opts.countAs.map((u) => this.key(u))) : null;
+    const byUrl = new Map(relays.map((c) => [c.url, c]));
+    const waiting = new Set(relays.filter((c) => !countKeys || countKeys.has(this.key(c.url))).map((c) => c.url));
+    const byRelay: Record<string, PublishVerdict> = {};
+    for (const c of relays) byRelay[c.url] = "silent";
+
+    let resolveAccepted!: (relay: string | null) => void;
+    let resolveOutcome!: (o: PublishOutcome) => void;
+    const accepted = new Promise<string | null>((r) => { resolveAccepted = r; });
+    const outcome = new Promise<PublishOutcome>((r) => { resolveOutcome = r; });
+
+    let acceptedBy: string | null = null;
+    let acceptedSettled = false;
+    const settleAccepted = (relay: string | null) => {
+      if (acceptedSettled) return;
+      acceptedSettled = true;
+      acceptedBy = relay;
+      resolveAccepted(relay);
+    };
+    // `OK false rate-limited:` (docs/DM_WIRE_CONTRACT.md §7.7): the relay did
+    // NOT store the event and wants it again later. Re-send with backoff
+    // inside the send window; the relay stays silent (neither sent nor
+    // failed) until it answers otherwise or the timeout passes.
+    const rateRetries = new Map<string, number>();
+    const retryTimers = new Set<ReturnType<typeof setTimeout>>();
+    const finishAll = () => {
+      clearTimeout(timer);
+      for (const t of retryTimers) clearTimeout(t);
+      this.publishOKCallbacks.delete(event.id);
+      settleAccepted(null);
+      resolveOutcome({ acceptedBy, byRelay: { ...byRelay } });
+    };
+    // No relay whose OK could count is even a target: it can never be sent.
+    if (waiting.size === 0) settleAccepted(null);
+
+    this.publishOKCallbacks.set(event.id, (relayUrl, success, message) => {
+      if (byRelay[relayUrl] !== "silent") return; // not a target, or answered already
+      if (success || message.startsWith("duplicate:")) {
+        byRelay[relayUrl] = "accepted";
+        if (waiting.delete(relayUrl)) settleAccepted(relayUrl);
+      } else if (PUBLISH_RATE_LIMITED_RE.test(message) && (rateRetries.get(relayUrl) ?? 0) < PUBLISH_RATE_LIMITED_RETRIES) {
+        const n = (rateRetries.get(relayUrl) ?? 0) + 1;
+        rateRetries.set(relayUrl, n);
+        const conn = byUrl.get(relayUrl)!;
+        const t = setTimeout(() => {
+          retryTimers.delete(t);
+          conn.publish(event);
+        }, PUBLISH_RATE_LIMITED_BASE_MS * 2 ** (n - 1));
+        retryTimers.add(t);
+        return; // still waiting on this relay
+      } else {
+        byRelay[relayUrl] = "refused";
+        if (waiting.delete(relayUrl) && waiting.size === 0) settleAccepted(null);
+      }
+      if (Object.values(byRelay).every((v) => v !== "silent")) finishAll();
     });
+    const timer = setTimeout(finishAll, timeout);
     for (const conn of relays) conn.publish(event);
-    return { sent: relays.length, accepted };
+    return { sent: relays.length, accepted, outcome };
   }
 
   /** Fetch NIP-11 relay info document to learn subscription limits.
@@ -630,6 +684,25 @@ class RelayManagerImpl {
     }
   }
 }
+
+/** One target relay's answer to a tracked publish. */
+export type PublishVerdict = "accepted" | "refused" | "silent";
+export interface PublishOutcome {
+  /** The counting relay whose OK settled the send, or null. */
+  acceptedBy: string | null;
+  /** Every target relay's verdict (keys are the connection URLs as dialed). */
+  byRelay: Record<string, PublishVerdict>;
+}
+export interface TrackedPublish {
+  sent: number;
+  accepted: Promise<string | null>;
+  outcome: Promise<PublishOutcome>;
+}
+
+/** `OK false rate-limited:` re-sends inside publishTracked's window (§7.7). */
+const PUBLISH_RATE_LIMITED_RE = /^rate-limited\s*:/i;
+const PUBLISH_RATE_LIMITED_RETRIES = 3;
+const PUBLISH_RATE_LIMITED_BASE_MS = 1_500;
 
 /** Singleton relay manager */
 export const relayManager = new RelayManagerImpl();

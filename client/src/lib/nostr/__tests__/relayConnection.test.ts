@@ -274,8 +274,76 @@ describe("RelayConnection", () => {
       conn.subscribe("sub-1", [{ kinds: [1] }]);
       expect(conn.hasSubscription("sub-1")).toBe(true);
 
-      latestWs().simulateMessage(["CLOSED", "sub-1", "rate-limited:"]);
+      latestWs().simulateMessage(["CLOSED", "sub-1", "blocked: not allowed"]);
       expect(conn.hasSubscription("sub-1")).toBe(false);
+    });
+  });
+
+  // docs/DM_WIRE_CONTRACT.md §7.7: a `rate-limited:` or `error:` CLOSED means the
+  // REQ was not registered — the relay is asking us to try again, not refusing.
+  describe("CLOSED rate-limited: / error: → re-REQ with backoff", () => {
+    function closedSub(reason: string) {
+      const conn = createConn();
+      conn.connect();
+      latestWs().simulateOpen();
+      conn.subscribe("sub-1", [{ kinds: [1059] }]);
+      expect(countREQs(latestWs())).toBe(1);
+      latestWs().simulateMessage(["CLOSED", "sub-1", reason]);
+      return conn;
+    }
+
+    it("keeps the subscription and re-sends the REQ after a delay, not at once", () => {
+      const conn = closedSub("rate-limited: slow down");
+      expect(conn.hasSubscription("sub-1")).toBe(true);
+      expect(countREQs(latestWs())).toBe(1);
+      vi.advanceTimersByTime(999);
+      expect(countREQs(latestWs())).toBe(1);
+      vi.advanceTimersByTime(1);
+      expect(countREQs(latestWs())).toBe(2);
+      expect(reqSubIds(latestWs())).toEqual(["sub-1", "sub-1"]);
+    });
+
+    it("treats `error: query failed` the same way", () => {
+      const conn = closedSub("error: query failed");
+      expect(conn.hasSubscription("sub-1")).toBe(true);
+      vi.advanceTimersByTime(1000);
+      expect(countREQs(latestWs())).toBe(2);
+    });
+
+    it("backs off exponentially and gives up after the retry cap", () => {
+      const conn = closedSub("rate-limited: slow down");
+      let expected = 1;
+      let delay = 1000;
+      for (let i = 0; i < 5; i++) {
+        vi.advanceTimersByTime(delay);
+        expected++;
+        expect(countREQs(latestWs())).toBe(expected);
+        latestWs().simulateMessage(["CLOSED", "sub-1", "rate-limited: slow down"]);
+        delay = Math.min(delay * 2, 30_000);
+      }
+      // Sixth refusal in a row: dropped, nothing more is sent.
+      expect(conn.hasSubscription("sub-1")).toBe(false);
+      vi.advanceTimersByTime(60_000);
+      expect(countREQs(latestWs())).toBe(expected);
+    });
+
+    it("an EOSE after a retry resets the counter", () => {
+      const conn = closedSub("rate-limited: slow down");
+      vi.advanceTimersByTime(1000);
+      latestWs().simulateMessage(["EOSE", "sub-1"]);
+      for (let i = 0; i < 5; i++) {
+        latestWs().simulateMessage(["CLOSED", "sub-1", "rate-limited: slow down"]);
+        vi.advanceTimersByTime(30_000);
+        latestWs().simulateMessage(["EOSE", "sub-1"]);
+      }
+      expect(conn.hasSubscription("sub-1")).toBe(true);
+    });
+
+    it("a pending retry is dropped when the sub is closed locally", () => {
+      const conn = closedSub("rate-limited: slow down");
+      conn.closeSubscription("sub-1");
+      vi.advanceTimersByTime(5_000);
+      expect(countREQs(latestWs())).toBe(1);
     });
   });
 
@@ -610,13 +678,13 @@ describe("RelayConnection — server-CLOSED retry (A5)", () => {
     expect(conn.hasSubscription("sub-1")).toBe(false);
   });
 
-  it("still drops immediately on a non-cap CLOSED (e.g. rate-limited)", () => {
+  it("still drops immediately on a final CLOSED (e.g. blocked); rate-limited/error retry instead (§7.7)", () => {
     const conn = createConn();
     conn.connect();
     latestWs().simulateOpen();
     conn.subscribe("sub-1", [{ kinds: [9] }]);
 
-    latestWs().simulateMessage(["CLOSED", "sub-1", "rate-limited: slow down"]);
+    latestWs().simulateMessage(["CLOSED", "sub-1", "blocked: not a member"]);
     expect(conn.hasSubscription("sub-1")).toBe(false);
   });
 });

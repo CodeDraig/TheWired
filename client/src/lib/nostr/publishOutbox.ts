@@ -3,6 +3,7 @@ import { relayManager } from "./relayManager";
 import { store } from "../../store";
 import { putOutbox, deleteOutbox, getAllOutbox } from "../db/outboxStore";
 import { createLogger } from "../debug/logger";
+import { normalizeRelayUrl } from "./relayUrl";
 
 const log = createLogger("outbox");
 
@@ -32,24 +33,41 @@ function isReplaceable(kind: number): boolean {
  * publish path or blocks the UI.
  */
 class PublishOutbox {
-  /** ids awaiting a relay OK — lets handleOK skip an IDB round-trip on every OK. */
-  private pending = new Set<string>();
+  /** ids awaiting a relay OK — lets handleOK skip an IDB round-trip on every OK.
+   *  With `targets`, only an OK from one of those relays clears the row (a DM
+   *  self-wrap waits for the platform relay, not for any relay). */
+  private pending = new Map<string, { targets?: Set<string>; kind: number }>();
+  /** kind → what to do once a row of that kind is acked (see setAckHandler). */
+  private ackHandlers = new Map<number, (eventId: string) => void>();
   /** Guards against overlapping replays (reconnect can fire in bursts). */
   private replaying = false;
 
   /** Record a just-published event. Fire-and-forget (non-blocking). */
   record(event: NostrEvent, targetRelays?: string[], now = Date.now()): void {
-    this.pending.add(event.id);
+    this.pending.set(event.id, { targets: targetSet(targetRelays), kind: event.kind });
     putOutbox(event, targetRelays, now).catch(() => {
       /* durability is best-effort; the live publish already went out */
     });
   }
 
-  /** Wired into the global relay OK stream. First success clears the row. */
-  handleOK(eventId: string, success: boolean): void {
-    if (!success || !this.pending.has(eventId)) return;
+  /** Run `handler(eventId)` whenever a row of `kind` is acked, whether it was
+   *  recorded this session or restored by `replay()` after a relaunch, so
+   *  state that outlives the session (a DM's sync warning) is cleared either
+   *  way. One handler per kind; setting it again replaces it. */
+  setAckHandler(kind: number, handler: (eventId: string) => void): void {
+    this.ackHandlers.set(kind, handler);
+  }
+
+  /** Wired into the global relay OK stream. First success (from a target
+   *  relay, when the row names them) clears the row. */
+  handleOK(eventId: string, success: boolean, relayUrl?: string): void {
+    if (!success) return;
+    const entry = this.pending.get(eventId);
+    if (!entry) return;
+    if (entry.targets && relayUrl && !entry.targets.has(normalizeRelayUrl(relayUrl) ?? relayUrl)) return;
     this.pending.delete(eventId);
     deleteOutbox(eventId).catch(() => {});
+    this.ackHandlers.get(entry.kind)?.(eventId);
   }
 
   /** Re-publish un-acked events. Called on next launch (after login) and on every
@@ -74,7 +92,7 @@ class PublishOutbox {
         deleteOutbox(row.id).catch(() => {});
         continue;
       }
-      this.pending.add(row.id);
+      if (!this.pending.has(row.id)) this.pending.set(row.id, { targets: targetSet(row.targetRelays), kind: row.event.kind });
       relayManager.publish(row.event, row.targetRelays);
       replayed++;
     }
@@ -94,6 +112,11 @@ class PublishOutbox {
     }
     return false;
   }
+}
+
+function targetSet(urls?: string[]): Set<string> | undefined {
+  if (!urls || urls.length === 0) return undefined;
+  return new Set(urls.map((u) => normalizeRelayUrl(u) ?? u));
 }
 
 export const publishOutbox = new PublishOutbox();

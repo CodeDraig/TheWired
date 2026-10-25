@@ -67,6 +67,13 @@ export interface DMMessage {
   syncWarning?: boolean;
   /** Own messages sent from this device: see DMSendStatus. */
   status?: DMSendStatus;
+  /** The relay whose OK settled `status: "sent"` (the platform relay or one of
+   *  the recipient's kind-10050 relays). Debugging aid; absent on history rows. */
+  sentVia?: string;
+  /** Sent (one of the recipient's inbox relays accepted) but the platform relay
+   *  did not: the recipient's phone gets no push for it, and a recipient who
+   *  reads only the platform relay never sees it. */
+  pushMissed?: boolean;
   /** Friends who acknowledged this rumor (kind-20015 receipts). */
   deliveredTo?: string[];
   readBy?: string[];
@@ -76,6 +83,15 @@ export interface DMMessage {
 export const MAX_DM_REACTION_EMOJI = 16;
 /** Reactions that arrived before their target message, keyed by rumorId. */
 const MAX_PENDING_DM_REACTION_TARGETS = 500;
+/** Anchors with a parked edit/delete at once (oldest evicted). Exported for tests. */
+export const MAX_PENDING_DM_CONTROL_TARGETS = 500;
+
+/** An edit or delete whose anchor message has not arrived yet (the wrap
+ *  backlog is served in random order). Replayed by addDMMessage, persisted
+ *  with the slice — unlike a reaction, a lost edit or delete is visible. */
+export type PendingDMControl =
+  | { type: "edit"; content: string; editedAt: number; sender: string }
+  | { type: "delete"; sender: string };
 
 interface PendingDMReaction {
   emoji: string;
@@ -152,6 +168,9 @@ interface DMState {
   /** Reactions whose target rumor hasn't arrived yet (cold start delivers
    *  newest-first). Drained by addDMMessage. In-memory only. */
   pendingReactions: Record<string, PendingDMReaction[]>;
+  /** Edits / deletes whose target rumor hasn't arrived yet, by anchor rumor id.
+   *  Drained by addDMMessage. Persisted (dmPersistence). */
+  pendingControl: Record<string, PendingDMControl[]>;
   /** conversationId → pubkey → unix seconds the "typing" hint expires. In-memory only. */
   typing: Record<string, Record<string, number>>;
   /** Pin / archive / mute / disappearing timers (synced via the read-state record). */
@@ -169,6 +188,7 @@ const initialState: DMState = {
   lastReadTimestamps: {},
   mutationCounter: 0,
   pendingReactions: {},
+  pendingControl: {},
   typing: {},
   flags: recordToFlags(emptyDMReadState()),
 };
@@ -236,6 +256,42 @@ function bufferPendingReaction(state: DMState, rumorId: string, r: PendingDMReac
       delete state.pendingReactions[k];
     }
   }
+}
+
+/** Park an edit/delete for a rumor we haven't seen yet (bounded, oldest anchor evicted). */
+function bufferPendingControl(state: DMState, rumorId: string, c: PendingDMControl): void {
+  const list = state.pendingControl[rumorId] ?? (state.pendingControl[rumorId] = []);
+  list.push(c);
+  const keys = Object.keys(state.pendingControl);
+  if (keys.length > MAX_PENDING_DM_CONTROL_TARGETS) {
+    for (const k of keys.slice(0, keys.length - MAX_PENDING_DM_CONTROL_TARGETS)) {
+      delete state.pendingControl[k];
+    }
+  }
+  state.mutationCounter += 1;
+}
+
+/** Apply one edit/delete to its anchor. Ownership-gated (#23/#32): only the
+ *  original author may edit or delete-for-everyone. Returns whether it applied. */
+function applyDMControl(msg: DMMessage, c: PendingDMControl): boolean {
+  if (msg.senderPubkey !== c.sender) return false;
+  if (c.type === "edit") {
+    msg.editedContent = c.content;
+    msg.editedAt = c.editedAt;
+  } else {
+    msg.isDeleted = true;
+    msg.content = "";
+    msg.editedContent = undefined;
+  }
+  return true;
+}
+
+/** Keep the conversation-list preview in step with the latest visible message. */
+function refreshContactPreview(state: DMState, partnerPubkey: string, msgs: DMMessage[]): void {
+  const contact = state.contacts.find((c) => c.pubkey === partnerPubkey);
+  if (!contact) return;
+  const lastVisible = [...msgs].reverse().find((m) => !m.isDeleted);
+  if (lastVisible) contact.lastMessagePreview = truncatePreview(lastVisible.editedContent ?? lastVisible.content);
 }
 
 /** Shared body of reactDMMessage / removeDMReaction. */
@@ -353,10 +409,18 @@ export const dmSlice = createSlice({
         }
         delete state.pendingReactions[message.rumorId];
       }
+      // Replay edits / deletes that arrived ahead of this message, in arrival
+      // order. Anchors are rumor ids; legacy senders anchored on the wrap id.
+      for (const anchor of message.rumorId ? [message.rumorId, message.wrapId] : [message.wrapId]) {
+        const parked = state.pendingControl[anchor];
+        if (!parked) continue;
+        for (const c of parked) applyDMControl(message, c);
+        delete state.pendingControl[anchor];
+      }
 
       // Update contact
       const contactIdx = state.contacts.findIndex((c) => c.pubkey === partnerPubkey);
-      const preview = truncatePreview(message.content);
+      const preview = truncatePreview(message.isDeleted ? "" : (message.editedContent ?? message.content));
 
       if (contactIdx >= 0) {
         const contact = state.contacts[contactIdx];
@@ -487,24 +551,19 @@ export const dmSlice = createSlice({
       if (wrapId && !markWrapProcessed(state, wrapId)) return;
 
       const msgs = state.messages[partnerPubkey];
-      if (!msgs) return;
       // Match by rumorId first, fall back to wrapId for legacy messages
-      const msg = msgs.find((m) => m.rumorId === rumorId)
-        ?? msgs.find((m) => m.wrapId === rumorId);
+      const msg = msgs?.find((m) => m.rumorId === rumorId)
+        ?? msgs?.find((m) => m.wrapId === rumorId);
+      if (!msg) {
+        // Anchor not here yet (backlog order is random): park it for addDMMessage.
+        bufferPendingControl(state, rumorId, { type: "edit", content: newContent, editedAt, sender: senderPubkey });
+        return;
+      }
       // Apply only when the editor authored the target message.
-      if (!msg || msg.senderPubkey !== senderPubkey) return;
-
-      msg.editedContent = newContent;
-      msg.editedAt = editedAt;
+      if (!applyDMControl(msg, { type: "edit", content: newContent, editedAt, sender: senderPubkey })) return;
 
       // #87: refresh the conversation-list preview when the latest message is edited.
-      const contact = state.contacts.find((c) => c.pubkey === partnerPubkey);
-      if (contact) {
-        const lastVisible = [...msgs].reverse().find((m) => !m.isDeleted);
-        if (lastVisible && lastVisible === msg) {
-          contact.lastMessagePreview = truncatePreview(lastVisible.editedContent ?? lastVisible.content);
-        }
-      }
+      refreshContactPreview(state, partnerPubkey, msgs!);
       state.mutationCounter += 1;
     },
 
@@ -523,24 +582,16 @@ export const dmSlice = createSlice({
       if (wrapId && !markWrapProcessed(state, wrapId)) return;
 
       const msgs = state.messages[partnerPubkey];
-      if (!msgs) return;
       // Match by rumorId first, fall back to wrapId for legacy messages
-      const msg = msgs.find((m) => m.rumorId === rumorId)
-        ?? msgs.find((m) => m.wrapId === rumorId);
-      if (!msg || msg.senderPubkey !== senderPubkey) return;
-
-      msg.isDeleted = true;
-      msg.content = "";
-      msg.editedContent = undefined;
-
-      // Update contact preview
-      const contact = state.contacts.find((c) => c.pubkey === partnerPubkey);
-      if (contact) {
-        const lastVisible = [...msgs].reverse().find((m) => !m.isDeleted);
-        if (lastVisible) {
-          contact.lastMessagePreview = truncatePreview(lastVisible.editedContent ?? lastVisible.content);
-        }
+      const msg = msgs?.find((m) => m.rumorId === rumorId)
+        ?? msgs?.find((m) => m.wrapId === rumorId);
+      if (!msg) {
+        bufferPendingControl(state, rumorId, { type: "delete", sender: senderPubkey });
+        return;
       }
+      if (!applyDMControl(msg, { type: "delete", sender: senderPubkey })) return;
+
+      refreshContactPreview(state, partnerPubkey, msgs!);
       state.mutationCounter += 1;
     },
 
@@ -671,11 +722,22 @@ export const dmSlice = createSlice({
 
     /** A relay answered (or none did in time) for an own message's recipient
      *  wrap. Only a pending row moves; an echo may have settled it first. */
-    dmSendResolved(state, action: PayloadAction<{ partnerPubkey: string; wrapId: string; ok: boolean }>) {
-      const { partnerPubkey, wrapId, ok } = action.payload;
+    dmSendResolved(state, action: PayloadAction<{ partnerPubkey: string; wrapId: string; ok: boolean; relay?: string }>) {
+      const { partnerPubkey, wrapId, ok, relay } = action.payload;
       const msg = state.messages[partnerPubkey]?.find((m) => m.wrapId === wrapId);
       if (!msg || msg.status !== "pending") return;
       msg.status = ok ? "sent" : "failed";
+      if (ok && relay) msg.sentVia = relay;
+      state.mutationCounter += 1;
+    },
+
+    /** The recipient wrap was accepted by an inbox relay but not by the
+     *  platform relay: no push will follow (see DMMessage.pushMissed). */
+    markDMPushMissed(state, action: PayloadAction<{ partnerPubkey: string; wrapId: string }>) {
+      const { partnerPubkey, wrapId } = action.payload;
+      const msg = state.messages[partnerPubkey]?.find((m) => m.wrapId === wrapId);
+      if (!msg || msg.pushMissed) return;
+      msg.pushMissed = true;
       state.mutationCounter += 1;
     },
 
@@ -687,6 +749,22 @@ export const dmSlice = createSlice({
       if (warning) msg.syncWarning = true;
       else delete msg.syncWarning;
       state.mutationCounter += 1;
+    },
+
+    /** The publish outbox delivered a self-wrap it was holding (later this
+     *  session, or replayed after a relaunch): clear that message's sync
+     *  warning, in whichever conversation it is. */
+    clearDMSyncWarning(state, action: PayloadAction<string>) {
+      const wrapId = action.payload;
+      for (const msgs of Object.values(state.messages)) {
+        const msg = msgs.find((m) => m.wrapId === wrapId);
+        if (!msg) continue;
+        if (msg.syncWarning) {
+          delete msg.syncWarning;
+          state.mutationCounter += 1;
+        }
+        return;
+      }
     },
 
     /** Delete messages whose `expiration` has passed (disappearing messages, NIP-40). */
@@ -778,9 +856,10 @@ export const dmSlice = createSlice({
         processedWrapIds?: string[];
         lastReadTimestamps?: Record<string, number>;
         flags?: DMFlags;
+        pendingControl?: Record<string, PendingDMControl[]>;
       }>,
     ) {
-      const { messages, contacts, processedWrapIds, lastReadTimestamps, flags } = action.payload;
+      const { messages, contacts, processedWrapIds, lastReadTimestamps, flags, pendingControl } = action.payload;
 
       if (flags) {
         const merged = mergeDMReadState(flagsToRecord(state.flags, {}), flagsToRecord(flags, {}));
@@ -788,17 +867,14 @@ export const dmSlice = createSlice({
       }
 
       if (messages) {
-        // Scrub corrupted messages: reject entries whose content is
-        // entirely base64 (likely undecrypted NIP-44 ciphertext)
-        const BASE64_ONLY = /^[A-Za-z0-9+/=]+$/;
+        // No content-shape scrub here: core's unwrap (seal signature, kind
+        // gate, rumor-id recompute, NIP-44 MAC) is what keeps ciphertext out,
+        // and a body that is only an npub or a hex id is a real message
+        // (docs/DM_WIRE_CONTRACT.md §1 step 9).
         const cleaned: Record<string, DMMessage[]> = {};
         for (const [pubkey, msgs] of Object.entries(messages)) {
           const valid = msgs
-            .filter(
-              (m) =>
-                typeof m.content === "string" &&
-                !(m.content.length > 50 && BASE64_ONLY.test(m.content)),
-            )
+            .filter((m) => typeof m.content === "string")
             // A send still pending from a previous session will never resolve.
             .map((m) => (m.status === "pending" ? { ...m, status: "failed" as const } : m));
           if (valid.length > 0) cleaned[pubkey] = valid;
@@ -821,6 +897,14 @@ export const dmSlice = createSlice({
           set[id] = true;
         }
         state.processedWrapIdSet = set;
+      }
+
+      if (pendingControl) {
+        for (const [rumorId, list] of Object.entries(pendingControl)) {
+          if (!Array.isArray(list) || list.length === 0) continue;
+          const have = state.pendingControl[rumorId];
+          state.pendingControl[rumorId] = have ? [...list, ...have] : [...list];
+        }
       }
 
       if (lastReadTimestamps) {
@@ -851,6 +935,7 @@ export const dmSlice = createSlice({
 export const {
   addDMMessage,
   dmSendResolved,
+  markDMPushMissed,
   markDMWrapProcessed,
   setActiveConversation,
   markConversationRead,
@@ -872,6 +957,7 @@ export const {
   setConversationFlag,
   setConversationExpireAfter,
   markDMSyncWarning,
+  clearDMSyncWarning,
   pruneExpiredDMs,
   upsertRoom,
 } = dmSlice.actions;

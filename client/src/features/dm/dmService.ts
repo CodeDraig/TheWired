@@ -6,6 +6,13 @@
 // Every message is sent as a recipient wrap + a self-wrap sharing one rumor;
 // rooms fan out one wrap per participant. Self-wrap failures are surfaced on
 // the message (syncWarning) instead of a console line.
+//
+// "Sent" means the message can reach the other side's phone: a recipient wrap
+// counts only when the platform relay (the one relay the backend's push
+// ingester and the mobile app read) or one of the recipient's kind-10050
+// relays accepted it. A public relay's OK alone leaves the row pending. The
+// self-wrap always goes to the platform relay too and is tracked against it;
+// a miss there is the sync warning (our other devices sync from that relay).
 
 import { nip19 } from "nostr-tools";
 import {
@@ -24,10 +31,13 @@ import {
 } from "@ishtarservices/core";
 import { DM_EDIT_WINDOW_SECONDS } from "@ishtarservices/shared-types";
 import type { DMFileMeta, DMReceiptStatus } from "@ishtarservices/shared-types";
+import type { NostrEvent } from "@/types/nostr";
 import { createGiftWrappedDM, createSelfWrap, buildRumor } from "@/lib/nostr/giftWrap";
 import { createGroupMessageWraps } from "@/lib/nostr/nip17Room";
-import { relayManager } from "@/lib/nostr/relayManager";
-import { getDMRelaysForPublish, getOwnDMRelays, fallbackDMRelays } from "@/lib/nostr/dmRelayList";
+import { relayManager, type PublishOutcome } from "@/lib/nostr/relayManager";
+import { recipientTargets, selfWrapTargets, APP_RELAY_URL } from "@/lib/nostr/dmRelayList";
+import { publishOutbox } from "@/lib/nostr/publishOutbox";
+import { normalizeRelayUrl } from "@/lib/nostr/relayUrl";
 import { buildMuteListEvent } from "@/lib/nostr/eventBuilder";
 import { signAndPublish } from "@/lib/nostr/publish";
 import { store } from "@/store";
@@ -35,6 +45,7 @@ import {
   addDMMessage,
   deleteDMMessage,
   dmSendResolved,
+  markDMPushMissed,
   editDMMessage,
   remoteDeleteDMMessage,
   reactDMMessage,
@@ -83,29 +94,61 @@ interface PublishResult {
   selfWrapId: string;
   /** Relay connections the recipient wrap(s) were handed to. */
   sent: number;
-  /** Relays the self-wrap reached (0 = not synced to our other devices). */
+  /** Relays the self-wrap was handed to (0 = not synced to our other devices). */
   selfSent: number;
-  /** With `track`: true once a relay accepted a recipient wrap, false when
-   *  every relay refused or none answered within DM_SEND_TIMEOUT_MS. */
-  accepted?: Promise<boolean>;
+  /** With `track`: the counting relay that accepted a recipient wrap, or null
+   *  when every counting relay refused or none answered within DM_SEND_TIMEOUT_MS. */
+  accepted?: Promise<string | null>;
+  /** With `track` (and a self-wrap): the platform relay's URL once it accepted
+   *  the self-wrap, null when it refused or never answered. */
+  selfAccepted?: Promise<string | null>;
+  /** With `track`: every recipient wrap's per-relay verdicts, once settled. */
+  outcomes?: Promise<PublishOutcome[]>;
+  /** The self-wrap and where it went — for the outbox retry when the platform
+   *  relay did not take it. */
+  selfWrap?: { event: NostrEvent; targets: string[] };
 }
 
 /** How long an own message waits for a relay OK before it shows as failed
  *  (the mobile app uses the same 10 s). */
 export const DM_SEND_TIMEOUT_MS = 10_000;
 
-/** True at the first accepted wrap; false once every one settled without. */
-function firstAccepted(acceptances: Promise<boolean>[]): Promise<boolean> {
-  if (acceptances.length === 0) return Promise.resolve(true);
+/** The first wrap a counting relay accepted; null once every one settled without. */
+function firstAccepted(acceptances: Promise<string | null>[]): Promise<string | null> {
+  if (acceptances.length === 0) return Promise.resolve(null);
   return new Promise((resolve) => {
     let left = acceptances.length;
     for (const a of acceptances) {
-      void a.then((ok) => {
-        if (ok) resolve(true);
-        else if (--left === 0) resolve(false);
+      void a.then((relay) => {
+        if (relay) resolve(relay);
+        else if (--left === 0) resolve(null);
       });
     }
   });
+}
+
+/** Hand a self-wrap to its relays, tracked against the platform relay when asked. */
+function publishSelfWrap(wrap: NostrEvent, track: boolean | undefined) {
+  const targets = selfWrapTargets();
+  if (!track) return { sent: relayManager.publish(wrap, targets), accepted: undefined, targets };
+  const t = relayManager.publishTracked(wrap, targets, { timeout: DM_SEND_TIMEOUT_MS, countAs: [APP_RELAY_URL] });
+  return { sent: t.sent, accepted: t.accepted, targets };
+}
+
+/** The platform relay's verdict inside a tracked publish (keys are dialed URLs). */
+function appRelayVerdict(o: PublishOutcome): "accepted" | "refused" | "silent" | undefined {
+  for (const [url, v] of Object.entries(o.byRelay)) {
+    if ((normalizeRelayUrl(url) ?? url) === APP_RELAY_URL) return v;
+  }
+  return undefined;
+}
+
+/** Sent somewhere, but the platform relay accepted none of the recipient
+ *  wraps: no push will follow for this message. */
+function pushMissed(outcomes: PublishOutcome[]): boolean {
+  const anyAccepted = outcomes.some((o) => o.acceptedBy !== null);
+  const appAccepted = outcomes.some((o) => appRelayVerdict(o) === "accepted");
+  return anyAccepted && !appAccepted;
 }
 
 /**
@@ -139,18 +182,24 @@ async function publishRumor(
     let sent = 0;
     let selfSent = 0;
     let selfWrapId = "";
-    const acceptances: Promise<boolean>[] = [];
+    let selfAccepted: Promise<string | null> | undefined;
+    let selfWrapOut: PublishResult["selfWrap"];
+    const acceptances: Promise<string | null>[] = [];
+    const outcomes: Promise<PublishOutcome>[] = [];
     for (const { to, wrap } of result.wraps) {
       if (to === myPubkey) {
-        const own = getOwnDMRelays();
-        selfSent = relayManager.publish(wrap, own.length > 0 ? own : fallbackDMRelays());
+        const self = publishSelfWrap(wrap, opts.track);
+        selfSent = self.sent;
+        selfAccepted = self.accepted;
         selfWrapId = wrap.id;
+        selfWrapOut = { event: wrap, targets: self.targets };
       } else {
-        const targets = (await getDMRelaysForPublish(to)) ?? fallbackDMRelays();
+        const { targets, countAs } = await recipientTargets(to);
         if (opts.track) {
-          const t = relayManager.publishTracked(wrap, targets, DM_SEND_TIMEOUT_MS);
+          const t = relayManager.publishTracked(wrap, targets, { timeout: DM_SEND_TIMEOUT_MS, countAs });
           sent += t.sent;
           acceptances.push(t.accepted);
+          outcomes.push(t.outcome);
         } else {
           sent += relayManager.publish(wrap, targets);
         }
@@ -162,7 +211,9 @@ async function publishRumor(
       selfWrapId,
       sent,
       selfSent,
-      ...(opts.track ? { accepted: firstAccepted(acceptances) } : {}),
+      ...(opts.track ? { accepted: firstAccepted(acceptances), outcomes: Promise.all(outcomes) } : {}),
+      ...(selfAccepted ? { selfAccepted } : {}),
+      ...(selfWrapOut ? { selfWrap: selfWrapOut } : {}),
     };
   }
 
@@ -171,21 +222,26 @@ async function publishRumor(
     kind: opts.kind ?? KIND_DM_MESSAGE,
   });
   const { wrap: recipientWrap } = await createGiftWrappedDM(content, peer, extraTags, sharedRumor, wrapOpts);
-  const targets = (await getDMRelaysForPublish(peer)) ?? fallbackDMRelays();
+  const { targets, countAs } = await recipientTargets(peer);
   let sent: number;
-  let accepted: Promise<boolean> | undefined;
+  let accepted: Promise<string | null> | undefined;
+  let outcome: Promise<PublishOutcome> | undefined;
   if (opts.track) {
-    ({ sent, accepted } = relayManager.publishTracked(recipientWrap, targets, DM_SEND_TIMEOUT_MS));
+    ({ sent, accepted, outcome } = relayManager.publishTracked(recipientWrap, targets, { timeout: DM_SEND_TIMEOUT_MS, countAs }));
   } else {
     sent = relayManager.publish(recipientWrap, targets);
   }
   let selfSent = 0;
   let selfWrapId = "";
+  let selfAccepted: Promise<string | null> | undefined;
+  let selfWrapOut: PublishResult["selfWrap"];
   if (!opts.noSelfWrap) {
     const { wrap: selfWrap } = await createSelfWrap(content, peer, extraTags, sharedRumor, wrapOpts);
-    const own = getOwnDMRelays();
-    selfSent = relayManager.publish(selfWrap, own.length > 0 ? own : fallbackDMRelays());
+    const self = publishSelfWrap(selfWrap, opts.track);
+    selfSent = self.sent;
+    selfAccepted = self.accepted;
     selfWrapId = selfWrap.id;
+    selfWrapOut = { event: selfWrap, targets: self.targets };
   }
   return {
     rumorId: sharedRumor.id,
@@ -194,13 +250,33 @@ async function publishRumor(
     sent,
     selfSent,
     ...(accepted ? { accepted } : {}),
+    ...(outcome ? { outcomes: outcome.then((o) => [o]) } : {}),
+    ...(selfAccepted ? { selfAccepted } : {}),
+    ...(selfWrapOut ? { selfWrap: selfWrapOut } : {}),
   };
 }
 
-/** Settle an own row's pending status once the relays answered. */
+/**
+ * Settle an own row once the relays answered.
+ *  - The recipient wrap's counting OK decides sent/failed (and records the relay).
+ *  - Once every relay has answered: sent somewhere but not on the platform
+ *    relay → `pushMissed` (the recipient gets no push for it).
+ *  - A self-wrap the platform relay did not accept raises the sync warning and
+ *    goes into the publish outbox addressed to the platform relay; the outbox
+ *    re-publishes it on reconnect and next launch, and its OK clears the
+ *    warning (`wireSelfWrapOutboxAcks`, also after a relaunch).
+ */
 function trackSend(partnerPubkey: string, r: PublishResult): void {
-  void r.accepted?.then((ok) => {
-    store.dispatch(dmSendResolved({ partnerPubkey, wrapId: r.selfWrapId, ok }));
+  void r.accepted?.then((relay) => {
+    store.dispatch(dmSendResolved({ partnerPubkey, wrapId: r.selfWrapId, ok: relay !== null, relay: relay ?? undefined }));
+  });
+  void r.outcomes?.then((outcomes) => {
+    if (pushMissed(outcomes)) store.dispatch(markDMPushMissed({ partnerPubkey, wrapId: r.selfWrapId }));
+  });
+  void r.selfAccepted?.then((relay) => {
+    if (relay !== null) return;
+    store.dispatch(markDMSyncWarning({ partnerPubkey, wrapId: r.selfWrapId, warning: true }));
+    if (r.selfWrap) publishOutbox.record(r.selfWrap.event, [APP_RELAY_URL]);
   });
 }
 
@@ -508,7 +584,3 @@ export async function unblockPeer(pubkey: string): Promise<void> {
   await signAndPublish(unsigned);
 }
 
-/** Re-flag or clear the sync warning after a retry (used by the outbox). */
-export function noteSelfWrapResult(conversationId: string, wrapId: string, ok: boolean): void {
-  store.dispatch(markDMSyncWarning({ partnerPubkey: conversationId, wrapId, warning: !ok }));
-}

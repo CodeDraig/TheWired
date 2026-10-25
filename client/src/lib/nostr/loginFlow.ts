@@ -25,6 +25,7 @@ import { parseRelayList } from "./nip65";
 import { bunkerAuthUrlOrNull } from "./nip46AuthUrl";
 import { loadAndApplyDisabledRelays } from "./relayList";
 import { parseDMRelayList, clearDMRelayCache } from "./dmRelayList";
+import { ensureAppRelayInOwnDMList, createEoseSettler } from "./dmRelayListEnsure";
 import { EVENT_KINDS } from "../../types/nostr";
 import { saveUserState, getUserState } from "../db/userStateStore";
 import { getProfile } from "../db/profileStore";
@@ -90,7 +91,7 @@ import { signAndPublish } from "./publish";
 import { buildDMRelayListEvent } from "./eventBuilder";
 import { profileCache } from "./profileCache";
 import { parseProfile } from "../../features/profile/profileParser";
-import { loadDMState, startDMPersistence, cancelPendingSave as cancelDMSave, flushPendingSave as flushDMSave } from "../../features/dm/dmPersistence";
+import { loadDMState, startDMPersistence, cancelPendingSave as cancelDMSave, flushPendingSave as flushDMSave, wireSelfWrapOutboxAcks } from "../../features/dm/dmPersistence";
 import { loadDMReadState, startDMReadStateSync, cancelPendingSave as cancelDMReadStateSave, flushPendingSave as flushDMReadStateSave } from "../../features/dm/dmReadState";
 import { startGiftWrapReconciliation } from "../../features/dm/dmSync";
 import { loadFollowerState, startFollowerPersistence, cancelPendingSave as cancelFollowerSave, flushPendingSave as flushFollowerSave } from "./followerPersistence";
@@ -247,7 +248,7 @@ function wireRelayStatusBridge(): void {
   relayManager.setGlobalCallbacks({
     onOK: (eventId, success, message, relayUrl) => {
       // First success clears the publish-outbox row (audit #34).
-      publishOutbox.handleOK(eventId, success);
+      publishOutbox.handleOK(eventId, success, relayUrl);
       if (!success) {
         console.warn(`[relay] ${relayUrl} rejected ${eventId.slice(0, 8)}: ${message}`);
         // Reactive kick detection: if the relay rejected this event because
@@ -293,6 +294,8 @@ function wireRelayStatusBridge(): void {
   // On any relay reconnect, re-publish un-acked outbox events (a relay that
   // dropped mid-publish never sent its OK). Idempotent + in-flight-guarded (#34).
   relayManager.onReconnect(() => void publishOutbox.replay());
+  // A replayed DM self-wrap's OK also clears its message's sync warning.
+  wireSelfWrapOutboxAcks();
 }
 
 /** Ingest the logged-in user's own kind:0 from any subscription: parse it (which
@@ -744,13 +747,45 @@ export async function performLogin(
   });
 
   // Step 6b: Subscribe for DM relay list (kind:10050) from bootstrap relays
-  let dmRelayEoseReceived = false;
+  /** The newest list a relay served this session (not the IndexedDB cache). */
+  let newestDMRelayList: { relays: string[]; createdAt: number } | null = null;
+  // Act only once every bootstrap relay has EOSEd (or a grace after the first):
+  // the first relay to answer may hold a stale list, and publishing a
+  // "default" or an appended copy over a newer list we had not yet received
+  // would overwrite the user's choice.
+  const dmRelaySettler = createEoseSettler(BOOTSTRAP_RELAYS, () => {
+    if (store.getState().identity.pubkey !== pubkey) return; // switched mid-login
+    if (newestDMRelayList) {
+      // A list exists: keep the platform relay in it (DM_WIRE_CONTRACT §1 —
+      // append when missing, once a day, never after the user removed it).
+      // Judged on the newest list a relay served, never on the cache alone.
+      void ensureAppRelayInOwnDMList(pubkey, store.getState().identity.signerType, newestDMRelayList).catch(() => {});
+      return;
+    }
+    // No kind:10050 found and no cache → auto-publish defaults
+    const currentDMRelays = store.getState().identity.dmRelayList;
+    // Don't auto-publish on a remote signer's behalf — it fires an unprompted
+    // bunker approval at login. Bunker users can set DM relays manually.
+    if (currentDMRelays.length === 0 && signerType !== "nip46") {
+      const defaults = [APP_RELAY, "wss://relay.damus.io", "wss://nos.lol"];
+      const unsigned = buildDMRelayListEvent(pubkey, defaults);
+      signAndPublish(unsigned, BOOTSTRAP_RELAYS).then(() => {
+        store.dispatch(setDMRelayList({ relays: defaults, createdAt: Math.floor(Date.now() / 1000) }));
+        saveUserState("dm_relay_list", defaults);
+      }).catch((err) => {
+        console.error("[LoginFlow] Failed to auto-publish kind:10050:", err);
+      });
+    }
+  });
   relayManager.subscribe({
     filters: [{ kinds: [10050], authors: [pubkey], limit: 1 }],
     relayUrls: BOOTSTRAP_RELAYS,
     onEvent: (event) => {
       const relays = parseDMRelayList(event);
       if (relays.length > 0) {
+        if (!newestDMRelayList || event.created_at > newestDMRelayList.createdAt) {
+          newestDMRelayList = { relays, createdAt: event.created_at };
+        }
         store.dispatch(setDMRelayList({ relays, createdAt: event.created_at }));
         saveUserState("dm_relay_list", relays);
         // Connect to DM relays so gift wraps can be received
@@ -759,24 +794,7 @@ export async function performLogin(
         }
       }
     },
-    onEOSE: () => {
-      if (dmRelayEoseReceived) return;
-      dmRelayEoseReceived = true;
-      // If no kind:10050 found and no cache, auto-publish defaults
-      const currentDMRelays = store.getState().identity.dmRelayList;
-      // Don't auto-publish on a remote signer's behalf — it fires an unprompted
-      // bunker approval at login. Bunker users can set DM relays manually.
-      if (currentDMRelays.length === 0 && signerType !== "nip46") {
-        const defaults = [APP_RELAY, "wss://relay.damus.io", "wss://nos.lol"];
-        const unsigned = buildDMRelayListEvent(pubkey, defaults);
-        signAndPublish(unsigned, BOOTSTRAP_RELAYS).then(() => {
-          store.dispatch(setDMRelayList({ relays: defaults, createdAt: Math.floor(Date.now() / 1000) }));
-          saveUserState("dm_relay_list", defaults);
-        }).catch((err) => {
-          console.error("[LoginFlow] Failed to auto-publish kind:10050:", err);
-        });
-      }
-    },
+    onEOSE: (_subId, relayUrl) => dmRelaySettler.onEOSE(relayUrl),
   });
 
   // Step 7: Subscribe for user metadata from bootstrap relays

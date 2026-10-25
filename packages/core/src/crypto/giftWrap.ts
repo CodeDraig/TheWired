@@ -60,6 +60,50 @@ function expirationOf(tags: unknown): number | undefined {
   return undefined;
 }
 
+/** Why `unwrapGiftWrap` refused a wrap. Every code is a final verdict on
+ *  that wrap: the same bytes will fail the same way on every retry. */
+export type GiftWrapRejectReason =
+  | "expired"
+  | "decrypt"
+  | "malformed"
+  | "seal_kind"
+  | "seal_sig"
+  | "kind"
+  | "sender"
+  | "rumor_id";
+
+/**
+ * Thrown by `unwrapGiftWrap` for a wrap it has judged and refused. Callers
+ * that retry transient failures (a signer that is not ready, a bunker
+ * round-trip that timed out — those surface as whatever the codec threw)
+ * must NOT retry one of these: nothing about the wrap can change.
+ */
+export class GiftWrapRejectedError extends Error {
+  readonly code: GiftWrapRejectReason;
+  constructor(code: GiftWrapRejectReason, message: string) {
+    super(message);
+    this.name = "GiftWrapRejectedError";
+    this.code = code;
+  }
+}
+
+/**
+ * A codec failure is retried only when it says the SIGNER was unavailable —
+ * a timeout, a locked extension or keystore, a bunker that is away or has not
+ * approved yet, no signer at all. Anything else (bad MAC, bad padding, wrong
+ * version, truncated payload, whatever a vendor calls a wrong-key failure) is
+ * a verdict on the wrap: retrying it would only spend a decrypt per NIP-77
+ * round on bytes that will never change. An unknown message is therefore a
+ * verdict, never a retry. Exported so a platform codec can test its own
+ * messages against the same list.
+ */
+export function isTransientCodecFailure(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /timed? ?out|timeout|locked|not ready|not (yet )?available|unavailable|no signer|not logged in|not connected|disconnected|network|offline|busy|try again|rejected|denied|cancel+ed|not supported|doesn'?t support|unsupported by/i.test(
+    msg,
+  );
+}
+
 /** Who we are + how we sign/encrypt. The only platform-specific inputs. */
 export interface GiftWrapContext {
   /** The logged-in user's pubkey (hex). */
@@ -233,6 +277,30 @@ export interface UnwrapOptions {
   now?: number;
 }
 
+/** Run the codec; a signer-unavailable failure propagates (retryable), every
+ *  other failure is a `decrypt` verdict. */
+async function decryptOrReject(
+  codec: Pick<SignerAdapter, "nip44Decrypt">,
+  peer: string,
+  ciphertext: string,
+): Promise<string> {
+  try {
+    return await codec.nip44Decrypt(peer, ciphertext);
+  } catch (err) {
+    if (err instanceof GiftWrapRejectedError) throw err;
+    if (isTransientCodecFailure(err)) throw err;
+    throw new GiftWrapRejectedError("decrypt", err instanceof Error ? err.message : "NIP-44 decrypt failed");
+  }
+}
+
+function parseJsonOrReject<T>(json: string, message: string): T {
+  try {
+    return JSON.parse(json) as T;
+  } catch {
+    throw new GiftWrapRejectedError("malformed", message);
+  }
+}
+
 /**
  * Unwrap a received gift wrap event (kind:1059).
  *
@@ -244,8 +312,9 @@ export interface UnwrapOptions {
  * 5. Parse the rumor, check kind, sender consistency, recompute its id
  *
  * Fails closed: any mismatch (wrong kinds, bad signature, sender
- * inconsistency, tampered id, content that still looks encrypted) throws
- * rather than returning suspect plaintext.
+ * inconsistency, tampered id) throws a `GiftWrapRejectedError` rather than
+ * returning suspect plaintext. A failure of the codec itself (signer not
+ * ready, bunker timeout) propagates as thrown, so callers can retry it.
  */
 export async function unwrapGiftWrap(
   codec: Pick<SignerAdapter, "nip44Decrypt">,
@@ -258,16 +327,16 @@ export async function unwrapGiftWrap(
   // Step 1: NIP-40 — an expired wrap is dropped before we spend a decrypt on it.
   const wrapExpiration = expirationOf(giftWrapEvent.tags);
   if (wrapExpiration !== undefined && wrapExpiration <= now) {
-    throw new Error("Gift wrap expired");
+    throw new GiftWrapRejectedError("expired", "Gift wrap expired");
   }
 
   // Step 2: Decrypt the gift wrap content using ephemeral pubkey
-  const sealJson = await codec.nip44Decrypt(giftWrapEvent.pubkey, giftWrapEvent.content);
+  const sealJson = await decryptOrReject(codec, giftWrapEvent.pubkey, giftWrapEvent.content);
 
   // Step 3: Parse + verify seal
-  const seal = JSON.parse(sealJson) as NostrEvent;
-  if (seal.kind !== KIND_SEAL) {
-    throw new Error(`Expected seal (kind:13), got kind:${seal.kind}`);
+  const seal = parseJsonOrReject<NostrEvent>(sealJson, "Seal is not JSON");
+  if (!seal || typeof seal !== "object" || seal.kind !== KIND_SEAL) {
+    throw new GiftWrapRejectedError("seal_kind", `Expected seal (kind:13), got kind:${seal?.kind}`);
   }
   if (opts?.verifySeal !== false) {
     if (
@@ -276,26 +345,29 @@ export async function unwrapGiftWrap(
       typeof seal.pubkey !== "string" ||
       !verifyEventSync(seal)
     ) {
-      throw new Error("Seal signature invalid");
+      throw new GiftWrapRejectedError("seal_sig", "Seal signature invalid");
     }
   }
   const sealExpiration = expirationOf(seal.tags);
   if (sealExpiration !== undefined && sealExpiration <= now) {
-    throw new Error("Seal expired");
+    throw new GiftWrapRejectedError("expired", "Seal expired");
   }
 
   // Step 4: Decrypt seal content using seal's author pubkey
-  const rumorJson = await codec.nip44Decrypt(seal.pubkey, seal.content);
+  const rumorJson = await decryptOrReject(codec, seal.pubkey, seal.content);
 
   // Step 5: Parse rumor
-  const rumor = JSON.parse(rumorJson) as {
+  const rumor = parseJsonOrReject<{
     id?: string;
     pubkey: string;
     created_at: number;
     kind: number;
     tags: string[][];
     content: string;
-  };
+  }>(rumorJson, "Rumor is not JSON");
+  if (!rumor || typeof rumor !== "object") {
+    throw new GiftWrapRejectedError("malformed", "Rumor is malformed");
+  }
 
   // Validate rumor kind against the allowlist. Some NIP-07 extensions return
   // garbage on wrong-key decryption that can survive JSON.parse (e.g.
@@ -303,7 +375,7 @@ export async function unwrapGiftWrap(
   // catches this: a seal (kind:13) mistakenly returned as a rumor fails here,
   // preventing its encrypted content from leaking through.
   if (typeof rumor.kind !== "number" || !acceptKinds.includes(rumor.kind)) {
-    throw new Error(`Unsupported rumor kind:${rumor.kind}`);
+    throw new GiftWrapRejectedError("kind", `Unsupported rumor kind:${rumor.kind}`);
   }
 
   // Shape checks — anchors and routing depend on these being well-formed.
@@ -311,32 +383,28 @@ export async function unwrapGiftWrap(
     typeof rumor.pubkey !== "string" ||
     !HEX64_RE.test(rumor.pubkey) ||
     typeof rumor.created_at !== "number" ||
+    typeof rumor.content !== "string" ||
     !Array.isArray(rumor.tags) ||
     !rumor.tags.every((t) => Array.isArray(t) && t.every((v) => typeof v === "string"))
   ) {
-    throw new Error("Rumor is malformed");
+    throw new GiftWrapRejectedError("malformed", "Rumor is malformed");
   }
 
   // Verify sender consistency
   if (rumor.pubkey !== seal.pubkey) {
-    throw new Error("Rumor pubkey does not match seal pubkey");
+    throw new GiftWrapRejectedError("sender", "Rumor pubkey does not match seal pubkey");
   }
 
-  // Guard against content that is still encrypted (base64 ciphertext).
-  // If nip44Decrypt silently returned garbage that parsed as JSON with a
-  // base64-only content field, reject it.
-  if (
-    typeof rumor.content !== "string" ||
-    (rumor.content.length > 50 && /^[A-Za-z0-9+/=]+$/.test(rumor.content))
-  ) {
-    throw new Error("Rumor content appears to still be encrypted");
-  }
+  // No content heuristics: a wrong key already fails the NIP-44 MAC above, the
+  // seal signature, the kind gate and the id recompute below cover forgery. A
+  // body that happens to be base64-shaped (an npub, a hex id, a long laugh) is
+  // a message like any other.
 
   // Recompute the rumor id: a sealer must not be able to choose the anchor
   // other messages (edits, deletes, reactions) will point at.
   const computedId = getEventId(rumor);
   if (rumor.id !== undefined && rumor.id !== computedId) {
-    throw new Error("Rumor id mismatch");
+    throw new GiftWrapRejectedError("rumor_id", "Rumor id mismatch");
   }
 
   const expirations = [wrapExpiration, sealExpiration].filter(
