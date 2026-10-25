@@ -2,8 +2,10 @@
 #
 # Weekly version updates per ecosystem, with minor/patch releases grouped into
 # one PR per ecosystem so the queue stays reviewable. Majors open as their own
-# PRs. Security updates are separate and are enabled in the repository's
-# Security settings (Dependabot alerts + security updates).
+# PRs, except crates that only build when bumped together (grouped below) and
+# majors that are planned migrations (ignored below, with the reason). Security
+# updates are separate and are enabled in the repository's Security settings
+# (Dependabot alerts + security updates).
 version: 2
 
 updates:
@@ -31,11 +33,26 @@ updates:
     groups:
       npm-minor-patch:
         update-types: ["minor", "patch"]
+    # Planned migrations, not drop-in bumps: zod 4 and tiptap 3 change their
+    # APIs, and astro 7 moves the landing site's sharp/vite with it.
+    ignore:
+      - dependency-name: zod
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@tiptap/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: astro
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@astrojs/*"
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: chore(deps)
       prefix-development: chore(deps-dev)
 
   # ── Cargo: relay + Tauri shell ───────────────────────────────────────────
+  # The `crypto` groups come first so these crates never land in the
+  # minor/patch group: the RustCrypto crates share one `digest`/`cipher`
+  # generation and secp256k1 pins its `rand` major, so a lone bump of any of
+  # them does not compile.
   - package-ecosystem: cargo
     directory: /services/relay
     schedule:
@@ -43,8 +60,15 @@ updates:
       day: monday
     open-pull-requests-limit: 5
     groups:
+      crypto:
+        patterns: ["sha2", "secp256k1", "rand"]
       cargo-minor-patch:
         update-types: ["minor", "patch"]
+    # sqlx 0.9 changes the query/migrate API the relay is written against; a
+    # deliberate migration, not a weekly bump.
+    ignore:
+      - dependency-name: sqlx
+        versions: [">= 0.9.0"]
     commit-message:
       prefix: chore(deps)
 
@@ -55,6 +79,8 @@ updates:
       day: monday
     open-pull-requests-limit: 5
     groups:
+      crypto:
+        patterns: ["sha2", "hmac", "hkdf", "chacha20", "secp256k1", "rand"]
       cargo-minor-patch:
         update-types: ["minor", "patch"]
     commit-message:
@@ -70,6 +96,13 @@ updates:
     groups:
       go-minor-patch:
         update-types: ["minor", "patch"]
+    # go-redis 9.23 and btcec 2.5 raised their minimum to Go 1.26; drop these
+    # when the gateway's go directive, CI and the builder image move to 1.26.
+    ignore:
+      - dependency-name: github.com/redis/go-redis/v9
+        versions: [">= 9.23.0"]
+      - dependency-name: github.com/btcsuite/btcd/btcec/v2
+        versions: [">= 2.5.0"]
     commit-message:
       prefix: chore(deps)
 
@@ -88,5 +121,10 @@ updates:
     groups:
       docker-minor-patch:
         update-types: ["minor", "patch"]
+    # The Node major in the images moves together with CI's node-version, so
+    # tests always run on the runtime that ships.
+    ignore:
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: chore(docker)
