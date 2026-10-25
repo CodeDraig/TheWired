@@ -18,6 +18,15 @@ export interface BlossomAuthErr {
 
 export type BlossomAuthResult = BlossomAuthOk | BlossomAuthErr;
 
+/** Longest an upload/delete token may be valid for (expiration − created_at).
+ *  A write token is minted right before the request; a long-lived one is a
+ *  standing capability if it leaks. get/list tokens are read-only and keep the
+ *  plain "not yet expired" rule. One hour: the shared client builder mints
+ *  5 minutes, the desktop's own builder (client/src/lib/api/blossomAuth.ts)
+ *  still mints exactly an hour — tighten to 10 minutes once it uses the
+ *  shared builder. */
+export const MAX_WRITE_TOKEN_LIFETIME_SEC = 60 * 60;
+
 /**
  * Verify a Blossom kind 24242 Authorization header per BUD-11.
  */
@@ -64,7 +73,8 @@ export function verifyBlossomAuth(
 
   // Expiration tag must exist and be in the future
   const expiration = getTagValue(tags, "expiration");
-  if (!expiration || parseInt(expiration, 10) <= now) {
+  const expiresAt = expiration ? parseInt(expiration, 10) : NaN;
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) {
     return { ok: false, status: 401, reason: "Missing or expired expiration tag" };
   }
 
@@ -72,6 +82,15 @@ export function verifyBlossomAuth(
   const action = getTagValue(tags, "t");
   if (action !== requiredAction) {
     return { ok: false, status: 401, reason: `Expected t=${requiredAction}, got t=${action}` };
+  }
+
+  // Write tokens are short-lived (see MAX_WRITE_TOKEN_LIFETIME_SEC).
+  const createdAt = typeof event.created_at === "number" ? event.created_at : NaN;
+  if (
+    (requiredAction === "upload" || requiredAction === "delete") &&
+    (!Number.isFinite(createdAt) || expiresAt - createdAt > MAX_WRITE_TOKEN_LIFETIME_SEC)
+  ) {
+    return { ok: false, status: 401, reason: `Token lifetime too long (max ${MAX_WRITE_TOKEN_LIFETIME_SEC}s)` };
   }
 
   // Server tag validation (if present): one `server` tag per server the token
@@ -93,8 +112,12 @@ export function verifyBlossomAuth(
     return { ok: false, status: 400, reason: "At most one h tag per upload" };
   }
 
-  // x tag validation
+  // x tag validation. A delete MUST name the blob: without an x tag the
+  // token was a wildcard over every blob the signer owns until it expired.
   const xTags = getTagValues(tags, "x");
+  if (requiredAction === "delete" && xTags.length === 0) {
+    return { ok: false, status: 401, reason: "Delete token must carry an x tag naming the blob" };
+  }
   if (requiredHash && xTags.length > 0 && !xTags.includes(requiredHash)) {
     return { ok: false, status: 403, reason: "Hash not authorized by auth token x-tags" };
   }

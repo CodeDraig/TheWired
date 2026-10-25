@@ -11,6 +11,8 @@ import { nanoid } from "../lib/id.js";
 import { permissionService } from "../services/permissionService.js";
 import { onboardingService } from "../services/onboardingService.js";
 import { notifySpaceChanged } from "../services/spaceSignalService.js";
+import { moderationService } from "../services/moderationService.js";
+import { getActorRank, canManageRole, isSpaceCreator } from "../lib/authz.js";
 
 const createInviteBody = z.object({
   spaceId: nonEmptyString,
@@ -37,6 +39,24 @@ export const invitesRoutes: FastifyPluginAsync = async (server) => {
     const perm = await permissionService.check(spaceId, pubkey, "CREATE_INVITES");
     if (!perm.allowed) {
       return reply.status(403).send({ error: perm.reason ?? "Forbidden", code: "FORBIDDEN" });
+    }
+
+    if (autoAssignRole) {
+      const [role] = await db
+        .select()
+        .from(spaceRoles)
+        .where(and(eq(spaceRoles.id, autoAssignRole), eq(spaceRoles.spaceId, spaceId)))
+        .limit(1);
+      if (!role) return reply.status(404).send({ error: "Role not found", code: "NOT_FOUND" });
+      // Anyone with CREATE_INVITES may hand out the default role (redeem falls
+      // back to it anyway); every other role follows the hierarchy rule, so a
+      // member can't mint an Admin invite and only the creator mints admins.
+      if (!role.isDefault) {
+        const rank = await getActorRank(spaceId, pubkey);
+        if (!canManageRole(rank, role)) {
+          return reply.status(403).send({ error: "Cannot create an invite for a role equal to or above your own", code: "FORBIDDEN" });
+        }
+      }
     }
 
     const code = nanoid(8);
@@ -130,6 +150,11 @@ export const invitesRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(410).send({ error: "Invite has been fully used", code: "INVITE_EXHAUSTED" });
     }
 
+    // Bans hold across every join path.
+    if (await moderationService.isBanned(invite.spaceId, pubkey)) {
+      return reply.status(403).send({ error: "You are banned from this space", code: "BANNED" });
+    }
+
     // Check if already a member
     const [existing] = await db
       .select()
@@ -154,7 +179,20 @@ export const invitesRoutes: FastifyPluginAsync = async (server) => {
 
     // Assign role: use explicit autoAssignRole, or fall back to the
     // space's default role so new members get basic permissions (SEND_MESSAGES, etc.)
-    let roleToAssign = invite.autoAssignRole;
+    // Honour autoAssignRole only when it still belongs to this space, and an
+    // admin role only when the creator minted the invite (rows predating the
+    // create-time check may name one).
+    let roleToAssign: string | null = null;
+    if (invite.autoAssignRole) {
+      const [role] = await db
+        .select()
+        .from(spaceRoles)
+        .where(and(eq(spaceRoles.id, invite.autoAssignRole), eq(spaceRoles.spaceId, invite.spaceId)))
+        .limit(1);
+      if (role && (!role.isAdmin || (await isSpaceCreator(invite.spaceId, invite.createdBy)))) {
+        roleToAssign = role.id;
+      }
+    }
     if (!roleToAssign) {
       const [defaultRole] = await db
         .select({ id: spaceRoles.id })

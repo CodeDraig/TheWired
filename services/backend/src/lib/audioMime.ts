@@ -51,3 +51,62 @@ export function canonicalAudioType(mime: string | null | undefined): string | nu
   const canonical = AUDIO_TYPE_ALIASES[bare] ?? bare;
   return ALLOWED_AUDIO_TYPES.has(canonical) ? canonical : null;
 }
+
+/**
+ * What file-type reports for the containers above → the canonical type the
+ * upload STORES. The stored type is decided by the bytes, never by the
+ * declared Content-Type: an attacker who names a playlist `audio/mpeg` must
+ * not get ffprobe/ffmpeg to open it as one. A generic ISO-BMFF (`isom`,
+ * `mp42` brands) or Matroska file is taken as its audio form — the transcode
+ * only maps the audio stream, and neither container can reference other files.
+ */
+const SNIFFED_TO_CANONICAL: Record<string, string> = {
+  "audio/mpeg": "audio/mpeg",
+  "audio/mp3": "audio/mpeg",
+  "audio/wav": "audio/wav",
+  "audio/x-wav": "audio/wav",
+  "audio/vnd.wave": "audio/wav",
+  "audio/mp4": "audio/mp4",
+  "audio/x-m4a": "audio/mp4",
+  "video/mp4": "audio/mp4",
+  "audio/flac": "audio/flac",
+  "audio/x-flac": "audio/flac",
+  "audio/ogg": "audio/ogg",
+  "audio/opus": "audio/ogg",
+  "application/ogg": "audio/ogg",
+  "audio/aiff": "audio/aiff",
+  "audio/x-aiff": "audio/aiff",
+  "audio/aac": "audio/aac",
+  "audio/webm": "audio/webm",
+  "video/webm": "audio/webm",
+};
+
+/** Canonical stored type for a sniffed (file-type) mime, or null when the
+ *  bytes are not an audio container the pipeline takes — text, playlists,
+ *  scripts, images, archives, nothing file-type recognises. */
+export function audioTypeFromSniff(sniffedMime: string | null | undefined): string | null {
+  if (!sniffedMime) return null;
+  return SNIFFED_TO_CANONICAL[sniffedMime.toLowerCase()] ?? null;
+}
+
+/** The ffmpeg input demuxer (`-f`) that reads a canonical stored type. Pinning
+ *  it stops libavformat from probing the bytes as hls / concat / anything that
+ *  opens further files or URLs. */
+const DEMUXER_BY_TYPE: Record<string, string> = {
+  "audio/mpeg": "mp3",
+  "audio/mp3": "mp3",
+  "audio/mp4": "mp4",
+  "audio/wav": "wav",
+  "audio/x-wav": "wav",
+  "audio/flac": "flac",
+  "audio/ogg": "ogg",
+  "audio/aiff": "aiff",
+  "audio/x-aiff": "aiff",
+  "audio/aac": "aac",
+  "audio/webm": "matroska",
+};
+
+export function audioDemuxerFor(mimeType: string | null | undefined): string | null {
+  if (!mimeType) return null;
+  return DEMUXER_BY_TYPE[mimeType.split(";")[0].trim().toLowerCase()] ?? null;
+}

@@ -1,19 +1,32 @@
 use sqlx::PgPool;
 
-/// Create a new NIP-29 group
+/// Create a new NIP-29 group. Returns `true` when the group row was inserted
+/// (and the creator seeded as member + admin), `false` when a group with this
+/// id already existed — in which case NOTHING is written.
+///
+/// SECURITY (audit 2026-10): the member/admin seed is conditional on the row
+/// insert, inside one transaction. Previously `ON CONFLICT DO NOTHING` on the
+/// group row was followed by unconditional member/admin inserts, so any key
+/// re-sending 9007 for an existing id became that group's admin.
 pub async fn create_group(
     pool: &PgPool,
     group_id: &str,
     name: &str,
     creator_pubkey: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query("INSERT INTO relay.groups (group_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-        .bind(group_id)
-        .bind(name)
-        .execute(&mut *tx)
-        .await?;
+    let inserted: Option<(String,)> = sqlx::query_as(
+        "INSERT INTO relay.groups (group_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING group_id",
+    )
+    .bind(group_id)
+    .bind(name)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if inserted.is_none() {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     // Creator becomes admin
     sqlx::query(
@@ -33,7 +46,7 @@ pub async fn create_group(
     .await?;
 
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Does a group with this id exist on the relay?
@@ -212,13 +225,16 @@ pub async fn delete_group(pool: &PgPool, group_id: &str) -> anyhow::Result<()> {
 }
 
 /// SECURITY: does a backend-authoritative (platform / A-lite) space already own
-/// this id? Used to refuse a colliding relay-native 9007 create. `app.*` being
-/// absent (embedded SQLite relay) is treated as "no collision".
+/// this id? Used to refuse a colliding relay-native 9007 create and to pick
+/// the 9005 authority model. Errors propagate (audit 2026-10): a failed lookup
+/// used to read as "no collision", so a transient DB error let a 9007 claim a
+/// platform space's id and a 9005 fall back to relay-group admins. The
+/// embedded SQLite relay never reaches this function (`Db::Sqlite` answers
+/// `false` directly).
 pub async fn platform_space_exists(pool: &PgPool, group_id: &str) -> anyhow::Result<bool> {
     let collides: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM app.spaces WHERE id = $1 LIMIT 1")
         .bind(group_id)
         .fetch_optional(pool)
-        .await
-        .unwrap_or(None);
+        .await?;
     Ok(collides.is_some())
 }

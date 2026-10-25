@@ -58,6 +58,19 @@ pub fn is_ephemeral_kind(kind: i32) -> bool {
     (20000..30000).contains(&kind)
 }
 
+/// How far into the future an event's `created_at` may lie (seconds). Covers
+/// honest clock skew; a timestamp beyond it would sit at the top of every
+/// newest-first feed and win every replaceable-event race forever (audit
+/// 2026-10). Same bound strfry uses (`rejectEventsNewerThanSeconds`).
+pub const MAX_FUTURE_CREATED_AT_SECS: i64 = 15 * 60;
+
+/// Is `created_at` within bounds: not negative, not more than
+/// [`MAX_FUTURE_CREATED_AT_SECS`] past `now`? No lower bound besides zero —
+/// old events are legitimately re-broadcast.
+pub fn created_at_in_bounds(created_at: i64, now: i64) -> bool {
+    created_at >= 0 && created_at <= now.saturating_add(MAX_FUTURE_CREATED_AT_SECS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +183,19 @@ mod tests {
         let serialized = event.serialize_for_id();
         let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
         assert_eq!(parsed[5], "hello 🌍 世界");
+    }
+
+    #[test]
+    fn created_at_bounds() {
+        let now = 1_700_000_000;
+        assert!(created_at_in_bounds(now, now));
+        assert!(created_at_in_bounds(now - 10 * 365 * 86400, now), "old events are fine");
+        assert!(created_at_in_bounds(0, now));
+        assert!(created_at_in_bounds(now + MAX_FUTURE_CREATED_AT_SECS, now), "at the bound");
+        assert!(!created_at_in_bounds(now + MAX_FUTURE_CREATED_AT_SECS + 1, now));
+        assert!(!created_at_in_bounds(now + 86400, now));
+        assert!(!created_at_in_bounds(-1, now));
+        assert!(!created_at_in_bounds(i64::MAX, now), "no overflow");
     }
 
     #[test]

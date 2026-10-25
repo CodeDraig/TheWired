@@ -53,7 +53,7 @@ This explained why 9-Alpha (27 spaces) was "most affected" while users with 1-3 
 
 ### Cap sizing rationale
 
-100 subs × ~1KB/Filter ≈ 100KB per connection. For 1k concurrent users on `t4g.large`: ~100MB extra memory vs. the old cap. Negligible.
+100 subs × ~1KB/Filter ≈ 100KB per connection. For 1k concurrent users on the production host: ~100MB extra memory vs. the old cap. Negligible.
 
 The hot CPU path is `subs.matching_subs(&event)` on every broadcast. With cap 100 vs. 20, that's 5× more `Filter::matches` calls per connection per broadcast. Each call is ~1µs for chat-shaped filters. Even at 100 broadcasts/sec across 1k connections, total CPU is well under 10 cores. **If event rates ever spike to thousands/sec, the win is hashing `authors`/`#h` arrays into HashSets at sub-registration, not lowering the cap.**
 

@@ -13,7 +13,7 @@ import { addEvent, addEvents, indexChatMessage, indexReel, indexLongForm, indexL
 import { addReaction, addReactions, removeReactionByEventId, type ReactionInput } from "../../store/slices/reactionsSlice";
 import { addZap, addZaps, type ZapInput } from "../../store/slices/zapsSlice";
 import { addPollVote, addPollVotes, removeVoteByEventId, removePoll, type PollVoteInput } from "../../store/slices/pollsSlice";
-import { getSatoshisAmountFromBolt11 } from "nostr-tools/nip57";
+import { validateReceiptShape } from "../lightning/zapReceipt";
 import { notifyMusicUpdate } from "../../features/music/savedVersionSync";
 import { addTrack, indexTrackByArtist, indexTrackByAlbum, indexTrackByArtistName, indexAlbumByArtist, indexAlbumByArtistName, addAlbum, addPlaylist, addAnnotation, removeAnnotation, removeTrack, removeAlbum, removePlaylist, recordMovedRelease, libraryReleaseMoved } from "../../store/slices/musicSlice";
 import { addDMMessage, editDMMessage, remoteDeleteDMMessage, reactDMMessage, removeDMReaction, setTyping, applyReceipt, markDMWrapProcessed } from "../../store/slices/dmSlice";
@@ -600,34 +600,24 @@ async function indexEvent(event: NostrEvent, relayUrl: string): Promise<void> {
       break;
     }
     case EVENT_KINDS.ZAP_RECEIPT: {
-      // NIP-57 kind:9735 receipt. Fold the bolt11 amount into the zap aggregate,
-      // keyed by the zapped event's id (the receipt's `e` tag). Client-agnostic:
-      // any client's zap shows up. We don't keep the full receipt event. The
-      // zapper pubkey + comment come from the embedded kind:9734 request in the
-      // `description` tag (best-effort, display-only — not re-verified).
+      // NIP-57 kind:9735 receipt. Fold the amount into the zap aggregate, keyed
+      // by the zapped event's id (the receipt's `e` tag). Client-agnostic: any
+      // client's zap shows up. We don't keep the full receipt event.
+      // Anyone can publish a 9735 with an `e` tag, so a receipt only counts
+      // when its embedded kind:9734 request is consistent with it and with the
+      // target (validateReceiptShape); when the zapped note is already in the
+      // store its author must be the receipt's `p`.
       const targetId = event.tags.find((t) => t[0] === "e")?.[1];
-      const bolt11 = event.tags.find((t) => t[0] === "bolt11")?.[1];
-      if (targetId && bolt11) {
-        const sats = getSatoshisAmountFromBolt11(bolt11);
-        if (sats > 0) {
-          let zapper: string | null = null;
-          let comment = "";
-          const desc = event.tags.find((t) => t[0] === "description")?.[1];
-          if (desc) {
-            try {
-              const req = JSON.parse(desc) as { pubkey?: unknown; content?: unknown };
-              if (typeof req.pubkey === "string") zapper = req.pubkey;
-              if (typeof req.content === "string") comment = req.content;
-            } catch {
-              /* malformed description — keep amount only */
-            }
-          }
+      if (targetId) {
+        const recipientPubkey = getState().events.entities[targetId]?.pubkey;
+        const ok = validateReceiptShape(event, { targetEventId: targetId, recipientPubkey });
+        if (ok) {
           emit(addZap({
             targetEventId: targetId,
             receiptId: event.id,
-            msat: sats * 1000,
-            zapper,
-            comment,
+            msat: ok.msat,
+            zapper: ok.zapper,
+            comment: ok.comment,
             createdAt: event.created_at,
           }));
         }

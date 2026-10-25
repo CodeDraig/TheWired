@@ -1,8 +1,23 @@
 use secp256k1::{Secp256k1, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 
+/// Exactly `len` lowercase hex characters? NIP-01 spells `id`, `pubkey` and
+/// `sig` in lowercase hex; the relay compares them as strings everywhere
+/// (suspensions, membership, `authors`, `p` tags), so any other spelling of a
+/// valid key would slip past those checks (security audit 2026-10).
+pub fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Verify a Nostr event's id and signature
 pub fn verify_event(event: &super::event::Event) -> bool {
+    // 0. Canonical spelling: lowercase hex only. `hex::decode` would accept
+    //    uppercase, and the digest comparison below only catches the id.
+    if !is_lower_hex(&event.id, 64) || !is_lower_hex(&event.pubkey, 64) || !is_lower_hex(&event.sig, 128) {
+        tracing::debug!("Event id/pubkey/sig not lowercase hex of the right length");
+        return false;
+    }
+
     // 1. Verify event ID = SHA-256 of canonical serialization
     let serialized = event.serialize_for_id();
     let mut hasher = Sha256::new();
@@ -125,6 +140,39 @@ mod tests {
         hasher.update(canonical.as_bytes());
         event.id = hex::encode(hasher.finalize());
         assert!(!verify_event(&event), "Wrong pubkey should fail sig check");
+    }
+
+    /// Security audit 2026-10: NIP-01 hex is lowercase. `hex::decode` accepts
+    /// either case, so an uppercase pubkey/sig verified but then matched none of
+    /// the relay's string comparisons (suspensions, membership, authors, p tags).
+    #[test]
+    fn test_verify_rejects_uppercase_hex_fields() {
+        let event = make_signed_event("hello", 1);
+        assert!(verify_event(&event));
+
+        // Re-sign with the pubkey spelled in uppercase (genuine signature).
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[0xcd; 32]).unwrap());
+        let mut upper_pk = event.clone();
+        upper_pk.pubkey = event.pubkey.to_ascii_uppercase();
+        let canonical = upper_pk.serialize_for_id();
+        let hash = Sha256::digest(canonical.as_bytes());
+        upper_pk.id = hex::encode(hash);
+        upper_pk.sig = hex::encode(secp.sign_schnorr_no_aux_rand(&hash, &keypair).to_byte_array());
+        assert!(!verify_event(&upper_pk), "uppercase pubkey must be rejected");
+
+        let mut upper_sig = event.clone();
+        upper_sig.sig = event.sig.to_ascii_uppercase();
+        assert!(!verify_event(&upper_sig), "uppercase sig must be rejected");
+
+        let mut upper_id = event.clone();
+        upper_id.id = event.id.to_ascii_uppercase();
+        assert!(!verify_event(&upper_id), "uppercase id must be rejected");
+
+        assert!(is_lower_hex(&event.pubkey, 64));
+        assert!(!is_lower_hex(&event.pubkey.to_ascii_uppercase(), 64));
+        assert!(!is_lower_hex(&event.pubkey[..63], 64));
+        assert!(!is_lower_hex("zz", 2));
     }
 
     #[test]

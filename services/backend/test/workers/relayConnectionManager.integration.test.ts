@@ -118,7 +118,7 @@ describe("relay manager — real multi-relay integration", () => {
       ]);
 
       const { startRelayIngester } = await import("../../src/workers/relayConnectionManager.js");
-      stopFn = startRelayIngester().stop;
+      stopFn = startRelayIngester({ dialGuard: async (url) => ({ ok: true, url }) }).stop; // 127.0.0.1 relays: the guard is covered in relayDialGuard.test.ts
 
       await Promise.all([relay1.connected, relay2.connected]);
       await new Promise((r) => setTimeout(r, 150)); // let REQs + NIP-11 settle

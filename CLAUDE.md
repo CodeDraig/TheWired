@@ -131,7 +131,7 @@ cd client/src-tauri && cargo build   # Build Rust binary
 - `lib/lightning/` -- `zap.ts`, `lnurl.ts` (NIP-57), `nwcClient.ts` (NIP-47 NWC)
 - `lib/relay/embeddedRelay.ts` -- Control surface for the in-process Tauri SQLite relay
 - `lib/db/` -- IndexedDB persistence (idb wrapper):
-  - `database.ts` -- Schema definition, DB open/upgrade (versioned; per-account `thewired_<pubkey>` DBs)
+  - `database.ts` -- Schema definition, DB open/upgrade (versioned; one `thewired_v1` DB — per-account user-state rows are keyed by a `<pubkey>:` prefix in `userStateStore.ts`)
   - `eventStore.ts`, `profileStore.ts`, `subscriptionStore.ts`, `userStateStore.ts`, `aiConversationStore.ts`
   - `eviction.ts` -- TTL + LRU cache eviction
 - `store/` -- Redux store with 20 slices (identity, relays, spaces, spaceConfig, events, feed, music, dm, friendRequest, notification, reactions, wallet, ai, features, voice, call, emoji, gif, listenTogether, ui)

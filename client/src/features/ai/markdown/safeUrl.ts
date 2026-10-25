@@ -1,14 +1,15 @@
 /**
- * URL scheme allow-listing for untrusted AI-generated markdown. Mirrors the
- * `safeImageUrl` posture used for group metadata — only http(s) (and mailto for
- * links) survive; `javascript:`/`data:`/`vbscript:` and relative/garbage URLs are
- * dropped. The model's output is untrusted input (see the nostr-security skill).
+ * URL scheme allow-listing for untrusted markdown (AI output, kind:30023
+ * article bodies). Mirrors the `safeImageUrl` posture used for group metadata —
+ * only absolute http(s) (plus mailto/nostr for links) survive; `javascript:`/
+ * `data:`/`vbscript:`, protocol-relative and relative URLs are dropped (a
+ * relative URL would resolve against the privileged app origin).
  */
 export function safeHref(url?: string): string | undefined {
   if (!url) return undefined;
   try {
     const u = new URL(url);
-    return ["http:", "https:", "mailto:"].includes(u.protocol)
+    return ["http:", "https:", "mailto:", "nostr:"].includes(u.protocol)
       ? u.toString()
       : undefined;
   } catch {

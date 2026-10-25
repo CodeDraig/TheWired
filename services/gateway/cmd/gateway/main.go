@@ -12,14 +12,17 @@ import (
 
 	"github.com/thewired/gateway/internal/auth"
 	"github.com/thewired/gateway/internal/config"
-	"github.com/thewired/gateway/internal/cors"
-	gmiddleware "github.com/thewired/gateway/internal/logging"
+	"github.com/thewired/gateway/internal/gatewayauth"
 	"github.com/thewired/gateway/internal/proxy"
 	"github.com/thewired/gateway/internal/ratelimit"
 )
 
 func main() {
 	cfg := config.Load()
+
+	if err := proxy.ValidateBackendURL(cfg.BackendURL); err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	limits := ratelimit.Limits{
 		ReadPerMin:        cfg.RateLimitRead,
@@ -28,104 +31,39 @@ func main() {
 		MediaPerMin:       cfg.RateLimitMedia,
 		ReportAnonPerHour: cfg.RateLimitReportAnon,
 		ReportPerHour:     cfg.RateLimitReport,
+		IPPerMin:          cfg.RateLimitIP,
 	}
 	limiter, err := ratelimit.NewLimiter(cfg.RedisURL, limits)
 	if err != nil {
 		log.Fatalf("Failed to initialize rate limiter: %v", err)
 	}
-	router := proxy.NewRouter(cfg.BackendURL)
 
-	mux := http.NewServeMux()
-
-	// Health check (no auth required)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok","service":"gateway"}`))
-	})
-
-	// Blossom endpoints (no auth at gateway -- backend handles kind 24242)
-	// PUT /upload, HEAD /upload
-	blossomHandler := proxy.TrustedProxyMiddleware(cfg.TrustedProxies,
-		gmiddleware.LoggingMiddleware(
-			cors.BlossomCORSMiddleware(
-				proxy.NewBlossomHandler(cfg.BackendURL),
-			),
-		),
-	)
-	mux.Handle("/upload", blossomHandler)
-	mux.Handle("/list/", blossomHandler)
-
-	// HLS adaptive audio streams (public, GET-only, no auth, no rate limit).
-	// Segments are immutable + CDN-cached so rate-limiting would just burn
-	// Redis for no benefit. Same CORS policy as Blossom GETs.
-	hlsHandler := proxy.TrustedProxyMiddleware(cfg.TrustedProxies,
-		gmiddleware.LoggingMiddleware(
-			cors.BlossomCORSMiddleware(
-				proxy.NewBlossomHandler(cfg.BackendURL),
-			),
-		),
-	)
-	mux.Handle("/hls/", hlsHandler)
-
-	// #64 — single-use replay guard for API auth events (Redis SET NX EX). If
-	// Redis is unreachable at startup we run without it (fail-open) rather than
-	// refusing to boot; per-request errors also fail open inside the middleware.
+	// #64 — single-use replay guard for API auth events (Redis SET NX EX). The
+	// constructor only parses REDIS_URL (the client dials lazily), so the only
+	// failure is a bad URL — the same one the limiter above already accepted.
+	// Treat it as the configuration error it is instead of silently running
+	// without replay protection for the life of the process. Per-request store
+	// errors are handled in the middleware (reads fail open; writes follow
+	// RATE_LIMIT_FAIL_MODE).
 	replayGuard, err := auth.NewRedisReplayGuard(cfg.RedisURL)
 	if err != nil {
-		log.Printf("NIP-98 replay guard disabled (Redis init failed): %v", err)
+		log.Fatalf("Failed to initialize NIP-98 replay guard: %v", err)
 	}
 
-	// API routes: trusted-proxy -> logging -> CORS -> auth-fail guard -> auth ->
-	// rate limit -> proxy. The auth-fail guard sits OUTSIDE NIP-98 so it can count
-	// 401s and throttle per-IP brute-force of the (expensive) signature verify.
-	failOpen := cfg.RateLimitFailMode != "closed"
-	authFail := ratelimit.NewAuthFailGuard(cfg.AuthFailPerMin)
-	// A typed-nil *RedisReplayGuard in an interface is non-nil; pass the interface
-	// explicitly so a failed init really disables the guard.
-	var replay auth.ReplayGuard
-	if replayGuard != nil {
-		replay = replayGuard
+	// Identity-header MAC shared with the backend (GATEWAY_SHARED_SECRET). nil
+	// when unset: nothing new on the wire, the backend keeps topological trust.
+	signer := gatewayauth.NewSigner(cfg.GatewaySharedSecret)
+	if signer == nil {
+		log.Printf("GATEWAY_SHARED_SECRET unset: forwarded identity headers are not signed")
 	}
-	apiHandler := proxy.TrustedProxyMiddleware(cfg.TrustedProxies,
-		gmiddleware.LoggingMiddleware(
-			cors.CORSMiddleware(cfg.AllowedOrigins)(
-				authFail.Middleware(
-					auth.NIP98MiddlewareWithReplay(replay,
-						ratelimit.RateLimitMiddleware(limiter, failOpen,
-							router.Handler(),
-						),
-					),
-				),
-			),
-		),
-	)
-	mux.Handle("/api/", apiHandler)
-
-	// Blossom blob retrieval/deletion catch-all: /<sha256>[.<ext>]
-	// Registered as "/" so it catches paths not matched by /upload, /list/, /api/, /uploads/, /health
-	// NIP-98 auth is optional here — allows backend to check access for protected blobs
-	defaultHandler := proxy.TrustedProxyMiddleware(cfg.TrustedProxies,
-		gmiddleware.LoggingMiddleware(
-			cors.BlossomCORSMiddleware(
-				auth.NIP98Middleware(
-					http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						if proxy.IsBlossomPath(r.URL.Path) {
-							proxy.NewBlossomHandler(cfg.BackendURL).ServeHTTP(w, r)
-							return
-						}
-						http.NotFound(w, r)
-					}),
-				),
-			),
-		),
-	)
-	mux.Handle("/", defaultHandler)
+	if cfg.IsProduction && len(cfg.TrustedProxies) == 0 {
+		log.Printf("TRUSTED_PROXIES unset in production: X-Forwarded-* is ignored, every client is keyed by the proxy's address")
+	}
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	srv := &http.Server{
-		Addr: addr,
-		// Strip forgeable internal headers on EVERY route before routing (#108).
-		Handler: proxy.StripInternalHeaders(mux),
+		Addr:    addr,
+		Handler: buildHandler(cfg, limiter, replayGuard, signer),
 		// #65 — bound slow-header/idle connections (Slowloris). Read/Write body
 		// timeouts are intentionally left unset because /upload streams large
 		// Blossom blobs and the catch-all streams them back to slow clients.

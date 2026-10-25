@@ -16,7 +16,7 @@ const preferencesBody = z.object({
   dms: z.boolean().optional(),
   newFollowers: z.boolean().optional(),
   chatMessages: z.boolean().optional(),
-  mutedSpaces: z.array(z.string()).optional(),
+  mutedSpaces: z.array(z.string().min(1).max(128)).max(MAX_SPACE_MODES).optional(),
   replies: z.boolean().optional(),
   reactions: z.boolean().optional(),
   zaps: z.boolean().optional(),

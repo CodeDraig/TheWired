@@ -11,7 +11,7 @@ import {
   finalizeEvent,
   type Event as NostrToolsEvent,
 } from "nostr-tools/pure";
-import type { NostrEvent } from "../../types/nostr";
+import type { NostrEvent, NostrFilter } from "../../types/nostr";
 import { getSigner, getSignerTimeoutMs } from "../nostr/loginFlow";
 import { signingQueue } from "../nostr/signingQueue";
 import { relayManager } from "../nostr/relayManager";
@@ -120,6 +120,9 @@ export function validateZapReceipt(receipt: NostrEvent, v: ZapValidation): boole
   }
   return true;
 }
+
+import { validateReceiptShape, type ReceiptContext } from "./zapReceipt";
+export { validateReceiptShape, type ReceiptContext, type PlausibleReceipt } from "./zapReceipt";
 
 export interface SendZapParams {
   recipientPubkey: string;
@@ -255,28 +258,33 @@ export async function sendZap(params: SendZapParams): Promise<SendZapResult> {
 }
 
 /**
- * Subscribe to kind:9735 zap receipts for an event and sum the amounts.
+ * Subscribe to kind:9735 zap receipts for an event and sum the amounts of the
+ * receipts that pass {@link validateReceiptShape}. When the recipient's LNURL
+ * server key is known (`resolveZapEndpoint(...).nostrPubkey`) the filter is
+ * pinned to that author, so forged receipts never even arrive.
  * Returns the subscription id; the caller closes it via relayManager.closeSubscription.
  */
 export function fetchZapTotals(
   eventId: string,
   relayUrls: string[],
   onTotal: (total: { msat: number; count: number }) => void,
+  known: Omit<ReceiptContext, "targetEventId"> = {},
 ): string {
   let msat = 0;
   let count = 0;
   const seen = new Set<string>();
+  const ctx: ReceiptContext = { targetEventId: eventId, ...known };
+  const filter: NostrFilter = { kinds: [9735], "#e": [eventId] };
+  if (known.zapperPubkey) filter.authors = [known.zapperPubkey];
   return relayManager.subscribe({
-    filters: [{ kinds: [9735], "#e": [eventId] }],
+    filters: [filter],
     relayUrls: relayUrls.length > 0 ? relayUrls : undefined,
     onEvent: (event) => {
       if (seen.has(event.id)) return;
       seen.add(event.id);
-      const bolt11 = event.tags.find((t) => t[0] === "bolt11")?.[1];
-      if (!bolt11) return;
-      const sats = getSatoshisAmountFromBolt11(bolt11);
-      if (sats <= 0) return;
-      msat += sats * 1000;
+      const ok = validateReceiptShape(event, ctx);
+      if (!ok) return;
+      msat += ok.msat;
       count += 1;
       onTotal({ msat, count });
     },

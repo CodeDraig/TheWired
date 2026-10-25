@@ -3,14 +3,18 @@ package auth
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
+
+	"encoding/base64"
 )
 
 var (
@@ -25,21 +29,55 @@ var (
 // Bodies larger than this with a payload tag are rejected, not silently passed.
 const maxPayloadVerifyBytes = 8 << 20 // 8 MiB
 
+// Payload-tag modes (NIP98_REQUIRE_PAYLOAD).
+const (
+	PayloadOff     = "off"     // verify only when the tag is present (default)
+	PayloadWarn    = "warn"    // ...and log body-bearing requests that omit it
+	PayloadEnforce = "enforce" // ...and 401 PAYLOAD_REQUIRED when it is missing
+)
+
+// Options configures the NIP-98 middleware.
+type Options struct {
+	// Replay rejects reused auth event ids (#64). nil disables the check.
+	Replay ReplayGuard
+	// ReplayFailClosed: when the replay store errors, 503 write-method requests
+	// instead of letting them through. Reads always fail open.
+	ReplayFailClosed bool
+	// PayloadMode is one of PayloadOff / PayloadWarn / PayloadEnforce.
+	PayloadMode string
+}
+
 // NIP98Middleware verifies the NIP-98 auth header with no replay protection.
 // Used on the public Blossom catch-all, where bodies are large blobs and the
 // replay surface is low.
 func NIP98Middleware(next http.Handler) http.Handler {
-	return nip98Middleware(nil, next)
+	return NIP98MiddlewareWithOptions(Options{}, next)
 }
 
 // NIP98MiddlewareWithReplay verifies NIP-98 auth and additionally rejects replays
 // via `guard` (#64). A nil guard disables replay checks. On a guard error the
 // request is allowed through (fail-open) so a Redis blip can't lock out auth.
 func NIP98MiddlewareWithReplay(guard ReplayGuard, next http.Handler) http.Handler {
-	return nip98Middleware(guard, next)
+	return NIP98MiddlewareWithOptions(Options{Replay: guard}, next)
 }
 
-func nip98Middleware(guard ReplayGuard, next http.Handler) http.Handler {
+// NIP98MiddlewareWithOptions is the fully configurable constructor.
+func NIP98MiddlewareWithOptions(opts Options, next http.Handler) http.Handler {
+	if opts.PayloadMode != PayloadWarn && opts.PayloadMode != PayloadEnforce {
+		opts.PayloadMode = PayloadOff
+	}
+	var warnMu sync.Mutex
+	var lastWarn time.Time
+	warnOncePerMinute := func(format string, args ...any) {
+		warnMu.Lock()
+		defer warnMu.Unlock()
+		if time.Since(lastWarn) < time.Minute {
+			return
+		}
+		lastWarn = time.Now()
+		log.Printf(format, args...)
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Always strip X-Auth-Pubkey from inbound requests — it is an
 		// internal header injected by this middleware after verification.
@@ -55,7 +93,7 @@ func nip98Middleware(guard ReplayGuard, next http.Handler) http.Handler {
 		}
 
 		if !strings.HasPrefix(authHeader, "Nostr ") {
-			http.Error(w, `{"error":"invalid auth scheme","code":"INVALID_AUTH"}`, http.StatusUnauthorized)
+			writeAuthError(w, http.StatusUnauthorized, "INVALID_AUTH", "invalid auth scheme")
 			return
 		}
 
@@ -63,13 +101,13 @@ func nip98Middleware(guard ReplayGuard, next http.Handler) http.Handler {
 		eventB64 := strings.TrimPrefix(authHeader, "Nostr ")
 		eventJSON, err := base64.StdEncoding.DecodeString(eventB64)
 		if err != nil {
-			http.Error(w, `{"error":"invalid base64","code":"INVALID_AUTH"}`, http.StatusUnauthorized)
+			writeAuthError(w, http.StatusUnauthorized, "INVALID_AUTH", "invalid base64")
 			return
 		}
 
 		var event NostrEvent
 		if err := json.Unmarshal(eventJSON, &event); err != nil {
-			http.Error(w, `{"error":"invalid event JSON","code":"INVALID_AUTH"}`, http.StatusUnauthorized)
+			writeAuthError(w, http.StatusUnauthorized, "INVALID_AUTH", "invalid event JSON")
 			return
 		}
 
@@ -89,29 +127,47 @@ func nip98Middleware(guard ReplayGuard, next http.Handler) http.Handler {
 		expectedURL := scheme + "://" + r.Host + r.URL.RequestURI()
 
 		if err := VerifyNIP98(&event, expectedURL, r.Method); err != nil {
-			http.Error(w, `{"error":"`+err.Error()+`","code":"AUTH_FAILED"}`, http.StatusUnauthorized)
+			// The verifier's message names the client's own `u` tag; the client
+			// gets a fixed description, the detail goes to the log.
+			log.Printf("NIP-98 verify failed for %s %s: %v", r.Method, r.URL.Path, err)
+			writeAuthError(w, http.StatusUnauthorized, "AUTH_FAILED", "auth event does not match this request")
 			return
 		}
 
 		// #64 — payload tag is verify-if-present: when the client binds the body
-		// hash into the auth event, the body MUST match. (Clients emit no payload
-		// tag today; this is forward-compatible and a no-op when absent.)
-		if payloadTag := getTagValue(event.Tags, "payload"); payloadTag != "" {
+		// hash into the auth event, the body MUST match. NIP98_REQUIRE_PAYLOAD
+		// additionally warns about / rejects body-bearing requests without one.
+		payloadTag := getTagValue(event.Tags, "payload")
+		if payloadTag != "" {
 			if err := verifyPayload(r, payloadTag); err != nil {
-				http.Error(w, `{"error":"`+err.Error()+`","code":"AUTH_FAILED"}`, http.StatusUnauthorized)
+				writeAuthError(w, http.StatusUnauthorized, "AUTH_FAILED", err.Error())
 				return
 			}
+		} else if opts.PayloadMode != PayloadOff && hasBody(r) && !isMultipart(r) {
+			if opts.PayloadMode == PayloadEnforce {
+				writeAuthError(w, http.StatusUnauthorized, "PAYLOAD_REQUIRED",
+					"NIP-98 payload tag (sha256 of the request body) is required")
+				return
+			}
+			warnOncePerMinute("NIP-98 payload tag missing on %s %s (mode=warn; pubkey %s…)",
+				r.Method, r.URL.Path, event.PubKey[:8])
 		}
 
 		// #64 — single-use replay protection, checked AFTER full verification so an
-		// attacker can't poison the cache with unverified ids. Fail-open on a store
-		// error: a Redis outage must not 401 every authenticated request.
-		if guard != nil {
-			fresh, err := guard.Reserve(r.Context(), event.ID)
+		// attacker can't poison the cache with unverified ids. On a store error
+		// reads fail open (a Redis outage must not 401 every authenticated
+		// request); writes follow ReplayFailClosed.
+		if opts.Replay != nil {
+			fresh, err := opts.Replay.Reserve(r.Context(), event.ID)
 			if err != nil {
+				if opts.ReplayFailClosed && isWriteMethod(r.Method) {
+					log.Printf("NIP-98 replay guard error (fail-closed, %s): %v", r.Method, err)
+					writeAuthError(w, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "service temporarily unavailable")
+					return
+				}
 				log.Printf("NIP-98 replay guard error (fail-open): %v", err)
 			} else if !fresh {
-				http.Error(w, `{"error":"auth event already used","code":"AUTH_REPLAY"}`, http.StatusUnauthorized)
+				writeAuthError(w, http.StatusUnauthorized, "AUTH_REPLAY", "auth event already used")
 				return
 			}
 		}
@@ -120,6 +176,41 @@ func nip98Middleware(guard ReplayGuard, next http.Handler) http.Handler {
 		r.Header.Set("X-Auth-Pubkey", event.PubKey)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// writeAuthError emits a fixed-shape JSON error. Messages are constants chosen
+// here, never client input, and the body is built with json.Marshal.
+func writeAuthError(w http.ResponseWriter, status int, code, message string) {
+	body, _ := json.Marshal(map[string]string{"error": message, "code": code})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(body)
+}
+
+func isWriteMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	}
+	return false
+}
+
+// hasBody reports whether the request carries a body: a known positive length
+// or an unknown (chunked) one. ContentLength 0 means none.
+func hasBody(r *http.Request) bool {
+	if r.Body == nil || r.Body == http.NoBody {
+		return false
+	}
+	return r.ContentLength != 0
+}
+
+// isMultipart: a browser serializes FormData (boundary included) only inside
+// fetch, so the client cannot know the body hash up front. Upload routes are
+// therefore exempt from the payload requirement (the backend's kind-24242 /
+// per-pubkey upload guards still apply).
+func isMultipart(r *http.Request) bool {
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && mt == "multipart/form-data"
 }
 
 // verifyPayload checks that sha256(body) hex-equals the NIP-98 `payload` tag,

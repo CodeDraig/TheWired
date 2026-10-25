@@ -14,6 +14,10 @@ import { validate, hexId, nonEmptyString } from "../lib/validation.js";
 /** How long a `dm:<roomId>` stays bound to its two parties (≥ the token TTL). */
 const DM_ROOM_BINDING_TTL_S = 3600;
 
+/** Channel tokens live one hour, like DM tokens: a leaked token is a seat in
+ *  the room until it expires, and the client re-mints on reconnect. */
+const CHANNEL_TOKEN_TTL_S = 3600;
+
 /**
  * Bind a 1:1 call room to the two pubkeys of the first mint, and reject any
  * third party afterwards. The roomId is only a pubkey the caller chose, so
@@ -163,6 +167,7 @@ export const voiceRoutes: FastifyPluginAsync = async (server) => {
         canSubscribe: true,
         canPublishSources,
       },
+      CHANNEL_TOKEN_TTL_S,
     );
 
     return {
@@ -194,6 +199,12 @@ export const voiceRoutes: FastifyPluginAsync = async (server) => {
     const perm = await permissionService.check(spaceId, pubkey, "MUTE_MEMBERS");
     if (!perm.allowed) {
       return reply.status(403).send({ error: "Missing MUTE_MEMBERS permission", code: "FORBIDDEN" });
+    }
+    // Same rank rule as the text-moderation routes: the actor must outrank the
+    // target (never the creator, an admin, an equal, or themselves).
+    const hierarchy = await permissionService.checkHierarchy(spaceId, pubkey, targetPubkey);
+    if (!hierarchy.allowed) {
+      return reply.status(403).send({ error: hierarchy.reason, code: "FORBIDDEN" });
     }
 
     const roomName = `${spaceId}:${channelId}`;
@@ -230,6 +241,10 @@ export const voiceRoutes: FastifyPluginAsync = async (server) => {
     const perm = await permissionService.check(spaceId, pubkey, "MUTE_MEMBERS");
     if (!perm.allowed) {
       return reply.status(403).send({ error: "Missing MUTE_MEMBERS permission", code: "FORBIDDEN" });
+    }
+    const hierarchy = await permissionService.checkHierarchy(spaceId, pubkey, targetPubkey);
+    if (!hierarchy.allowed) {
+      return reply.status(403).send({ error: hierarchy.reason, code: "FORBIDDEN" });
     }
 
     const roomName = `${spaceId}:${channelId}`;

@@ -100,15 +100,37 @@ func writeTooMany(w http.ResponseWriter, result AllowResult, code string) {
 	w.Write([]byte(`{"error":"rate limit exceeded","code":"` + code + `"}`))
 }
 
-// RateLimitMiddleware applies per-pubkey rate limiting. `failOpen` controls the
-// behavior on a Redis error: true (default) lets the request through so a cache
-// blip can't 503 the whole API; false returns 503 (#67).
+func writeUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	w.Write([]byte(`{"error":"service temporarily unavailable","code":"SERVICE_UNAVAILABLE"}`))
+}
+
+// RateLimitMiddleware applies the per-IP floor and then per-pubkey rate
+// limiting. `failOpen` controls the behavior on a Redis error: true (default)
+// lets the request through so a cache blip can't 503 the whole API; false
+// returns 503 (#67).
 func RateLimitMiddleware(limiter *Limiter, failOpen bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r)
 		pubkey := r.Header.Get("X-Auth-Pubkey")
 		anonymous := pubkey == ""
 		if anonymous {
-			pubkey = "anon:" + clientIP(r)
+			pubkey = "anon:" + ip
+		}
+
+		// Per-IP ceiling first: it is independent of who the caller claims to
+		// be, so rotating keys cannot multiply the budget.
+		ipResult, err := limiter.AllowIP(r.Context(), ip)
+		if err != nil {
+			log.Printf("IP rate limiter error (fail-open=%v): %v", failOpen, err)
+			if !failOpen {
+				writeUnavailable(w)
+				return
+			}
+		} else if !ipResult.Allowed {
+			writeTooMany(w, ipResult, "IP_RATE_LIMITED")
+			return
 		}
 
 		category := classify(r.Method, r.URL.Path)
@@ -120,9 +142,7 @@ func RateLimitMiddleware(limiter *Limiter, failOpen bool, next http.Handler) htt
 				next.ServeHTTP(w, r) // degraded: don't take the API down with Redis
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(`{"error":"service temporarily unavailable","code":"SERVICE_UNAVAILABLE"}`))
+			writeUnavailable(w)
 			return
 		}
 

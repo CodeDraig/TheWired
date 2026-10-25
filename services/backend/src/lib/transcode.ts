@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { audioDemuxerFor } from "./audioMime.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -12,6 +13,8 @@ export interface TranscodeInput {
   sha256: string;
   /** Absolute blob directory; HLS output lands at `<blobDir>/hls/<sha256>/`. */
   blobDir: string;
+  /** The upload's stored (sniffed) type; pins the input demuxer. */
+  mimeType?: string | null;
 }
 
 export interface TranscodeResult {
@@ -25,18 +28,39 @@ export interface TranscodeResult {
   durationSec: number | null;
 }
 
+/**
+ * Input options shared by ffprobe and ffmpeg. The file they open was uploaded
+ * by a user: libavformat left to probe it could pick the hls / concat / any
+ * other demuxer that OPENS FURTHER FILES OR URLS named inside the "audio"
+ * (CVE-2016-1897/1898 class — a sibling blob spliced into the output, an
+ * internal HTTP service hit from the worker). So: only the `file` protocol,
+ * and the demuxer pinned to the container the upload sniffed from the bytes
+ * (lib/audioMime.ts). An unknown type still gets the whitelist.
+ */
+function inputOptions(mimeType: string | null | undefined): string[] {
+  const demuxer = audioDemuxerFor(mimeType);
+  return ["-protocol_whitelist", "file", ...(demuxer ? ["-f", demuxer] : [])];
+}
+
+/** ffprobe argv for a stored upload. Exported for tests. (ffprobe has no
+ *  `-nostdin`; it never reads stdin.) */
+export function ffprobeArgs(inputPath: string, mimeType: string | null | undefined): string[] {
+  return [
+    "-v", "error",
+    ...inputOptions(mimeType),
+    "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    inputPath,
+  ];
+}
+
 /** Probe a source file's duration in seconds via ffprobe. Null on any failure
  *  (no ffprobe on PATH, unreadable file, timeout) — duration is metadata, never
  *  worth failing a transcode or an upload over. The upload route calls this
  *  inline, hence the timeout. */
-export async function probeDurationSec(inputPath: string): Promise<number | null> {
+export async function probeDurationSec(inputPath: string, mimeType?: string | null): Promise<number | null> {
   try {
-    const { stdout } = await execFileAsync("ffprobe", [
-      "-v", "error",
-      "-show_entries", "format=duration",
-      "-of", "default=noprint_wrappers=1:nokey=1",
-      inputPath,
-    ], { timeout: 15_000 });
+    const { stdout } = await execFileAsync("ffprobe", ffprobeArgs(inputPath, mimeType), { timeout: 15_000 });
     const dur = parseFloat(stdout.trim());
     return Number.isFinite(dur) && dur > 0 ? dur : null;
   } catch {
@@ -64,23 +88,15 @@ const MASTER_PLAYLIST =
  *  normal failure path (purge output dir, mark `failed`) runs. */
 export const FFMPEG_TIMEOUT_MS = 10 * 60 * 1000;
 
-/**
- * Produce a two-rendition HLS ladder with −14 LUFS loudness normalization.
- * Single ffmpeg invocation: decode once, normalize once via `loudnorm`,
- * split to two AAC encoders, fMP4 segments at 6s. Safe to retry — failures
- * purge the output directory so a retry starts clean.
- */
-export async function transcodeAudio(input: TranscodeInput): Promise<TranscodeResult> {
-  const { inputPath, sha256, blobDir } = input;
+/** ffmpeg argv for the two-rendition HLS ladder. Exported for tests. */
+export function ffmpegArgs(input: TranscodeInput): string[] {
+  const { inputPath, sha256, blobDir, mimeType } = input;
   const outDir = join(blobDir, "hls", sha256);
   const dir128 = join(outDir, "128k");
   const dir256 = join(outDir, "256k");
-
-  await mkdir(dir128, { recursive: true });
-  await mkdir(dir256, { recursive: true });
-
-  const args = [
-    "-y", "-hide_banner", "-loglevel", "error",
+  return [
+    "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+    ...inputOptions(mimeType),
     "-i", inputPath,
     "-filter_complex",
     "[0:a]loudnorm=I=-14:LRA=11:TP=-1,asplit=2[a128][a256]",
@@ -105,9 +121,23 @@ export async function transcodeAudio(input: TranscodeInput): Promise<TranscodeRe
     "-hls_fmp4_init_filename", "init.mp4",
     join(dir256, "index.m3u8"),
   ];
+}
+
+/**
+ * Produce a two-rendition HLS ladder with −14 LUFS loudness normalization.
+ * Single ffmpeg invocation: decode once, normalize once via `loudnorm`,
+ * split to two AAC encoders, fMP4 segments at 6s. Safe to retry — failures
+ * purge the output directory so a retry starts clean.
+ */
+export async function transcodeAudio(input: TranscodeInput): Promise<TranscodeResult> {
+  const { inputPath, sha256, blobDir, mimeType } = input;
+  const outDir = join(blobDir, "hls", sha256);
+
+  await mkdir(join(outDir, "128k"), { recursive: true });
+  await mkdir(join(outDir, "256k"), { recursive: true });
 
   try {
-    await execFileAsync("ffmpeg", args, {
+    await execFileAsync("ffmpeg", ffmpegArgs(input), {
       maxBuffer: 16 * 1024 * 1024,
       timeout: FFMPEG_TIMEOUT_MS,
       killSignal: "SIGKILL",
@@ -123,6 +153,6 @@ export async function transcodeAudio(input: TranscodeInput): Promise<TranscodeRe
     hlsRelPath: `hls/${sha256}/master.m3u8`,
     loudnessI: null,
     loudnessTp: null,
-    durationSec: await probeDurationSec(inputPath),
+    durationSec: await probeDurationSec(inputPath, mimeType),
   };
 }

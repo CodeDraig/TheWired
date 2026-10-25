@@ -49,6 +49,12 @@ async function rankByTrending<T extends { id: string; created_at: number }>(
   return scored.map((s) => s.item);
 }
 
+/** `%<term>%` for an ILIKE … ESCAPE '\' pattern: the term's own `%`, `_` and
+ *  `\` are escaped so a search is text, never a wildcard. */
+function containsPattern(term: string): string {
+  return "%" + term.replace(/[\\%_]/g, (c) => `\\${c}`) + "%";
+}
+
 export const discoveryService = {
   // ── Space discovery ──────────────────────────────────────────────
 
@@ -72,7 +78,7 @@ export const discoveryService = {
 
     if (opts.search) {
       conditions.push(
-        sql`(${spaces.name} ILIKE ${"%" + opts.search + "%"} OR ${spaces.about} ILIKE ${"%" + opts.search + "%"})`,
+        sql`(${spaces.name} ILIKE ${containsPattern(opts.search)} ESCAPE '\\' OR ${spaces.about} ILIKE ${containsPattern(opts.search)} ESCAPE '\\')`,
       );
     }
 
@@ -667,7 +673,7 @@ export const discoveryService = {
 
     if (opts.search) {
       conditions.push(
-        sql`(${relayDirectory.url} ILIKE ${"%" + opts.search + "%"} OR ${relayDirectory.name} ILIKE ${"%" + opts.search + "%"})` as any,
+        sql`(${relayDirectory.url} ILIKE ${containsPattern(opts.search)} ESCAPE '\\' OR ${relayDirectory.name} ILIKE ${containsPattern(opts.search)} ESCAPE '\\')` as any,
       );
     }
 

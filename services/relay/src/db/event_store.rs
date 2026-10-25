@@ -38,7 +38,14 @@ pub async fn store_event_flagged(
     event: &Event,
     self_published: bool,
 ) -> anyhow::Result<bool> {
-    let d_tag = event.get_tag_value("d");
+    // NIP-01: an addressable event with no `d` tag has the empty-string
+    // address. Storing NULL there put every such event outside the unique
+    // index, so unlimited "versions" of one address accumulated (audit 2026-10).
+    let d_tag = match event.get_tag_value("d") {
+        Some(d) => Some(d),
+        None if is_addressable(event.kind) => Some(String::new()),
+        None => None,
+    };
     let expires_at = event_expiration(event);
     // Every h tag goes into the indexed `h_tags` array (multi-space events);
     // the scalar `h_tag` column is kept as h_tags[1] so `h_tag IS NULL` still
@@ -53,19 +60,25 @@ pub async fn store_event_flagged(
     let p_tags = event.get_tag_values("p");
     let e_tags = event.get_tag_values("e");
 
-    // For replaceable/addressable events, delete the older version first.
-    // Only deletes if the new event is strictly newer (created_at >).
-    // If the existing event is newer or same age, the delete matches nothing
-    // and the subsequent insert will fail on the unique constraint — that's fine,
-    // we return Ok(false) to indicate "duplicate/superseded".
+    // Replace + insert run in one transaction so a crash between them cannot
+    // lose the only copy of a replaceable event (audit 2026-10).
+    let mut tx = pool.begin().await?;
+
+    // For replaceable/addressable events, delete the version this one
+    // supersedes first: an older one, or — NIP-01 tie-break — one with the same
+    // created_at and a lexically greater id (the lowest id is retained). If
+    // the existing event wins, the delete matches nothing and the insert fails
+    // on the unique constraint; that is reported as Ok(false) ("superseded").
     if is_replaceable(event.kind) {
         sqlx::query(
-            "DELETE FROM relay.events WHERE pubkey = $1 AND kind = $2 AND created_at < $3",
+            "DELETE FROM relay.events WHERE pubkey = $1 AND kind = $2 \
+             AND (created_at < $3 OR (created_at = $3 AND id > $4))",
         )
         .bind(&event.pubkey)
         .bind(event.kind)
         .bind(event.created_at)
-        .execute(pool)
+        .bind(&event.id)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(kind = event.kind, error = %e, "Failed to delete old replaceable event");
@@ -74,13 +87,15 @@ pub async fn store_event_flagged(
     } else if is_addressable(event.kind) {
         if let Some(ref d) = d_tag {
             sqlx::query(
-                "DELETE FROM relay.events WHERE pubkey = $1 AND kind = $2 AND d_tag = $3 AND created_at < $4",
+                "DELETE FROM relay.events WHERE pubkey = $1 AND kind = $2 AND d_tag = $3 \
+                 AND (created_at < $4 OR (created_at = $4 AND id > $5))",
             )
             .bind(&event.pubkey)
             .bind(event.kind)
             .bind(d)
             .bind(event.created_at)
-            .execute(pool)
+            .bind(&event.id)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 tracing::error!(kind = event.kind, error = %e, "Failed to delete old addressable event");
@@ -89,10 +104,16 @@ pub async fn store_event_flagged(
         }
     }
 
+    // The two NOT EXISTS legs refuse an event a prior NIP-09 / NIP-29 deletion
+    // covers (security audit 2026-10). The handler checks `is_deleted` first
+    // and answers `deleted:`; this guard makes the store itself safe.
     let result = sqlx::query(
         r#"
         INSERT INTO relay.events (id, pubkey, created_at, kind, tags, content, sig, d_tag, h_tag, visibility, p_tags, e_tags, h_tags, expires_at, self_published)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        SELECT $1::text, $2::text, $3::bigint, $4::int, $5::jsonb, $6::text, $7::text, $8::text, $9::text, $10::text, $11::text[], $12::text[], $13::text[], $14::bigint, $15::boolean
+        WHERE NOT EXISTS (SELECT 1 FROM relay.deleted_events WHERE event_id = $1 AND pubkey = $2)
+          AND NOT EXISTS (SELECT 1 FROM relay.deleted_addresses
+                          WHERE kind = $4 AND pubkey = $2 AND d_tag = COALESCE($8, '') AND deleted_upto >= $3)
         ON CONFLICT (id) DO NOTHING
         "#,
     )
@@ -111,12 +132,18 @@ pub async fn store_event_flagged(
     .bind(&h_tags)
     .bind(expires_at)
     .bind(self_published)
-    .execute(pool)
+    .execute(&mut *tx)
     .await;
 
     match result {
-        Ok(r) => Ok(r.rows_affected() > 0),
+        Ok(r) => {
+            tx.commit().await?;
+            Ok(r.rows_affected() > 0)
+        }
         Err(e) => {
+            // Nothing to keep: the delete above (if any) must not survive a
+            // failed insert.
+            let _ = tx.rollback().await;
             // Unique constraint violation for replaceable/addressable means
             // the existing event is newer — not an error, just a no-op.
             if is_replaceable(event.kind) || is_addressable(event.kind) {
@@ -463,6 +490,71 @@ pub async fn get_event_by_id(pool: &PgPool, event_id: &str) -> anyhow::Result<Op
         content: r.content,
         sig: r.sig,
     }))
+}
+
+/// Remember that `event_id` (authored by `pubkey`) was deleted by `deleted_by`,
+/// so a re-publish is refused (`relay.deleted_events`, migration 007).
+pub async fn record_deleted_event(
+    pool: &PgPool,
+    event_id: &str,
+    pubkey: &str,
+    deleted_by: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO relay.deleted_events (event_id, pubkey, deleted_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(event_id)
+    .bind(pubkey)
+    .bind(deleted_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Remember a NIP-09 `a`-tag deletion: every version of `(kind, pubkey, d_tag)`
+/// created at or before `deleted_upto` is refused from now on. A later
+/// deletion only ever moves the bound forward.
+pub async fn record_deleted_address(
+    pool: &PgPool,
+    kind: i32,
+    pubkey: &str,
+    d_tag: &str,
+    deleted_upto: i64,
+    deleted_by: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO relay.deleted_addresses (kind, pubkey, d_tag, deleted_upto, deleted_by) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (kind, pubkey, d_tag) DO UPDATE \
+         SET deleted_upto = GREATEST(relay.deleted_addresses.deleted_upto, EXCLUDED.deleted_upto)",
+    )
+    .bind(kind)
+    .bind(pubkey)
+    .bind(d_tag)
+    .bind(deleted_upto)
+    .bind(deleted_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Does a recorded deletion cover this event — its id (for its author), or
+/// its address at or before the deletion?
+pub async fn is_deleted(pool: &PgPool, event: &Event) -> anyhow::Result<bool> {
+    let d_tag = event.get_tag_value("d").unwrap_or_default();
+    let (hit,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM relay.deleted_events WHERE event_id = $1 AND pubkey = $2) \
+             OR EXISTS (SELECT 1 FROM relay.deleted_addresses \
+                        WHERE kind = $3 AND pubkey = $2 AND d_tag = $4 AND deleted_upto >= $5)",
+    )
+    .bind(&event.id)
+    .bind(&event.pubkey)
+    .bind(event.kind)
+    .bind(&d_tag)
+    .bind(event.created_at)
+    .fetch_one(pool)
+    .await?;
+    Ok(hit)
 }
 
 /// Delete an event by ID

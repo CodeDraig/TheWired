@@ -34,6 +34,13 @@ struct Obs {
     by_id_count: usize,
     by_author_count: usize,
     by_kind_ids_newest_first: Vec<String>,
+    tie_lower_replaces_higher: bool,
+    tie_higher_refused_after_lower: bool,
+    tie_survivor_is_lowest: bool,
+    dless_addressable_count: usize,
+    group_created: bool,
+    group_recreated: bool,
+    recreate_made_bob_admin: bool,
     admin_alice: bool,
     member_alice_native: bool,
     members_after_create: Vec<String>,
@@ -42,10 +49,21 @@ struct Obs {
     unified_member_alice: bool,
     members_of_alice_has_g1: bool,
     any_private_default: bool,
+    private_lists_anon: Vec<String>,
+    private_lists_stranger: Vec<String>,
+    private_lists_member: Vec<String>,
+    private_meta_anon: Vec<String>,
+    public_lists_anon: Vec<String>,
     members_after_remove: Vec<String>,
     group_has_bob_after_remove: bool,
     existed_before_delete: bool,
     exists_after_delete: bool,
+    deleted_is_flagged: bool,
+    deleted_reinsert: bool,
+    deleted_reinsert_row: bool,
+    other_is_flagged: bool,
+    deleted_address_old_inserted: bool,
+    deleted_address_new_inserted: bool,
     // --- DM wire contract §7: gift-wrap gate, self-wrap flag, NIP-40 ---
     wrap_anon_count: usize,
     wrap_recipient_count: usize,
@@ -68,6 +86,32 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
     let inserted_dup = db.store_event(&note_a).await.unwrap(); // same id → ignored
     let inserted_second = db.store_event(&note_b).await.unwrap();
 
+    // --- replaceable tie-break (audit 2026-10): equal created_at → lowest id
+    //     survives whichever arrives first; a d-less addressable collapses to "" ---
+    let (tie_lo, tie_hi) = {
+        let x = sign_event(alice, 10002, vec![], "x", 300);
+        let y = sign_event(alice, 10002, vec![], "y", 300);
+        if x.id < y.id { (x, y) } else { (y, x) }
+    };
+    db.store_event(&tie_hi).await.unwrap();
+    let tie_lower_replaces_higher = db.store_event(&tie_lo).await.unwrap();
+    let tie_higher_refused_after_lower = db.store_event(&tie_hi).await.unwrap();
+    let tie_survivor = db
+        .query_events(&filt(serde_json::json!({ "kinds": [10002], "authors": [alice.pubkey] })), None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect::<Vec<_>>();
+    let tie_survivor_is_lowest = tie_survivor == vec![tie_lo.id.clone()];
+    db.store_event(&sign_event(alice, 30023, vec![], "nod-1", 300)).await.unwrap();
+    db.store_event(&sign_event(alice, 30023, vec![], "nod-2", 301)).await.unwrap();
+    let dless_addressable_count = db
+        .query_events(&filt(serde_json::json!({ "kinds": [30023], "authors": [alice.pubkey] })), None)
+        .await
+        .unwrap()
+        .len();
+
     let by_id = db
         .query_events(&filt(serde_json::json!({ "ids": [note_a.id] })), None)
         .await
@@ -82,7 +126,12 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
         .unwrap();
 
     // --- NIP-29 group store ---
-    db.create_group("g1", "Group One", &alice.pubkey).await.unwrap();
+    let group_created = db.create_group("g1", "Group One", &alice.pubkey).await.unwrap();
+    // Security audit 2026-10: re-creating an existing id is a no-op on BOTH
+    // backends — the second caller gains no membership and no admin role.
+    let group_recreated = db.create_group("g1", "Hijack", &bob.pubkey).await.unwrap();
+    let recreate_made_bob_admin = db.is_admin("g1", &bob.pubkey).await.unwrap()
+        || db.group_has_member("g1", &bob.pubkey).await.unwrap();
     let admin_alice = db.is_admin("g1", &alice.pubkey).await.unwrap();
     let member_alice_native = db.group_has_member("g1", &alice.pubkey).await.unwrap();
     let members_after_create = sorted(db.get_members("g1").await.unwrap());
@@ -96,14 +145,48 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
     let members_of_alice_has_g1 = db.members_of(&alice.pubkey).await.unwrap().contains("g1");
     let any_private_default = db.any_private(&["g1".into()]).await.unwrap();
 
+    // --- relay-signed group lists: private groups' 39001/39002 are members-only
+    //     (security audit 2026-10); 39000 and public groups' lists stay public ---
+    {
+        use thewired_relay::nostr::nip29::metadata::publish_group_metadata;
+        use thewired_relay::relay_identity::RelayIdentity;
+        let identity = RelayIdentity::new(None, "test");
+        let (btx, _) = tokio::sync::broadcast::channel(16);
+        db.create_group("g-priv", "Private", &alice.pubkey).await.unwrap();
+        db.set_group_flags("g-priv", true, false).await.unwrap();
+        publish_group_metadata(db, &identity, &btx, "g-priv").await;
+        publish_group_metadata(db, &identity, &btx, "g1").await; // public, has alice + bob
+    }
+    let lists = |gid: &str| filt(serde_json::json!({ "kinds": [39001, 39002], "#d": [gid] }));
+    let kinds = |evs: Vec<thewired_relay::nostr::event::Event>| sorted(evs.iter().map(|e| e.kind.to_string()).collect());
+    let private_lists_anon = kinds(db.query_events(&lists("g-priv"), None).await.unwrap());
+    let private_lists_stranger = kinds(db.query_events(&lists("g-priv"), Some(&bob.pubkey)).await.unwrap());
+    let private_lists_member = kinds(db.query_events(&lists("g-priv"), Some(&alice.pubkey)).await.unwrap());
+    let private_meta_anon = kinds(
+        db.query_events(&filt(serde_json::json!({ "kinds": [39000], "#d": ["g-priv"] })), None)
+            .await
+            .unwrap(),
+    );
+    let public_lists_anon = kinds(db.query_events(&lists("g1"), None).await.unwrap());
+
     db.remove_member("g1", &bob.pubkey).await.unwrap();
     let members_after_remove = sorted(db.get_members("g1").await.unwrap());
     let group_has_bob_after_remove = db.group_has_member("g1", &bob.pubkey).await.unwrap();
 
-    // --- delete round-trip ---
+    // --- delete round-trip; a tombstoned event stays gone (audit 2026-10) ---
     let existed_before_delete = db.get_event_by_id(&note_a.id).await.unwrap().is_some();
+    db.record_deleted_event(&note_a.id, &alice.pubkey, &alice.pubkey).await.unwrap();
     db.delete_event(&note_a.id).await.unwrap();
     let exists_after_delete = db.get_event_by_id(&note_a.id).await.unwrap().is_some();
+    let deleted_is_flagged = db.is_deleted(&note_a).await.unwrap();
+    let deleted_reinsert = db.store_event(&note_a).await.unwrap();
+    let deleted_reinsert_row = db.get_event_by_id(&note_a.id).await.unwrap().is_some();
+    let other_is_flagged = db.is_deleted(&note_b).await.unwrap();
+    db.record_deleted_address(30023, &alice.pubkey, "p", 100, &alice.pubkey).await.unwrap();
+    let addr_old = sign_event(alice, 30023, vec![vec!["d".into(), "p".into()]], "old", 100);
+    let addr_new = sign_event(alice, 30023, vec![vec!["d".into(), "p".into()]], "new", 101);
+    let deleted_address_old_inserted = db.store_event(&addr_old).await.unwrap();
+    let deleted_address_new_inserted = db.store_event(&addr_new).await.unwrap();
 
     // --- gift wraps: served only to the authenticated recipient (or ingest) ---
     use thewired_relay::nostr::wrap_gate::ReadCtx;
@@ -140,6 +223,13 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
         by_id_count: by_id.len(),
         by_author_count: by_author.len(),
         by_kind_ids_newest_first: by_kind.iter().map(|e| e.id.clone()).collect(),
+        tie_lower_replaces_higher,
+        tie_higher_refused_after_lower,
+        tie_survivor_is_lowest,
+        dless_addressable_count,
+        group_created,
+        group_recreated,
+        recreate_made_bob_admin,
         admin_alice,
         member_alice_native,
         members_after_create,
@@ -148,10 +238,21 @@ async fn exercise(db: &Db, alice: &TestIdentity, bob: &TestIdentity) -> Obs {
         unified_member_alice,
         members_of_alice_has_g1,
         any_private_default,
+        private_lists_anon,
+        private_lists_stranger,
+        private_lists_member,
+        private_meta_anon,
+        public_lists_anon,
         members_after_remove,
         group_has_bob_after_remove,
         existed_before_delete,
         exists_after_delete,
+        deleted_is_flagged,
+        deleted_reinsert,
+        deleted_reinsert_row,
+        other_is_flagged,
+        deleted_address_old_inserted,
+        deleted_address_new_inserted,
         wrap_anon_count,
         wrap_recipient_count,
         wrap_stranger_count,
@@ -183,6 +284,13 @@ fn expected(alice: &TestIdentity, bob: &TestIdentity, note_a_id: &str, note_b_id
         by_author_count: 1,
         // newest-first: note_b (ts 101) before note_a (ts 100)
         by_kind_ids_newest_first: vec![note_b_id.to_string(), note_a_id.to_string()],
+        tie_lower_replaces_higher: true,
+        tie_higher_refused_after_lower: false,
+        tie_survivor_is_lowest: true,
+        dless_addressable_count: 1,
+        group_created: true,
+        group_recreated: false,
+        recreate_made_bob_admin: false,
         admin_alice: true,
         member_alice_native: true,
         members_after_create: vec![alice.pubkey.clone()],
@@ -191,10 +299,21 @@ fn expected(alice: &TestIdentity, bob: &TestIdentity, note_a_id: &str, note_b_id
         unified_member_alice: true,
         members_of_alice_has_g1: true,
         any_private_default: false,
+        private_lists_anon: vec![],
+        private_lists_stranger: vec![],
+        private_lists_member: vec!["39001".into(), "39002".into()],
+        private_meta_anon: vec!["39000".into()],
+        public_lists_anon: vec!["39001".into(), "39002".into()],
         members_after_remove: vec![alice.pubkey.clone()],
         group_has_bob_after_remove: false,
         existed_before_delete: true,
         exists_after_delete: false,
+        deleted_is_flagged: true,
+        deleted_reinsert: false,
+        deleted_reinsert_row: false,
+        other_is_flagged: false,
+        deleted_address_old_inserted: false,
+        deleted_address_new_inserted: true,
         wrap_anon_count: 0,
         wrap_recipient_count: 1,
         wrap_stranger_count: 0,
