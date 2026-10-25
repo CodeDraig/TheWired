@@ -264,9 +264,9 @@ fn load_or_create_tunnel_secret() -> Result<String, String> {
             return Ok(existing.trim().to_string());
         }
     }
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let secret = BASE64.encode(bytes);
     crate::keystore::keystore_set_secret(TUNNEL_SECRET_ID.to_string(), secret.clone())
         .map_err(|e| format!("store tunnel secret: {e}"))?;

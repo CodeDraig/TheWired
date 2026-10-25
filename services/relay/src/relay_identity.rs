@@ -1,4 +1,5 @@
-use secp256k1::{Secp256k1, SecretKey, Keypair, XOnlyPublicKey};
+use rand::Rng;
+use secp256k1::{schnorr, Keypair, SecretKey};
 use sha2::{Digest, Sha256};
 
 use crate::nostr::event::Event;
@@ -14,31 +15,29 @@ impl RelayIdentity {
     /// In production (env == "production"), panics if no key is provided.
     /// In development, generates a random ephemeral key (without logging the secret).
     pub fn new(secret_key_hex: Option<String>, env: &str) -> Self {
-        let secp = Secp256k1::new();
-
         let secret_key = if let Some(hex_str) = secret_key_hex {
-            let bytes = hex::decode(hex_str.trim())
-                .expect("RELAY_SECRET_KEY must be valid hex");
-            SecretKey::from_slice(&bytes)
+            let bytes: [u8; 32] = hex::decode(hex_str.trim())
+                .expect("RELAY_SECRET_KEY must be valid hex")
+                .try_into()
+                .expect("RELAY_SECRET_KEY must be a valid 32-byte secret key");
+            SecretKey::from_secret_bytes(bytes)
                 .expect("RELAY_SECRET_KEY must be a valid 32-byte secret key")
         } else if env == "production" {
             panic!(
                 "RELAY_SECRET_KEY is required in production. Generate one with: openssl rand -hex 32"
             );
         } else {
-            use rand::RngCore;
-            let mut rng = rand::thread_rng();
             let mut key_bytes = [0u8; 32];
-            rng.fill_bytes(&mut key_bytes);
-            let sk = SecretKey::from_slice(&key_bytes)
+            rand::rng().fill_bytes(&mut key_bytes);
+            let sk = SecretKey::from_secret_bytes(key_bytes)
                 .expect("random 32 bytes should be a valid secret key");
             tracing::warn!("No RELAY_SECRET_KEY set. Generated ephemeral relay key (not suitable for production).");
             sk
         };
 
-        let keypair = Keypair::from_secret_key(&secp, &secret_key);
-        let (xonly, _parity) = XOnlyPublicKey::from_keypair(&keypair);
-        let pubkey = hex::encode(xonly.serialize());
+        let keypair = Keypair::from_secret_key(&secret_key);
+        let (xonly, _parity) = keypair.x_only_public_key();
+        let pubkey = hex::encode(xonly.to_byte_array());
 
         tracing::info!("Relay identity pubkey: {pubkey}");
 
@@ -55,7 +54,6 @@ impl RelayIdentity {
         tags: Vec<Vec<String>>,
         content: &str,
     ) -> Event {
-        let secp = Secp256k1::new();
         let created_at = chrono::Utc::now().timestamp();
 
         // Build unsigned event for ID computation
@@ -76,16 +74,12 @@ impl RelayIdentity {
         let id_bytes = hasher.finalize();
         let id = hex::encode(&id_bytes);
 
-        // Sign with schnorr (secp256k1 v0.30 takes &[u8] for message, &[u8; 32] for aux_rand)
-        let keypair = Keypair::from_secret_key(&secp, &self.secret_key);
+        // Sign with BIP-340 schnorr over the 32-byte id, with fresh aux randomness
+        let keypair = Keypair::from_secret_key(&self.secret_key);
         let mut aux_rand = [0u8; 32];
-        {
-            use rand::RngCore;
-            let mut rng = rand::thread_rng();
-            rng.fill_bytes(&mut aux_rand);
-        }
-        let sig = secp.sign_schnorr_with_aux_rand(&id_bytes, &keypair, &aux_rand);
-        let sig_hex = hex::encode(sig.as_ref());
+        rand::rng().fill_bytes(&mut aux_rand);
+        let sig = schnorr::sign_with_aux_rand(&id_bytes, &keypair, &aux_rand);
+        let sig_hex = hex::encode(sig.to_byte_array());
 
         Event {
             id,

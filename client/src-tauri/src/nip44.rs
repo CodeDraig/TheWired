@@ -2,8 +2,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
-use rand::RngCore;
+use hmac::{Hmac, KeyInit, Mac};
+use rand::TryRng;
 use secp256k1::{PublicKey, SecretKey};
 use sha2::Sha256;
 
@@ -164,7 +164,9 @@ pub fn encrypt(plaintext: &str, conversation_key: &[u8; 32]) -> Result<String, S
 
     // Generate random 32-byte nonce
     let mut nonce = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|e| format!("OS RNG failed: {e}"))?;
 
     encrypt_with_nonce(plaintext, conversation_key, &nonce)
 }
@@ -180,10 +182,7 @@ fn encrypt_with_nonce(plaintext: &str, conversation_key: &[u8; 32], nonce: &[u8;
 
     // Encrypt with ChaCha20
     let mut ciphertext = padded;
-    let mut cipher = ChaCha20::new(
-        chacha_key.as_ref().into(),
-        chacha_nonce.as_ref().into(),
-    );
+    let mut cipher = ChaCha20::new(&chacha_key.into(), &chacha_nonce.into());
     cipher.apply_keystream(&mut ciphertext);
 
     // Compute HMAC with AAD (nonce)
@@ -246,10 +245,7 @@ pub fn decrypt(payload: &str, conversation_key: &[u8; 32]) -> Result<String, Str
 
     // Decrypt with ChaCha20
     let mut plaintext_padded = ciphertext.to_vec();
-    let mut cipher = ChaCha20::new(
-        chacha_key.as_ref().into(),
-        chacha_nonce.as_ref().into(),
-    );
+    let mut cipher = ChaCha20::new(&chacha_key.into(), &chacha_nonce.into());
     cipher.apply_keystream(&mut plaintext_padded);
 
     // Unpad
@@ -332,15 +328,14 @@ mod tests {
     #[test]
     fn test_conversation_key_from_test_vector() {
         // NIP-44 test vector: sec1=0x01, sec2=0x02
-        let sec1_bytes = hex::decode("0000000000000000000000000000000000000000000000000000000000000001").unwrap();
-        let sec1 = SecretKey::from_slice(&sec1_bytes).unwrap();
+        let sec1_bytes: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001").unwrap().try_into().unwrap();
+        let sec1 = SecretKey::from_secret_bytes(sec1_bytes).unwrap();
 
-        let sec2_bytes = hex::decode("0000000000000000000000000000000000000000000000000000000000000002").unwrap();
-        let sec2 = SecretKey::from_slice(&sec2_bytes).unwrap();
+        let sec2_bytes: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000002").unwrap().try_into().unwrap();
+        let sec2 = SecretKey::from_secret_bytes(sec2_bytes).unwrap();
 
         // Derive pub2 from sec2
-        let secp = secp256k1::Secp256k1::new();
-        let pub2 = sec2.public_key(&secp);
+        let pub2 = sec2.public_key();
 
         let conv_key = get_conversation_key(&sec1, &pub2).unwrap();
         assert_eq!(
@@ -349,22 +344,21 @@ mod tests {
         );
 
         // Verify symmetry: conv(sec2, pub1) == conv(sec1, pub2)
-        let pub1 = sec1.public_key(&secp);
+        let pub1 = sec1.public_key();
         let conv_key2 = get_conversation_key(&sec2, &pub1).unwrap();
         assert_eq!(conv_key, conv_key2);
     }
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
-        let sec1_bytes = hex::decode("0000000000000000000000000000000000000000000000000000000000000001").unwrap();
-        let sec1 = SecretKey::from_slice(&sec1_bytes).unwrap();
+        let sec1_bytes: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001").unwrap().try_into().unwrap();
+        let sec1 = SecretKey::from_secret_bytes(sec1_bytes).unwrap();
 
-        let sec2_bytes = hex::decode("0000000000000000000000000000000000000000000000000000000000000002").unwrap();
-        let sec2 = SecretKey::from_slice(&sec2_bytes).unwrap();
+        let sec2_bytes: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000002").unwrap().try_into().unwrap();
+        let sec2 = SecretKey::from_secret_bytes(sec2_bytes).unwrap();
 
-        let secp = secp256k1::Secp256k1::new();
-        let pub2 = sec2.public_key(&secp);
-        let pub1 = sec1.public_key(&secp);
+        let pub2 = sec2.public_key();
+        let pub1 = sec1.public_key();
 
         let conv_key_sender = get_conversation_key(&sec1, &pub2).unwrap();
         let conv_key_recipient = get_conversation_key(&sec2, &pub1).unwrap();
@@ -379,14 +373,13 @@ mod tests {
     #[test]
     fn test_known_payload_decryption() {
         // NIP-44 test vector
-        let sec1_bytes = hex::decode("0000000000000000000000000000000000000000000000000000000000000001").unwrap();
-        let sec1 = SecretKey::from_slice(&sec1_bytes).unwrap();
+        let sec1_bytes: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001").unwrap().try_into().unwrap();
+        let sec1 = SecretKey::from_secret_bytes(sec1_bytes).unwrap();
 
-        let sec2_bytes = hex::decode("0000000000000000000000000000000000000000000000000000000000000002").unwrap();
-        let sec2 = SecretKey::from_slice(&sec2_bytes).unwrap();
+        let sec2_bytes: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000002").unwrap().try_into().unwrap();
+        let sec2 = SecretKey::from_secret_bytes(sec2_bytes).unwrap();
 
-        let secp = secp256k1::Secp256k1::new();
-        let pub2 = sec2.public_key(&secp);
+        let pub2 = sec2.public_key();
 
         let conv_key = get_conversation_key(&sec1, &pub2).unwrap();
 
@@ -399,14 +392,13 @@ mod tests {
     #[test]
     fn test_encrypt_with_known_nonce() {
         // Verify encryption produces the exact test vector payload
-        let sec1_bytes = hex::decode("0000000000000000000000000000000000000000000000000000000000000001").unwrap();
-        let sec1 = SecretKey::from_slice(&sec1_bytes).unwrap();
+        let sec1_bytes: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001").unwrap().try_into().unwrap();
+        let sec1 = SecretKey::from_secret_bytes(sec1_bytes).unwrap();
 
-        let sec2_bytes = hex::decode("0000000000000000000000000000000000000000000000000000000000000002").unwrap();
-        let sec2 = SecretKey::from_slice(&sec2_bytes).unwrap();
+        let sec2_bytes: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000002").unwrap().try_into().unwrap();
+        let sec2 = SecretKey::from_secret_bytes(sec2_bytes).unwrap();
 
-        let secp = secp256k1::Secp256k1::new();
-        let pub2 = sec2.public_key(&secp);
+        let pub2 = sec2.public_key();
 
         let conv_key = get_conversation_key(&sec1, &pub2).unwrap();
 
@@ -424,11 +416,10 @@ mod tests {
     #[test]
     fn test_xonly_to_pubkey() {
         // Derive a known pubkey from sec2=0x02
-        let sec2_bytes = hex::decode("0000000000000000000000000000000000000000000000000000000000000002").unwrap();
-        let sec2 = SecretKey::from_slice(&sec2_bytes).unwrap();
-        let secp = secp256k1::Secp256k1::new();
-        let (xonly, _) = sec2.x_only_public_key(&secp);
-        let xonly_hex = hex::encode(xonly.serialize());
+        let sec2_bytes: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000002").unwrap().try_into().unwrap();
+        let sec2 = SecretKey::from_secret_bytes(sec2_bytes).unwrap();
+        let (xonly, _) = sec2.x_only_public_key();
+        let xonly_hex = hex::encode(xonly.to_byte_array());
 
         let recovered = xonly_to_pubkey(&xonly_hex).unwrap();
         // The recovered full pubkey should be valid

@@ -1,9 +1,6 @@
-use rand::Rng;
-
 /// Generate a NIP-42 AUTH challenge
 pub fn generate_challenge() -> String {
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 32] = rng.gen();
+    let bytes: [u8; 32] = rand::random();
     hex::encode(bytes)
 }
 
@@ -156,18 +153,17 @@ mod tests {
 
     /// A real schnorr-signed kind:22242 naming `relay` and `challenge`.
     fn signed_auth(relay: &str, challenge: &str, created_at: i64) -> crate::nostr::event::Event {
-        use secp256k1::{Keypair, Secp256k1, SecretKey};
+        use secp256k1::{Keypair, SecretKey};
         use sha2::{Digest, Sha256};
-        let secp = Secp256k1::new();
-        let keypair = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[0x42; 32]).unwrap());
-        let pubkey = hex::encode(keypair.x_only_public_key().0.serialize());
+        let keypair = Keypair::from_secret_key(&SecretKey::from_secret_bytes([0x42; 32]).unwrap());
+        let pubkey = hex::encode(keypair.x_only_public_key().0.to_byte_array());
         let tags = vec![
             vec!["relay".to_string(), relay.to_string()],
             vec!["challenge".to_string(), challenge.to_string()],
         ];
         let canonical = serde_json::to_string(&serde_json::json!([0, &pubkey, created_at, 22242, &tags, ""])).unwrap();
         let hash = Sha256::digest(canonical.as_bytes());
-        let sig = secp.sign_schnorr_no_aux_rand(&hash, &keypair);
+        let sig = secp256k1::schnorr::sign_no_aux_rand(&hash, &keypair);
         crate::nostr::event::Event {
             id: hex::encode(hash),
             pubkey,
