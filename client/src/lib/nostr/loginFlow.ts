@@ -91,7 +91,7 @@ import { signAndPublish } from "./publish";
 import { buildDMRelayListEvent } from "./eventBuilder";
 import { profileCache } from "./profileCache";
 import { parseProfile } from "../../features/profile/profileParser";
-import { loadDMState, startDMPersistence, cancelPendingSave as cancelDMSave, flushPendingSave as flushDMSave } from "../../features/dm/dmPersistence";
+import { loadDMState, startDMPersistence, cancelPendingSave as cancelDMSave, flushPendingSave as flushDMSave, wireSelfWrapOutboxAcks } from "../../features/dm/dmPersistence";
 import { loadDMReadState, startDMReadStateSync, cancelPendingSave as cancelDMReadStateSave, flushPendingSave as flushDMReadStateSave } from "../../features/dm/dmReadState";
 import { startGiftWrapReconciliation } from "../../features/dm/dmSync";
 import { loadFollowerState, startFollowerPersistence, cancelPendingSave as cancelFollowerSave, flushPendingSave as flushFollowerSave } from "./followerPersistence";
@@ -294,6 +294,8 @@ function wireRelayStatusBridge(): void {
   // On any relay reconnect, re-publish un-acked outbox events (a relay that
   // dropped mid-publish never sent its OK). Idempotent + in-flight-guarded (#34).
   relayManager.onReconnect(() => void publishOutbox.replay());
+  // A replayed DM self-wrap's OK also clears its message's sync warning.
+  wireSelfWrapOutboxAcks();
 }
 
 /** Ingest the logged-in user's own kind:0 from any subscription: parse it (which

@@ -751,6 +751,22 @@ export const dmSlice = createSlice({
       state.mutationCounter += 1;
     },
 
+    /** The publish outbox delivered a self-wrap it was holding (later this
+     *  session, or replayed after a relaunch): clear that message's sync
+     *  warning, in whichever conversation it is. */
+    clearDMSyncWarning(state, action: PayloadAction<string>) {
+      const wrapId = action.payload;
+      for (const msgs of Object.values(state.messages)) {
+        const msg = msgs.find((m) => m.wrapId === wrapId);
+        if (!msg) continue;
+        if (msg.syncWarning) {
+          delete msg.syncWarning;
+          state.mutationCounter += 1;
+        }
+        return;
+      }
+    },
+
     /** Delete messages whose `expiration` has passed (disappearing messages, NIP-40). */
     pruneExpiredDMs(state, action: PayloadAction<number>) {
       const now = action.payload;
@@ -941,6 +957,7 @@ export const {
   setConversationFlag,
   setConversationExpireAfter,
   markDMSyncWarning,
+  clearDMSyncWarning,
   pruneExpiredDMs,
   upsertRoom,
 } = dmSlice.actions;

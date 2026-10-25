@@ -263,7 +263,8 @@ async function publishRumor(
  *    relay → `pushMissed` (the recipient gets no push for it).
  *  - A self-wrap the platform relay did not accept raises the sync warning and
  *    goes into the publish outbox addressed to the platform relay; the outbox
- *    re-publishes it on reconnect and next launch, and its OK clears the warning.
+ *    re-publishes it on reconnect and next launch, and its OK clears the
+ *    warning (`wireSelfWrapOutboxAcks`, also after a relaunch).
  */
 function trackSend(partnerPubkey: string, r: PublishResult): void {
   void r.accepted?.then((relay) => {
@@ -275,11 +276,7 @@ function trackSend(partnerPubkey: string, r: PublishResult): void {
   void r.selfAccepted?.then((relay) => {
     if (relay !== null) return;
     store.dispatch(markDMSyncWarning({ partnerPubkey, wrapId: r.selfWrapId, warning: true }));
-    if (r.selfWrap) {
-      publishOutbox.record(r.selfWrap.event, [APP_RELAY_URL], Date.now(), () => {
-        store.dispatch(markDMSyncWarning({ partnerPubkey, wrapId: r.selfWrapId, warning: false }));
-      });
-    }
+    if (r.selfWrap) publishOutbox.record(r.selfWrap.event, [APP_RELAY_URL]);
   });
 }
 

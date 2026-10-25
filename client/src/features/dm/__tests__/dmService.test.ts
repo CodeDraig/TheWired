@@ -65,7 +65,7 @@ vi.mock("@/lib/nostr/dmRelayList", () => ({
   selfWrapTargets: () => ["wss://own", APP],
 }));
 vi.mock("@/lib/nostr/publish", () => ({ signAndPublish: vi.fn(async () => {}) }));
-/** publishOutbox.record(event, targets, now, onAck) calls. */
+/** publishOutbox.record(event, targets) calls. */
 const outboxSpy = vi.fn();
 vi.mock("@/lib/nostr/publishOutbox", () => ({ publishOutbox: { record: (...a: unknown[]) => outboxSpy(...a) } }));
 
@@ -299,17 +299,17 @@ describe("dmService — which relays count as sent", () => {
     expect(store.getState().dm.messages[PEER].find((m) => m.wrapId === selfWrapId)?.syncWarning).toBeUndefined();
   });
 
-  it("a self-wrap the platform relay refused goes to the outbox, addressed to it; its OK clears the warning", async () => {
+  // Its OK clearing the warning (this session or after a relaunch) is
+  // dmSelfWrapOutboxAck.test.ts.
+  it("a self-wrap the platform relay refused goes to the outbox, addressed to it", async () => {
     selfAnswer = async () => null;
     await sendDM(PEER, "one");
     await settle();
     expect(row().syncWarning).toBe(true);
     expect(outboxSpy).toHaveBeenCalledTimes(1);
-    const [event, targets, , onAck] = outboxSpy.mock.calls[0] as [{ id: string }, string[], number, () => void];
+    const [event, targets] = outboxSpy.mock.calls[0] as [{ id: string }, string[]];
     expect(event.id).toBe(selfWrapId);
     expect(targets).toEqual([APP]);
-    onAck();
-    expect(row().syncWarning).toBeUndefined();
   });
 
   it("sent via an inbox relay while the platform relay refused marks the row pushMissed", async () => {

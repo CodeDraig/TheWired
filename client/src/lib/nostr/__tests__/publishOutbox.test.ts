@@ -84,6 +84,30 @@ describe("publishOutbox", () => {
     expect(publish).toHaveBeenCalledTimes(1);
   });
 
+  it("the ack handler for a row's kind runs once it clears, recorded or replayed; other kinds do not", async () => {
+    const acked = vi.fn();
+    publishOutbox.setAckHandler(1059, acked);
+
+    publishOutbox.record(ev({ id: "w-live", kind: 1059 }), ["wss://app"]);
+    publishOutbox.handleOK("w-live", true, "wss://elsewhere"); // not a target: row stays
+    expect(acked).not.toHaveBeenCalled();
+    publishOutbox.handleOK("w-live", true, "wss://app");
+    expect(acked).toHaveBeenCalledWith("w-live");
+
+    // Restored from IndexedDB on a later launch: nothing of the original session survives.
+    outboxRows = [{ id: "w-old", event: ev({ id: "w-old", kind: 1059 }), targetRelays: ["wss://app"], queuedAt: 1_000_000 }];
+    await publishOutbox.replay(1_000_000 + 1000);
+    publishOutbox.handleOK("w-old", true, "wss://app");
+    expect(acked).toHaveBeenLastCalledWith("w-old");
+
+    publishOutbox.record(ev({ id: "note", kind: 1 }));
+    publishOutbox.handleOK("note", true, "wss://app");
+    expect(acked).toHaveBeenCalledTimes(2);
+
+    publishOutbox.handleOK("w-old", true, "wss://app"); // already cleared: no second ack
+    expect(acked).toHaveBeenCalledTimes(2);
+  });
+
   it("guards against overlapping replays", async () => {
     let resolveGet: (v: typeof outboxRows) => void = () => {};
     getAllOutbox.mockImplementationOnce(() => new Promise((r) => { resolveGet = r; }));
