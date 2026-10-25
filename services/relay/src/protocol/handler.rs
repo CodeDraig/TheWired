@@ -657,7 +657,9 @@ async fn handle_req(
     // client as CLOSED — never as an empty EOSE. Both clients stamp their
     // since-watermark on EOSE, so a silent empty answer would put the whole
     // undelivered backlog outside their next catch-up window. The sub is not
-    // registered either: the client was told it is closed and will re-REQ.
+    // registered either, and an earlier one under the same id (this REQ was
+    // meant to replace it) stops too: the client was told it is closed and
+    // will re-REQ.
     let merged = match query_merged(state, &filters, &ctx).await {
         Ok(events) => events,
         Err(e) => {
@@ -667,6 +669,7 @@ async fn handle_req(
                 error = %e,
                 "REQ query failed; CLOSED instead of EOSE"
             );
+            subscriptions.lock().await.remove(&sub_id);
             return vec![closed_frame(&sub_id, "error: query failed")];
         }
     };
