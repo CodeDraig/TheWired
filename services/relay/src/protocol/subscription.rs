@@ -21,6 +21,12 @@ pub struct SubscriptionManager {
     neg_sessions: HashMap<String, negentropy::NegentropyStorageVector>,
 }
 
+impl Default for SubscriptionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SubscriptionManager {
     pub fn new() -> Self {
         Self {
@@ -71,9 +77,23 @@ impl SubscriptionManager {
             .collect()
     }
 
+    /// Every open subscription with its filters — cloned, so a caller can
+    /// release the lock before running stored queries (lag resync).
+    pub fn snapshot(&self) -> Vec<(String, Vec<Filter>)> {
+        self.subscriptions
+            .iter()
+            .map(|(id, filters)| (id.clone(), filters.clone()))
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.subscriptions.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.subscriptions.is_empty()
     }
 }
 
@@ -159,8 +179,7 @@ mod tests {
             subs.add(format!("sub_{i}"), empty_filter()).unwrap();
         }
         // Re-add an existing id with a different filter — must succeed even at cap
-        let mut updated = Filter::default();
-        updated.kinds = vec![9];
+        let updated = Filter { kinds: vec![9], ..Default::default() };
         assert!(subs.add("sub_0".to_string(), vec![updated]).is_ok());
         assert_eq!(subs.len(), MAX_SUBSCRIPTIONS);
     }

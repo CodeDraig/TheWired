@@ -30,6 +30,11 @@ pub struct Config {
     pub rate_max_msgs: u32,
     /// Window length in seconds. `RELAY_RATE_WINDOW_SECS` (10).
     pub rate_window_secs: u64,
+    /// Counted frames allowed during the FIRST window after connect, when the
+    /// desktop client re-opens every subscription at once (a cold start is
+    /// more than 100 REQs plus NEG chunk REQ/CLOSE pairs).
+    /// `RELAY_RATE_COLD_START_MAX_MSGS` (900); never below `rate_max_msgs`.
+    pub rate_cold_start_max_msgs: u32,
     /// Concurrent connections per client IP. `RELAY_MAX_CONNS_PER_IP` (32); 0 = off.
     pub max_conns_per_ip: usize,
     /// Trust `X-Forwarded-For` for the client IP (set behind Caddy).
@@ -52,6 +57,17 @@ pub struct Config {
     /// linger — and keep counting toward `max_conns_per_ip` — until the TCP
     /// stack gives up. `RELAY_WS_IDLE_TIMEOUT_SECS` (90); 0 = never drop.
     pub ws_idle_timeout_secs: u64,
+
+    // ── Live fan-out ──
+    /// Capacity of the global broadcast channel every connection reads live
+    /// events from. A connection that falls further behind than this lags
+    /// (`RecvError::Lagged`) and is resynced from storage.
+    /// `RELAY_BROADCAST_CAPACITY` (4096).
+    pub broadcast_capacity: usize,
+    /// A connection that lags again within this many seconds of a resync is
+    /// closed (1013) instead of resynced a second time.
+    /// `RELAY_RESYNC_COOLDOWN_SECS` (10).
+    pub resync_cooldown_secs: u64,
 }
 
 impl Default for Config {
@@ -69,11 +85,14 @@ impl Default for Config {
             report_read_gate: true,
             rate_max_msgs: 300,
             rate_window_secs: 10,
+            rate_cold_start_max_msgs: 900,
             max_conns_per_ip: 32,
             trust_proxy: false,
             auth_relay_urls: Vec::new(),
             ws_ping_interval_secs: 30,
             ws_idle_timeout_secs: 90,
+            broadcast_capacity: 4096,
+            resync_cooldown_secs: 10,
         }
     }
 }
@@ -122,6 +141,7 @@ impl Config {
             ),
             rate_max_msgs: env_or("RELAY_RATE_MAX_MSGS", d.rate_max_msgs),
             rate_window_secs: env_or("RELAY_RATE_WINDOW_SECS", d.rate_window_secs),
+            rate_cold_start_max_msgs: env_or("RELAY_RATE_COLD_START_MAX_MSGS", d.rate_cold_start_max_msgs),
             max_conns_per_ip: env_or("RELAY_MAX_CONNS_PER_IP", d.max_conns_per_ip),
             trust_proxy: env_bool("RELAY_TRUST_PROXY"),
             auth_relay_urls: std::env::var("RELAY_AUTH_RELAY_URLS")
@@ -133,6 +153,8 @@ impl Config {
                 .collect(),
             ws_ping_interval_secs: env_or("RELAY_WS_PING_SECS", d.ws_ping_interval_secs),
             ws_idle_timeout_secs: env_or("RELAY_WS_IDLE_TIMEOUT_SECS", d.ws_idle_timeout_secs),
+            broadcast_capacity: env_or("RELAY_BROADCAST_CAPACITY", d.broadcast_capacity).max(1),
+            resync_cooldown_secs: env_or("RELAY_RESYNC_COOLDOWN_SECS", d.resync_cooldown_secs),
         }
     }
 

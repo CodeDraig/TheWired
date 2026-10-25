@@ -72,7 +72,7 @@ impl RelayIdentity {
         let mut hasher = Sha256::new();
         hasher.update(serialized.as_bytes());
         let id_bytes = hasher.finalize();
-        let id = hex::encode(&id_bytes);
+        let id = hex::encode(id_bytes);
 
         // Sign with BIP-340 schnorr over the 32-byte id, with fresh aux randomness
         let keypair = Keypair::from_secret_key(&self.secret_key);

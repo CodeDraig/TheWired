@@ -16,12 +16,12 @@ const MAX_QUERY_LIMIT: i64 = 500;
 
 /// Replaceable event kinds: only one event per pubkey+kind (NIP-01)
 fn is_replaceable(kind: i32) -> bool {
-    kind == 0 || kind == 3 || (kind >= 10000 && kind < 20000)
+    kind == 0 || kind == 3 || (10000..20000).contains(&kind)
 }
 
 /// Addressable event kinds: only one event per pubkey+kind+d_tag (NIP-01)
 fn is_addressable(kind: i32) -> bool {
-    kind >= 30000 && kind < 40000
+    (30000..40000).contains(&kind)
 }
 
 /// Store an event in the database.
@@ -220,6 +220,14 @@ fn build_conditions(filter: &Filter, ctx: &ReadCtx<'_>) -> (Vec<String>, Vec<Bin
         param_counter += 1;
         conditions.push(format!("created_at <= ${param_counter}"));
         binds.push(BindValue::Int64(until));
+    }
+
+    // first_seen_since (relay-internal, lag resync): rows stored at or after
+    // this server time, whatever their `created_at`.
+    if let Some(first_seen_since) = filter.first_seen_since {
+        param_counter += 1;
+        conditions.push(format!("first_seen >= to_timestamp(${param_counter})"));
+        binds.push(BindValue::Int64(first_seen_since));
     }
 
     // h_tags: array overlap against the indexed `h_tags` column, so a `#h`

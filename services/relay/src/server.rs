@@ -7,7 +7,7 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -45,6 +45,23 @@ pub struct AppState {
     pub owner_pubkey: Option<String>,
     /// Live connections per client IP (per-IP cap, `RELAY_MAX_CONNS_PER_IP`).
     pub ip_conns: std::sync::Mutex<HashMap<IpAddr, usize>>,
+    /// Last connect time per client IP, for the rate limiter's cold-start
+    /// allowance: granted only to the first connection an IP opens within a
+    /// rate window, so a reconnect loop cannot mint a fresh allowance per
+    /// socket. Entries older than a window are pruned on every connect.
+    pub ip_last_connect: std::sync::Mutex<HashMap<IpAddr, std::time::Instant>>,
+    /// Counters surfaced in logs and `/health`: connections whose broadcast
+    /// receiver lagged, live events skipped by lag (then resynced from
+    /// storage), and frames refused by the per-connection rate limiter.
+    pub metrics: Metrics,
+}
+
+/// Process-wide counters for the paths that used to drop silently.
+#[derive(Default)]
+pub struct Metrics {
+    pub broadcast_lagged_connections: AtomicU64,
+    pub broadcast_skipped_events: AtomicU64,
+    pub rate_limited_frames: AtomicU64,
 }
 
 /// NIP-40 sweep cadence.
@@ -79,7 +96,7 @@ pub fn spawn_sweeper(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
 pub async fn run(config: Config, pool: Db) -> anyhow::Result<()> {
     let port = config.port;
 
-    let (broadcast_tx, _) = broadcast::channel::<Event>(4096);
+    let (broadcast_tx, _) = broadcast::channel::<Event>(config.broadcast_capacity.max(1));
 
     let relay_identity = RelayIdentity::new(config.relay_secret_key.clone(), &config.rust_env);
 
@@ -128,6 +145,8 @@ pub async fn run(config: Config, pool: Db) -> anyhow::Result<()> {
         hosted_only: false,
         owner_pubkey: None,
         ip_conns: std::sync::Mutex::new(HashMap::new()),
+        ip_last_connect: std::sync::Mutex::new(HashMap::new()),
+        metrics: Metrics::default(),
     });
 
     let _sweeper = spawn_sweeper(state.clone());
@@ -154,6 +173,7 @@ fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(root_handler))
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .layer(cors)
         .with_state(state)
 }
@@ -247,7 +267,7 @@ pub async fn run_embedded(
     owner_pubkey: Option<String>,
     bind_lan: bool,
 ) -> anyhow::Result<EmbeddedRelay> {
-    let (broadcast_tx, _) = broadcast::channel::<Event>(4096);
+    let (broadcast_tx, _) = broadcast::channel::<Event>(Config::default().broadcast_capacity);
     let relay_identity = RelayIdentity::new(relay_secret_key, "development");
     let pubkey = relay_identity.pubkey.clone();
 
@@ -305,6 +325,8 @@ pub async fn run_embedded(
         hosted_only: true,
         owner_pubkey,
         ip_conns: std::sync::Mutex::new(HashMap::new()),
+        ip_last_connect: std::sync::Mutex::new(HashMap::new()),
+        metrics: Metrics::default(),
     });
 
     let sweeper = spawn_sweeper(state.clone());
@@ -538,4 +560,18 @@ fn nip11_response(state: &AppState) -> impl IntoResponse {
 
 async fn health() -> &'static str {
     "OK"
+}
+
+/// Plain-text counters (one `name value` per line) for the formerly-silent
+/// paths, so an operator can see whether live fan-out is lagging or clients
+/// are hitting the rate limiter without grepping logs.
+async fn metrics(State(state): State<Arc<AppState>>) -> String {
+    let m = &state.metrics;
+    format!(
+        "relay_connections_active {}\nrelay_broadcast_lagged_connections_total {}\nrelay_broadcast_skipped_events_total {}\nrelay_rate_limited_frames_total {}\n",
+        state.active_connections.load(Ordering::Relaxed),
+        m.broadcast_lagged_connections.load(Ordering::Relaxed),
+        m.broadcast_skipped_events.load(Ordering::Relaxed),
+        m.rate_limited_frames.load(Ordering::Relaxed),
+    )
 }

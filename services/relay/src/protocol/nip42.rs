@@ -103,7 +103,7 @@ pub fn verify_auth_event(
     let has_challenge = event
         .tags
         .iter()
-        .any(|t| t.get(0).map(|s| s.as_str()) == Some("challenge") && t.get(1).map(|s| s.as_str()) == Some(challenge));
+        .any(|t| t.first().map(|s| s.as_str()) == Some("challenge") && t.get(1).map(|s| s.as_str()) == Some(challenge));
 
     has_relay && has_challenge && crate::nostr::verify::verify_event(event)
 }

@@ -653,21 +653,26 @@ async fn handle_req(
     }
     let ctx = read_ctx(state, authed_pubkey);
 
-    // Query stored events for each filter, merge with id-dedup, newest-first.
-    let mut seen = HashSet::new();
-    let mut merged: Vec<crate::nostr::event::Event> = Vec::new();
-    for filter in &filters {
-        let events = state.pool
-            .query_events_ctx(filter, &ctx)
-            .await
-            .unwrap_or_default();
-        for e in events {
-            if seen.insert(e.id.clone()) {
-                merged.push(e);
-            }
+    // A store that cannot answer (pool exhausted, query error) is told to the
+    // client as CLOSED — never as an empty EOSE. Both clients stamp their
+    // since-watermark on EOSE, so a silent empty answer would put the whole
+    // undelivered backlog outside their next catch-up window. The sub is not
+    // registered either, and an earlier one under the same id (this REQ was
+    // meant to replace it) stops too: the client was told it is closed and
+    // will re-REQ.
+    let merged = match query_merged(state, &filters, &ctx).await {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::warn!(
+                sub_id,
+                filters = filters.len(),
+                error = %e,
+                "REQ query failed; CLOSED instead of EOSE"
+            );
+            subscriptions.lock().await.remove(&sub_id);
+            return vec![closed_frame(&sub_id, "error: query failed")];
         }
-    }
-    merged.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    };
 
     tracing::debug!(sub_id, filters = filters.len(), results = merged.len(), "REQ");
 
@@ -692,6 +697,87 @@ async fn handle_req(
 
     responses.push(format!(r#"["EOSE","{}"]"#, sub_id));
     responses
+}
+
+/// `["CLOSED", <subId>, <reason>]`, JSON-escaped (a sub id is client text).
+pub fn closed_frame(sub_id: &str, reason: &str) -> String {
+    serde_json::json!(["CLOSED", sub_id, reason]).to_string()
+}
+
+/// Run the stored query for every filter of a subscription and merge the
+/// results by id, newest first. Fails on the FIRST filter whose query fails:
+/// a partial answer followed by EOSE would read as "backlog delivered".
+async fn query_merged(
+    state: &Arc<AppState>,
+    filters: &[Filter],
+    ctx: &ReadCtx<'_>,
+) -> anyhow::Result<Vec<Event>> {
+    let mut seen = HashSet::new();
+    let mut merged: Vec<Event> = Vec::new();
+    for filter in filters {
+        for e in state.pool.query_events_ctx(filter, ctx).await? {
+            if seen.insert(e.id.clone()) {
+                merged.push(e);
+            }
+        }
+    }
+    merged.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(merged)
+}
+
+/// Clock-skew margin (seconds) subtracted from the lag window start: an event
+/// is stored (its `first_seen` stamped) a moment before it is broadcast.
+const RESYNC_MARGIN_SECS: i64 = 5;
+
+/// The resync shape of one client filter: the same filter restricted to rows
+/// the relay first stored since `missed_since` (server time, so a NIP-59
+/// backdated `created_at` cannot escape it). For a filter that can match kind
+/// 1059 the client's `since` is dropped, mirroring the live rule
+/// (`Filter::matches` ignores `since` for wraps) — otherwise a wrap backdated
+/// below a near-"now" `since` would be lost by the lag the resync repairs.
+pub fn resync_filter(filter: &Filter, missed_since: i64) -> Filter {
+    let mut f = filter.clone();
+    f.first_seen_since = Some(missed_since - RESYNC_MARGIN_SECS);
+    if f.kinds.is_empty() || f.kinds.contains(&wrap_gate::KIND_GIFT_WRAP) {
+        f.since = None;
+    }
+    f
+}
+
+/// Re-run every open subscription of a connection whose broadcast receiver
+/// lagged, over the window it missed (`missed_since`, unix seconds: when it
+/// last kept up), and return the EVENT frames to send (no EOSE: these
+/// subscriptions already had theirs). Clients dedupe by id. Ephemeral kinds
+/// are not stored, so a lag can still lose those — they are refetch hints,
+/// not history. A subscription whose query fails is skipped (logged); it is
+/// not closed, since live matching for it still works.
+pub async fn resync_subscriptions(
+    state: &Arc<AppState>,
+    subscriptions: &Arc<Mutex<SubscriptionManager>>,
+    authed_pubkey: &Option<String>,
+    missed_since: i64,
+) -> Vec<String> {
+    let ctx = read_ctx(state, authed_pubkey);
+    let snapshot = subscriptions.lock().await.snapshot();
+    let mut frames = Vec::new();
+    for (sub_id, filters) in snapshot {
+        let filters: Vec<Filter> = filters.iter().map(|f| resync_filter(f, missed_since)).collect();
+        match query_merged(state, &filters, &ctx).await {
+            Ok(events) => {
+                for e in events {
+                    frames.push(format!(
+                        r#"["EVENT","{}",{}]"#,
+                        sub_id,
+                        serde_json::to_string(&e).unwrap_or_default()
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(sub_id, filters = filters.len(), error = %e, "Resync query failed; subscription skipped");
+            }
+        }
+    }
+    frames
 }
 
 /// `["NEG-OPEN", <subId>, <filter>, <initialMessageHex>]` → the relay builds a
@@ -903,4 +989,29 @@ async fn handle_auth(
     }
 
     vec![format!(r#"["OK","{}",true,""]"#, event.id)]
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use super::*;
+
+    /// The resync keeps the client's filter but pins it to the missed window
+    /// by server receipt time; a filter that can match wraps drops `since`
+    /// (as live matching does), one that cannot keeps it.
+    #[test]
+    fn resync_filter_pins_first_seen_and_mirrors_live_since_rule() {
+        let inbox = Filter { kinds: vec![1059], since: Some(1_000_000), limit: Some(500), ..Default::default() };
+        let r = resync_filter(&inbox, 2_000_000);
+        assert_eq!(r.first_seen_since, Some(2_000_000 - RESYNC_MARGIN_SECS));
+        assert_eq!(r.since, None, "backdated wraps must be recoverable");
+        assert_eq!(r.limit, Some(500));
+
+        let feed = Filter { kinds: vec![1, 9], since: Some(1_000_000), ..Default::default() };
+        let r = resync_filter(&feed, 2_000_000);
+        assert_eq!(r.since, Some(1_000_000), "non-wrap kinds keep the client's since");
+        assert_eq!(r.first_seen_since, Some(2_000_000 - RESYNC_MARGIN_SECS));
+
+        let any = Filter { since: Some(1_000_000), ..Default::default() };
+        assert_eq!(resync_filter(&any, 2_000_000).since, None, "no kinds = may match wraps");
+    }
 }

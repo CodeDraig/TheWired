@@ -40,9 +40,11 @@ CREATE TABLE IF NOT EXISTS events (
     h_tag       TEXT,
     visibility  TEXT,
     expires_at  INTEGER,
-    self_published INTEGER NOT NULL DEFAULT 0
+    self_published INTEGER NOT NULL DEFAULT 0,
+    first_seen  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_events_kind_created ON events (kind, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_first_seen   ON events (first_seen);
 CREATE INDEX IF NOT EXISTS idx_events_expires_at   ON events (expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_pubkey_kind  ON events (pubkey, kind);
 CREATE INDEX IF NOT EXISTS idx_events_htag         ON events (h_tag) WHERE h_tag IS NOT NULL;
@@ -123,6 +125,7 @@ pub async fn connect(path: &str) -> anyhow::Result<SqlitePool> {
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
     backfill_event_tags(&pool).await?;
     ensure_wire_v1_columns(&pool).await?;
+    ensure_first_seen_column(&pool).await?;
     Ok(pool)
 }
 
@@ -153,6 +156,32 @@ async fn ensure_wire_v1_columns(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
     sqlx::query("PRAGMA user_version = 2").execute(pool).await?;
+    Ok(())
+}
+
+/// Databases created before the lag resync lack `first_seen` (server receipt
+/// time, unix seconds). Add it once, gated on `user_version` 3; existing rows
+/// keep 0, which no resync window ever reaches.
+async fn ensure_first_seen_column(pool: &SqlitePool) -> anyhow::Result<()> {
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    if version >= 3 {
+        return Ok(());
+    }
+    let cols: Vec<(i64, String)> = sqlx::query_as("SELECT cid, name FROM pragma_table_info('events')")
+        .fetch_all(pool)
+        .await?;
+    if !cols.iter().any(|(_, c)| c == "first_seen") {
+        sqlx::query("ALTER TABLE events ADD COLUMN first_seen INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await?;
+    }
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_first_seen ON events (first_seen)")
+        .execute(pool)
+        .await?;
+    sqlx::query("PRAGMA user_version = 3").execute(pool).await?;
     Ok(())
 }
 
@@ -193,11 +222,12 @@ pub async fn connect_memory() -> anyhow::Result<SqlitePool> {
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
     backfill_event_tags(&pool).await?;
     ensure_wire_v1_columns(&pool).await?;
+    ensure_first_seen_column(&pool).await?;
     Ok(pool)
 }
 
 fn is_replaceable(kind: i32) -> bool {
-    kind == 0 || kind == 3 || (kind >= 10000 && kind < 20000)
+    kind == 0 || kind == 3 || (10000..20000).contains(&kind)
 }
 fn is_addressable(kind: i32) -> bool {
     (30000..40000).contains(&kind)
@@ -265,8 +295,8 @@ pub async fn store_event_flagged(
     // The NOT EXISTS legs refuse an event a prior deletion covers (security
     // audit 2026-10) — same guard as the Postgres store.
     let inserted = sqlx::query(
-        "INSERT OR IGNORE INTO events (id, pubkey, created_at, kind, tags, content, sig, d_tag, h_tag, visibility, expires_at, self_published) \
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12 \
+        "INSERT OR IGNORE INTO events (id, pubkey, created_at, kind, tags, content, sig, d_tag, h_tag, visibility, expires_at, self_published, first_seen) \
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13 \
          WHERE NOT EXISTS (SELECT 1 FROM deleted_events WHERE event_id = ?1 AND pubkey = ?2) \
            AND NOT EXISTS (SELECT 1 FROM deleted_addresses \
                            WHERE kind = ?4 AND pubkey = ?2 AND d_tag = COALESCE(?8, '') AND deleted_upto >= ?3)",
@@ -283,6 +313,7 @@ pub async fn store_event_flagged(
     .bind(&visibility)
     .bind(expires_at)
     .bind(self_published as i64)
+    .bind(crate::nostr::wrap_gate::unix_now())
     .execute(&mut *tx)
     .await?
     .rows_affected()
@@ -422,6 +453,9 @@ fn push_filter_conditions(qb: &mut QueryBuilder<Sqlite>, filter: &Filter, ctx: &
     }
     if let Some(until) = filter.until {
         qb.push(" AND created_at <= ").push_bind(until);
+    }
+    if let Some(first_seen_since) = filter.first_seen_since {
+        qb.push(" AND first_seen >= ").push_bind(first_seen_since);
     }
 
     push_visibility_gate(qb, ctx);

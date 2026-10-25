@@ -339,12 +339,9 @@ async fn embedded_relay_nonadmin_moddelete_not_stored() {
 
     // It must NOT have been stored: owner REQs kind:9005 and gets none.
     tx1.send(Message::Text(r##"["REQ","s",{"kinds":[9005],"#h":["g"]}]"##.into())).await.unwrap();
-    // Either an EVENT (bad) or EOSE (good) comes next.
-    loop {
-        match read_until(&mut rx1, "EVENT").await {
-            Some(_) => panic!("rejected 9005 was stored + returned by REQ"),
-            None => break, // timed out waiting for EVENT — none stored
-        }
+    // Either an EVENT (bad) or a timeout waiting for one (good) comes next.
+    if read_until(&mut rx1, "EVENT").await.is_some() {
+        panic!("rejected 9005 was stored + returned by REQ");
     }
 
     relay.stop().await;

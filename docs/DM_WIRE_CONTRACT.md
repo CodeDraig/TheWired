@@ -1,6 +1,6 @@
 # DM wire contract — The Wired desktop ↔ soot mobile ↔ relay ↔ backend
 
-**Contract version:** `wire_version = 1` · **Document version:** 1.2.0 (2026-10-12)
+**Contract version:** `wire_version = 1` · **Document version:** 1.3.0 (2026-10-24)
 **Owner:** the TheWiredV1 monorepo (server side + `@ishtarservices/core`). soot implements it; it does not change it.
 **Ships in:** `@ishtarservices/shared-types@0.2.0`, `@ishtarservices/core@0.2.0`, `thewired-relay` ≥ 0.2.0, backend ≥ migration 0029.
 
@@ -188,7 +188,23 @@ Replaces since-window resync on relays that list 77 (ours; also relay.damus.io, 
 nostr-tools ≥ 2.23 exports `Negentropy` and `NegentropyStorageVector` from `nostr-tools/nip77`; drive the frames with your own socket (the bundled `NegentropySync` wants its `AbstractRelay`).
 
 ### 7.6 Rate limits and NIP-11
-Per connection: 300 messages / 10 s (then `NOTICE rate limited: slow down`, messages dropped). Per IP: 32 connections. NIP-11: `supported_nips: [1, 2, 9, 11, 17, 29, 40, 42, 44, 50, 59, 77]`, `limitation.max_limit = 500`, `limitation.auth_required = false` (AUTH is required only for 1059), `retention: [{"kinds":[1059], "time": <seconds or null>}]`.
+Per connection: 300 **counted** frames / 10 s (`RELAY_RATE_MAX_MSGS` / `RELAY_RATE_WINDOW_SECS`); 900 in the first window after connect (`RELAY_RATE_COLD_START_MAX_MSGS`, for the desktop client's resubscribe burst), granted only to the first connection an IP opens within a window. Counted = `EVENT`, `REQ`, `NEG-OPEN`, `NEG-MSG` and anything unparseable; `CLOSE`, `NEG-CLOSE` and WebSocket ping/pong are exempt; `AUTH` is exempt only until the connection is authenticated (and for at most 8 frames) — after that a replayed AUTH counts like a REQ. A frame over the limit is **not processed but always answered** (§7.7); one `["NOTICE", "rate-limited: slow down"]` per window. Per IP: 32 connections. NIP-11: `supported_nips: [1, 2, 9, 11, 17, 29, 40, 42, 44, 50, 59, 77]`, `limitation.max_limit = 500`, `limitation.auth_required = false` (AUTH is required only for 1059), `retention: [{"kinds":[1059], "time": <seconds or null>}]`.
+
+### 7.7 Answer, never drop (relay ≥ 0.2.1)
+NIP-01's rule — every `EVENT` gets an `OK`, every `REQ` ends in `EOSE` or `CLOSED` — holds on every path, including overload. The prefixes are the stable contract; the text after them may change.
+
+| Situation | Relay answer | Client MUST |
+|---|---|---|
+| `EVENT` over the rate limit | `["OK", id, false, "rate-limited: slow down"]` — the event was **not** stored | keep the message in the outbox and republish with backoff (not "failed", not "sent") |
+| `REQ` over the rate limit | `["CLOSED", subId, "rate-limited: slow down"]` — the subscription was **not** registered, no `EOSE` | re-REQ with backoff; do not advance the since-watermark, do not mark the inbox unreadable |
+| `NEG-OPEN` / `NEG-MSG` over the rate limit | `["NEG-ERR", subId, "rate-limited: slow down"]` | retry the reconciliation later; do not fall back to "unsupported" |
+| stored query failed (pool exhausted, DB error) | `["CLOSED", subId, "error: query failed"]`, no `EVENT`s, no `EOSE`, sub not registered | re-REQ with backoff; do not advance the watermark |
+| this connection's live receiver lagged | `["NOTICE", "resync: <n> events skipped"]`, then every open subscription is re-run over the window the connection missed — by **server receipt time** (`first_seen`), so a NIP-59 backdated wrap is recovered; wrap filters drop the client's `since` for this pass — and sent as `EVENT`s (no second `EOSE`) | nothing — dedupe by id as usual. Ephemeral kinds (20000–29999) skipped by a lag are not recoverable |
+| lagged twice within 10 s (`RELAY_RESYNC_COOLDOWN_SECS`), or a resync over 2048 frames | `["NOTICE", "resync: too slow, reconnect"]`, then WebSocket close 1013 | reconnect and re-REQ as on any close |
+
+Implementation status of the "client MUST" column (2026-10-24): relay ships all rows; desktop re-REQs / re-sends with backoff on `fix/desktop-dm-sent-parity`; **soot pending** (`handleRelayClosed` still marks any non-`auth-required` CLOSED as unreadable).
+
+Also: the idle reaper (`RELAY_WS_PING_SECS` 30 / `RELAY_WS_IDLE_TIMEOUT_SECS` 90) no longer cuts a socket that is only *receiving* — it drops a connection only after the pings the idle period has room for were actually sent and unanswered. Live matching ignores `since` for kind 1059 (NIP-59 backdates a wrap's `created_at` by up to two days; a wrap published now would otherwise miss a subscription whose `since` is near "now"); stored queries honour `since` unchanged. Counters: `GET /metrics` (plain text, unauthenticated like `/health` — aggregate totals only, nothing per user) — `relay_broadcast_lagged_connections_total`, `relay_broadcast_skipped_events_total`, `relay_rate_limited_frames_total`.
 
 ## 8. Push (backend ≥ this contract)
 
@@ -254,12 +270,14 @@ Plan: (1) on login publish a 30443 with a signing key distinct from the nsec (ke
 | `@ishtarservices/shared-types@0.2.0` | `DM_KINDS`, `DM_RUMOR_KINDS`, `DMControlType`, `DMFileMeta`, `DMReadStateRecordV2`, `DMPushData`, `DM_EXPIRATION_SECONDS`, `DM_EDIT_WINDOW_SECONDS` |
 | `@ishtarservices/core@0.2.0` | `unwrapGiftWrap` hardened (seal sig, rumor-id recompute, kind allowlist, expiration); `buildRumor`/wraps take `kind` + `expiration`; `parseDMWire` + `*RumorTags` builders; `conversationIdOf`; `encryptDMFile`/`decryptDMFile`; read-state v2 merge; `Negentropy` client+responder (NIP-77); room wraps take `extraTags`/`kind`/`expiration`/`noSelfWrap` |
 | relay 0.2.0 | §7 complete: 1059 gate (`RELAY_WRAP_AUTH_GATE`), ingest role, `self_published`, NIP-40 + sweeper, NIP-77, per-connection + per-IP limits, NIP-11 |
+| relay 0.2.1 | §7.7: rate-limited frames answered (`rate-limited:` OK / CLOSED / NEG-ERR), query failures are `CLOSED error:` not `EOSE`, lag resync, receive-only sockets not reaped, live 1059 ignores `since` |
 | backend | ingester AUTHs with `INGEST_SECRET_KEY` (gated REQs survive an AUTH OK that lands before the cursor read); self-published and typing wraps never queue; dm push carries `DMPushData` (+ `eventIds`) + `mutableContent` + `categoryId`; 5-s per-recipient fold gate, dispatch ~1 s after ingest; `GET /push/devices` reports `lastDm`, `ingestLastWrapAt` and receipt-stage errors; `/push/suppress` deprecated no-op |
 | desktop | writes the spec form (`e` replies, kind 7, kind 15), reads both; typing/receipts (friends, opt-out); pin/archive/mute/disappearing via read-state v2; rooms (≤10, `g` id); block = kind-10000; AUTH `CLOSED` → re-REQ; NIP-77 inbox reconcile every 15 min. Desktop does **not** republish `have` ids (it keeps no wrap ciphertext), so §7.5 step 5 is mobile-only for now. AI summarize/ask gated by a per-session consent dialog for remote providers. |
 | iOS NSE | in progress (§8.2) |
 | Marmot | §10 plan only |
 
 ## 12. Change log
+- **1.3.0 (2026-10-24)** — relay "answer, never drop" (§7.6–7.7); no wire change, two new machine-readable prefixes. Over the rate limit an `EVENT` gets `OK false "rate-limited:"`, a `REQ` `CLOSED "rate-limited:"`, a `NEG-OPEN` `NEG-ERR "rate-limited:"` (previously one NOTICE and silence); only `EVENT`/`REQ`/`NEG-OPEN` count, with a larger first-window allowance; a stored-query failure is `CLOSED "error: query failed"` with no `EOSE` (previously an empty `EOSE`, which advanced client watermarks past the backlog); a lagged live receiver gets `NOTICE "resync:"` plus a storage resync of its open subscriptions over the missed window by server receipt time (SQLite gains a `first_seen` column, `user_version` 3); the idle reaper ignores time spent streaming to the client; live matching ignores `since` for kind 1059. Clients: treat `rate-limited:` and `error:` CLOSEDs as retryable with backoff, never as "inbox unreadable".
 - **1.2.0 (2026-10-12)** — push timing and the iOS extension (§8); no wire change. Backend: typing-style wraps (`expiration` ≤ 60 s away) are no longer pushed; the 120-s per-recipient drop window becomes a 5-s send gate that defers and folds (nothing dropped); a dm is dispatched ~1 s after ingest; push `data.eventIds` names every folded wrap (`DMPushData.eventIds`, optional); `GET /push/devices` gains `lastDm`, `ingestLastWrapAt` and receipt-stage `lastError`s. Extension (§8.2): fetch every id in `eventIds`; MAY send `delivered` for 1:1 kind-14/15 rumors from friends (the app must not repeat it); the spool holds the raw wrap (`{v:1, p, wrap, receiptSent, at}`) instead of the decrypted rumor; the app's private keychain group comes first and the extension gets only the shared one; the shared nsec copy is after-first-unlock-this-device-only; decrypt note corrected (NIP-44 v2 = ChaCha20 + HMAC-SHA256).
 - **1.1.0 (2026-09-25)** — frame-level E2EE for calls and channels (docs/E2EE_CALLS.md): `caps.e2ee` on `call_invite` (invites without it are declined), new rumor kind **20016 media key** (per-sender LiveKit keys for channels, 120-s expiry, no self-wrap), `DM_RUMOR_KINDS` gains 20016, `DM_EXPIRATION_SECONDS.mediaKey`. Backend `/voice/token` + `/voice/dm-token` require `supportsE2EE: true` (409 `E2EE_REQUIRED` otherwise). shared-types/core 0.4.0.
 - **1.0.1 (2026-09-21)** — clarified the stable `auth-required:` prefix and strfry's `negentropy disabled` NOTICE (§7.1, §7.5). No wire change.
