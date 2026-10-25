@@ -1,3 +1,8 @@
+# Local development stack. Every host port is bound to 127.0.0.1 (set the
+# *_BIND variables to 0.0.0.0 to reach a service from another machine):
+# Postgres, Redis, Meilisearch, the relay, the backend (which trusts the
+# gateway's identity header) and LiveKit (dev keys) have no business on the LAN.
+# Only Caddy publishes 80/443.
 networks:
   frontend:
   backend:
@@ -6,7 +11,7 @@ services:
   postgres:
     image: postgres:16-alpine
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${BIND_ADDR:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-thewired}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
@@ -25,12 +30,14 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "${REDIS_PORT:-6380}:6379"
-    command: redis-server --maxmemory 256mb --maxmemory-policy noeviction --appendonly yes
+      - "${BIND_ADDR:-127.0.0.1}:${REDIS_PORT:-6380}:6379"
+    # REDIS_PASSWORD set → requirepass is on and the in-network REDIS_URLs below
+    # carry it; the native backend/gateway then need redis://:<pw>@localhost:6380.
+    command: redis-server --maxmemory 256mb --maxmemory-policy noeviction --appendonly yes ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ${REDIS_PASSWORD:+-a ${REDIS_PASSWORD} --no-auth-warning} ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -41,7 +48,7 @@ services:
   meilisearch:
     image: getmeili/meilisearch:v1.6
     ports:
-      - "${MEILI_PORT:-7700}:7700"
+      - "${BIND_ADDR:-127.0.0.1}:${MEILI_PORT:-7700}:7700"
     environment:
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?Set MEILI_MASTER_KEY in .env}
       MEILI_ENV: ${MEILI_ENV:-development}
@@ -64,7 +71,7 @@ services:
       context: ./services/relay
       dockerfile: Dockerfile
     ports:
-      - "${RELAY_PORT:-7777}:7777"
+      - "${BIND_ADDR:-127.0.0.1}:${RELAY_PORT:-7777}:7777"
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-thewired}:${POSTGRES_PASSWORD:?err}@postgres:5432/${POSTGRES_DB:-thewired}
       RELAY_PORT: 7777
@@ -90,10 +97,10 @@ services:
       context: .
       dockerfile: services/backend/Dockerfile
     ports:
-      - "${BACKEND_PORT:-3002}:3002"
+      - "${BIND_ADDR:-127.0.0.1}:${BACKEND_PORT:-3002}:3002"
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-thewired}:${POSTGRES_PASSWORD:?err}@postgres:5432/${POSTGRES_DB:-thewired}
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379
       MEILISEARCH_URL: http://meilisearch:7700
       MEILISEARCH_KEY: ${MEILI_MASTER_KEY:?err}
       RELAY_URL: ws://relay:7777
@@ -105,7 +112,7 @@ services:
       REPORT_WEBHOOK_URL: ${REPORT_WEBHOOK_URL:-}
       LIVEKIT_URL: ${LIVEKIT_URL:-ws://livekit:7880}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
-      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env (openssl rand -base64 32)}
       VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
       VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
       GIF_API_KEY: ${GIF_API_KEY:-}
@@ -117,6 +124,12 @@ services:
       BLOSSOM_SERVER_NAMES: ${BLOSSOM_SERVER_NAMES:-}
       UPLOAD_RATE_PER_MIN: ${UPLOAD_RATE_PER_MIN:-30}
       UPLOAD_DAILY_BYTES: ${UPLOAD_DAILY_BYTES:-2147483648}
+      # Gateway-signed identity headers (same secret as the gateway below);
+      # off = trust X-Auth-Pubkey as before, warn = log mismatches, enforce = drop.
+      GATEWAY_SHARED_SECRET: ${GATEWAY_SHARED_SECRET:-}
+      GATEWAY_AUTH_MODE: ${GATEWAY_AUTH_MODE:-off}
+      # Which hops may set X-Forwarded-For (default: loopback + RFC1918).
+      TRUST_PROXY: ${TRUST_PROXY:-}
     volumes:
       - blobdata:/app/blobs
     depends_on:
@@ -142,12 +155,20 @@ services:
       context: ./services/gateway
       dockerfile: Dockerfile
     ports:
-      - "${GATEWAY_PORT:-9080}:9080"
+      - "${BIND_ADDR:-127.0.0.1}:${GATEWAY_PORT:-9080}:9080"
     environment:
       GATEWAY_PORT: 9080
       BACKEND_URL: http://backend:3002
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      GATEWAY_SHARED_SECRET: ${GATEWAY_SHARED_SECRET:-}
+      # NIP-98 payload tag on body-bearing /api requests: off | warn | enforce
+      NIP98_REQUIRE_PAYLOAD: ${NIP98_REQUIRE_PAYLOAD:-off}
+      # GATEWAY_ENV=production flips TRUSTED_PROXIES to "trust nobody" and CORS
+      # to deny-by-default; dev keeps the private-range / "*" defaults.
+      GATEWAY_ENV: ${GATEWAY_ENV:-${NODE_ENV:-development}}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      RATE_LIMIT_IP_PER_MIN: ${RATE_LIMIT_IP_PER_MIN:-1200}
     depends_on:
       backend:
         condition: service_started
@@ -172,15 +193,18 @@ services:
   #
   # LIVEKIT_NODE_IP defaults to the host's LAN IP for Linux hosts where
   # Docker UDP works. On Mac, set it to your LAN IP (e.g. 192.168.1.x) only
-  # if you absolutely must keep LiveKit in Docker.
+  # if you absolutely must keep LiveKit in Docker (and then BIND_ADDR=0.0.0.0
+  # so the media ports are reachable from the LAN).
   livekit:
     image: livekit/livekit-server:latest
     ports:
-      - "${LIVEKIT_PORT:-7880}:7880"
-      - "7881:7881"
-      - "7882:7882/udp"
+      - "${BIND_ADDR:-127.0.0.1}:${LIVEKIT_PORT:-7880}:7880"
+      - "${BIND_ADDR:-127.0.0.1}:7881:7881"
+      - "${BIND_ADDR:-127.0.0.1}:7882:7882/udp"
     environment:
-      LIVEKIT_KEYS: "devkey: ${LIVEKIT_API_SECRET:-secret}"
+      # The signaling endpoint mints nothing by itself, but anyone who knows the
+      # key pair can mint room tokens: no "secret" default, even in dev.
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env (openssl rand -base64 32)}"
       LIVEKIT_LOG_LEVEL: info
     command: --dev --bind 0.0.0.0 ${LIVEKIT_NODE_IP:+--node-ip=${LIVEKIT_NODE_IP}}
     restart: unless-stopped
@@ -192,7 +216,7 @@ services:
       context: .
       dockerfile: services/landing/Dockerfile
     ports:
-      - "${LANDING_PORT:-8080}:8080"
+      - "${BIND_ADDR:-127.0.0.1}:${LANDING_PORT:-8080}:8080"
     networks:
       - frontend
 

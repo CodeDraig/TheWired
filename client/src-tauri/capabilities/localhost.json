@@ -1,9 +1,9 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "localhost",
-  "description": "Grants IPC access when served via tauri-plugin-localhost in production",
+  "description": "Grants IPC access to the production asset origin (localhost.rs serves the bundle on a fixed port). Exactly that origin — any other local port is some other program and must never get IPC.",
   "remote": {
-    "urls": ["http://localhost:*"]
+    "urls": ["http://localhost:14420"]
   },
   "windows": ["main"],
   "permissions": [

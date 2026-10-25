@@ -383,14 +383,19 @@ async fn req_on_a_failing_db_is_closed_with_no_eose_and_no_live_sub() {
     let pool = pool_or_skip!();
     let bob = TestIdentity::from_seed(2);
     let (state, tx) = make_app_state_with(pool.clone(), |_| {});
-    // Every acquire now fails immediately (sqlx `PoolClosed`): the shape of a
-    // pool whose 5 s acquire timeout elapsed under load.
-    pool.close().await;
-
     let subs = Arc::new(Mutex::new(SubscriptionManager::new()));
     let mut authed = Some(bob.pubkey.clone());
     let mut memberships = HashSet::new();
     let req = format!(r##"["REQ","inbox",{{"kinds":[1059],"#p":["{}"]}}]"##, bob.pubkey);
+
+    // An earlier "inbox" sub, registered while the store still answered.
+    let first = handle_message(&req, &state, &subs, &mut authed, &mut memberships, "c", &tx).await;
+    assert!(first.iter().any(|f| f.starts_with(r#"["EOSE""#)), "{first:?}");
+
+    // Every acquire now fails immediately (sqlx `PoolClosed`): the shape of a
+    // pool whose 5 s acquire timeout elapsed under load.
+    pool.close().await;
+
     let frames: Vec<serde_json::Value> =
         handle_message(&req, &state, &subs, &mut authed, &mut memberships, "c", &tx)
             .await
@@ -404,8 +409,9 @@ async fn req_on_a_failing_db_is_closed_with_no_eose_and_no_live_sub() {
     assert!(s(&frames[0], 2).starts_with("error:"), "{frames:?}");
     assert!(!frames.iter().any(|f| typ(f) == "EOSE"), "an EOSE here advances the client's watermark: {frames:?}");
 
-    // The failed sub must not be registered for live delivery either — the
-    // client was told it is closed and will re-REQ.
+    // The failed sub must not be registered for live delivery either, and the
+    // earlier one it replaced must stop — the client was told it is closed
+    // and will re-REQ.
     let wrap = sign_event(&TestIdentity::from_seed(10), 1059, vec![vec!["p".into(), bob.pubkey.clone()]], "c", now());
     assert!(subs.lock().await.matching_subs(&wrap).is_empty(), "sub registered despite CLOSED");
 }

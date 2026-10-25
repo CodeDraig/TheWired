@@ -25,6 +25,10 @@ type Limits struct {
 	// anonymous callers are keyed by IP and kept tight.
 	ReportAnonPerHour int
 	ReportPerHour     int
+	// Per-client-IP ceiling on every /api request per minute, applied before
+	// the pubkey bucket. A fresh keypair per request used to get a fresh
+	// budget each time. 0 disables.
+	IPPerMin int
 }
 
 var DefaultLimits = Limits{
@@ -34,6 +38,7 @@ var DefaultLimits = Limits{
 	MediaPerMin:       300,
 	ReportAnonPerHour: 5,
 	ReportPerHour:     30,
+	IPPerMin:          1200,
 }
 
 // AllowResult contains the outcome of a rate limit check.
@@ -123,6 +128,15 @@ func (l *Limiter) AllowReport(ctx context.Context, ident string, anonymous bool)
 		limit = l.limits.ReportAnonPerHour
 	}
 	return l.allow(ctx, "ratelimit:report:"+ident, limit, time.Hour)
+}
+
+// AllowIP checks the per-client-IP floor that every /api request passes
+// through before its pubkey (or anonymous) bucket. Disabled when IPPerMin <= 0.
+func (l *Limiter) AllowIP(ctx context.Context, ip string) (AllowResult, error) {
+	if l.limits.IPPerMin <= 0 {
+		return AllowResult{Allowed: true, Remaining: -1}, nil
+	}
+	return l.allow(ctx, "ratelimit:ip:"+ip, l.limits.IPPerMin, time.Minute)
 }
 
 // allow runs the sliding-window check for one key.

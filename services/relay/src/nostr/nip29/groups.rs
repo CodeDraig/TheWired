@@ -20,9 +20,31 @@ pub async fn handle_create_group(db: &Db, event: &Event) -> anyhow::Result<Vec<S
         )]);
     }
 
+    // SECURITY (audit 2026-10): a 9007 naming an id this relay already hosts is
+    // NOT a create. Without this check (and the conditional seed inside
+    // `create_group`) any key could re-send 9007 for an existing group and be
+    // made its admin, then flip its private/closed flags below. An exact
+    // re-send of the original create (same event id) is a NIP-01 duplicate.
+    if db.group_exists(&group_id).await? {
+        if db.get_event_by_id(&event.id).await?.is_some() {
+            return Ok(vec![format!(r#"["OK","{}",true,"duplicate:"]"#, event.id)]);
+        }
+        return Ok(vec![format!(
+            r#"["OK","{}",false,"error: group already exists"]"#,
+            event.id
+        )]);
+    }
+
     let name = event.content.clone();
 
-    db.create_group(&group_id, &name, &event.pubkey).await?;
+    // Atomic: the member/admin seed only happens when the group row was
+    // inserted by THIS call, so a concurrent create of the same id loses.
+    if !db.create_group(&group_id, &name, &event.pubkey).await? {
+        return Ok(vec![format!(
+            r#"["OK","{}",false,"error: group already exists"]"#,
+            event.id
+        )]);
+    }
 
     // Apply NIP-29 policy marker tags from the create event (private = members-only
     // read, closed = join requires invite/approval).

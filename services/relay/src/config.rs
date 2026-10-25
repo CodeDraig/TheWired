@@ -41,6 +41,13 @@ pub struct Config {
     /// `RELAY_TRUST_PROXY` = 1|true.
     pub trust_proxy: bool,
 
+    // ── NIP-42 ──
+    /// Additional URLs a kind-22242 `relay` tag may name, besides `RELAY_URL`
+    /// (e.g. a second public hostname during a DNS move). The relay accepts
+    /// an AUTH only for an address in this allow-set; it is never skipped.
+    /// `RELAY_AUTH_RELAY_URLS`, comma-separated.
+    pub auth_relay_urls: Vec<String>,
+
     // ── WebSocket keepalive ──
     /// Seconds between server-initiated WebSocket pings. `RELAY_WS_PING_SECS`
     /// (30); 0 = never ping (and never drop idle sockets).
@@ -81,6 +88,7 @@ impl Default for Config {
             rate_cold_start_max_msgs: 900,
             max_conns_per_ip: 32,
             trust_proxy: false,
+            auth_relay_urls: Vec::new(),
             ws_ping_interval_secs: 30,
             ws_idle_timeout_secs: 90,
             broadcast_capacity: 4096,
@@ -136,6 +144,13 @@ impl Config {
             rate_cold_start_max_msgs: env_or("RELAY_RATE_COLD_START_MAX_MSGS", d.rate_cold_start_max_msgs),
             max_conns_per_ip: env_or("RELAY_MAX_CONNS_PER_IP", d.max_conns_per_ip),
             trust_proxy: env_bool("RELAY_TRUST_PROXY"),
+            auth_relay_urls: std::env::var("RELAY_AUTH_RELAY_URLS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
             ws_ping_interval_secs: env_or("RELAY_WS_PING_SECS", d.ws_ping_interval_secs),
             ws_idle_timeout_secs: env_or("RELAY_WS_IDLE_TIMEOUT_SECS", d.ws_idle_timeout_secs),
             broadcast_capacity: env_or("RELAY_BROADCAST_CAPACITY", d.broadcast_capacity).max(1),

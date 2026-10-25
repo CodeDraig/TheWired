@@ -59,8 +59,12 @@ async fn maybe_refresh_memberships(
     }
 }
 
-/// Maximum incoming WebSocket message size (128 KiB)
-const MAX_MESSAGE_SIZE: usize = 128 * 1024;
+/// Maximum incoming WebSocket message size (128 KiB). Enforced at the upgrade
+/// (`server.rs`: tungstenite message AND frame cap, so an oversized frame is
+/// refused before it is buffered — the library default was 64 MiB per
+/// message, security audit 2026-10) and re-checked here. Advertised as NIP-11
+/// `max_message_length`.
+pub(crate) const MAX_MESSAGE_SIZE: usize = 128 * 1024;
 
 /// Has a socket gone quiet for longer than the configured idle timeout? A zero
 /// timeout disables the check. Any inbound frame (text, pong, even a client
@@ -383,7 +387,10 @@ pub async fn handle_connection(
     let mut auth_frames_unauthed: u32 = 0;
     // Broadcast lag: when this connection last had to be resynced from storage,
     // and the last moment (unix seconds) its receiver was known to be caught
-    // up — the start of the window a resync has to cover.
+    // up — the start of the window a resync has to cover. "Caught up" means the
+    // channel held nothing unread, not merely that a recv succeeded: a receiver
+    // draining a backlog is behind by everything still queued, and a lag then
+    // skips events stored before that recv.
     let mut last_resync_at: Option<Instant> = None;
     let mut last_kept_up_at: i64 = wrap_gate::unix_now();
     // A connection whose receiver lags twice within this window is too slow
@@ -490,6 +497,14 @@ pub async fn handle_connection(
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
+                    // A transport-level error (a frame over the size cap, a
+                    // protocol violation): the stream is unusable, so end the
+                    // connection rather than spin on repeated errors.
+                    Some(Err(e)) => {
+                        tracing::debug!(remote = %addr, error = %e, "WebSocket error; closing");
+                        let _ = sender.send(Message::Close(None)).await;
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -510,13 +525,19 @@ pub async fn handle_connection(
                     break;
                 }
                 pings_unanswered = pings_unanswered.saturating_add(1);
+                // A quiet relay sends no broadcasts to stamp the watermark on.
+                if broadcast_rx.is_empty() {
+                    last_kept_up_at = wrap_gate::unix_now();
+                }
             }
 
             // Handle broadcast events from other connections
             broadcast_result = broadcast_rx.recv() => {
                 match broadcast_result {
                     Ok(event) => {
-                        last_kept_up_at = wrap_gate::unix_now();
+                        if broadcast_rx.is_empty() {
+                            last_kept_up_at = wrap_gate::unix_now();
+                        }
                         // For h-tagged (space-scoped) events, lazily refresh the
                         // membership cache if it's older than MEMBERSHIP_TTL —
                         // otherwise a kicked user holding this socket keeps
@@ -585,8 +606,10 @@ pub async fn handle_connection(
                         if sender.send(Message::Text(notice.into())).await.is_err() {
                             break;
                         }
+                        // The watermark stays put: the receiver now sits at the
+                        // oldest retained event with up to a full channel still
+                        // unread, so it is not caught up until that drains.
                         let resync_from = last_kept_up_at;
-                        last_kept_up_at = wrap_gate::unix_now();
                         let frames = handler::resync_subscriptions(&state, &subscriptions, &authed_pubkey, resync_from).await;
                         if frames.len() > RESYNC_MAX_FRAMES {
                             tracing::warn!(remote = %addr, frames = frames.len(), "Resync too large; closing");

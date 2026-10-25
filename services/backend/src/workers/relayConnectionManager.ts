@@ -7,6 +7,7 @@ import { and, eq, ne, sql } from "drizzle-orm";
 import { finalizeEvent, getPublicKey, nip19 } from "nostr-tools";
 import { hexToBytes } from "@noble/hashes/utils";
 import { processEvent, type NostrEvent } from "./ingestHandlers.js";
+import { checkDialTarget, type RelayUrlCheck } from "../lib/relayUrlGuard.js";
 
 /**
  * Multi-relay ingestion manager (Decentralized Spaces, M3).
@@ -26,6 +27,70 @@ import { processEvent, type NostrEvent } from "./ingestHandlers.js";
  */
 
 const RECONNECT_MAX_MS = 60_000;
+
+/** Largest frame accepted from an EXTERNAL relay (Node's built-in WebSocket
+ *  has no maxPayload, so the cap is applied on receipt and the socket closed).
+ *  Nostr events are a few KB; the relay's own limit is far below this. The own
+ *  relay is exempt, like the rate cap. */
+export const MAX_EXTERNAL_FRAME_BYTES = 1024 * 1024;
+
+/** Close code sent when an external relay's frame is over the cap (private
+ *  use range: the WHATWG close() refuses the standard 1009). */
+export const FRAME_TOO_LARGE_CLOSE_CODE = 4009;
+
+/** Largest NIP-11 document read from an external relay. */
+export const MAX_NIP11_BYTES = 1024 * 1024;
+
+function frameSize(data: unknown): number {
+  if (typeof data === "string") return data.length;
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  if (data && typeof (data as { size?: unknown }).size === "number") return (data as { size: number }).size;
+  return 0;
+}
+
+/**
+ * The relay's NIP-11 document, for its signing key (39000/39002 trust). The
+ * relay is attacker-registered: redirects are NOT followed (a 3xx to an
+ * internal address would otherwise be fetched) and the body is capped.
+ * Undefined on any failure — the key is optional.
+ */
+export async function fetchRelayPubkey(url: string, fetchImpl: typeof fetch = fetch): Promise<string | undefined> {
+  try {
+    const httpUrl = url.replace(/^wss:\/\//, "https://").replace(/^ws:\/\//, "http://");
+    const res = await fetchImpl(httpUrl, {
+      headers: { Accept: "application/nostr+json" },
+      redirect: "manual",
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return undefined;
+    const declared = Number(res.headers?.get?.("content-length"));
+    if (Number.isFinite(declared) && declared > MAX_NIP11_BYTES) return undefined;
+    const info = (await readJsonCapped(res, MAX_NIP11_BYTES)) as { pubkey?: unknown } | undefined;
+    return typeof info?.pubkey === "string" ? info.pubkey : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `res.json()` with a running byte cap on the stream; undefined when over. */
+async function readJsonCapped(res: Response, max: number): Promise<unknown> {
+  const body = res.body;
+  if (!body || typeof body.getReader !== "function") return res.json();
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => {});
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
 
 /** NIP-59 gift wraps randomize created_at up to 2 days into the past, so the
  *  shared max-created_at `since` cursor would filter nearly all of them out.
@@ -129,14 +194,25 @@ interface Conn {
   sinceReady: boolean;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   backoffMs: number;
+  /** External only: counts dial attempts, so a guard result that lands after
+   *  the connection was closed or re-opened is ignored. */
+  dialSeq: number;
   maxSeen: number;
   windowStart: number;
   windowCount: number;
 }
 
-export function startRelayIngester(): { stop: () => Promise<void> } {
+export interface RelayIngesterOptions {
+  /** Connect-time check run on every EXTERNAL relay URL right before it is
+   *  dialled (default: checkDialTarget — resolve + refuse private addresses).
+   *  Tests inject one; the own relay never goes through it. */
+  dialGuard?: (url: string) => Promise<RelayUrlCheck>;
+}
+
+export function startRelayIngester(opts: RelayIngesterOptions = {}): { stop: () => Promise<void> } {
   const redis = getRedis();
   const cfg = tunables();
+  const dialGuard = opts.dialGuard ?? checkDialTarget;
   const connections = new Map<string, Conn>();
   let stopped = false;
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -156,21 +232,6 @@ export function startRelayIngester(): { stop: () => Promise<void> } {
     return v ? parseInt(v, 10) : Math.floor(Date.now() / 1000) - 3600;
   }
 
-  async function fetchRelayPubkey(url: string): Promise<string | undefined> {
-    try {
-      const httpUrl = url.replace(/^wss:\/\//, "https://").replace(/^ws:\/\//, "http://");
-      const res = await fetch(httpUrl, {
-        headers: { Accept: "application/nostr+json" },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!res.ok) return undefined;
-      const info = (await res.json()) as { pubkey?: unknown };
-      return typeof info?.pubkey === "string" ? info.pubkey : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
   async function recordRelayError(url: string, message: string): Promise<void> {
     try {
       await db
@@ -188,6 +249,7 @@ export function startRelayIngester(): { stop: () => Promise<void> } {
       spaceIds,
       reconnectTimer: null,
       backoffMs: cfg.reconnectBaseMs,
+      dialSeq: 0,
       maxSeen: 0,
       windowStart: Date.now(),
       windowCount: 0,
@@ -220,11 +282,52 @@ export function startRelayIngester(): { stop: () => Promise<void> } {
     return true;
   }
 
+  /** Arm one reconnect after the current backoff. `ws` is the socket (or
+   *  null) the caller believes is current: a stale socket's close/error, or a
+   *  guard result for a dial since superseded, arms nothing. */
+  function scheduleReconnect(conn: Conn, url: string, ws: WebSocket | null): void {
+    if (stopped || !connections.has(url) || conn.ws !== ws || conn.reconnectTimer) return;
+    conn.reconnectTimer = setTimeout(() => {
+      conn.reconnectTimer = null;
+      open(url);
+    }, conn.backoffMs);
+    conn.backoffMs = Math.min(conn.backoffMs * 2, RECONNECT_MAX_MS);
+  }
+
   function open(url: string): void {
     if (stopped) return;
     const conn = connections.get(url);
     if (!conn) return;
+    if (isOwn(url)) {
+      dial(url, conn);
+      return;
+    }
+    // External relay: the registry is attacker-influenced, so the target is
+    // resolved and re-checked right before every connect (lib/relayUrlGuard
+    // checkDialTarget — DNS rebinding). A refusal is treated like a failed
+    // connect: recorded on the relay row and retried with backoff, since a
+    // DNS answer can change either way.
+    const attempt = ++conn.dialSeq;
+    const current = conn.ws;
+    void dialGuard(url).then(
+      (check) => {
+        if (stopped || connections.get(url) !== conn || conn.dialSeq !== attempt) return;
+        if (!check.ok) {
+          void recordRelayError(url, `dial refused: ${check.reason ?? "unsafe target"}`);
+          scheduleReconnect(conn, url, current);
+          return;
+        }
+        dial(url, conn);
+      },
+      () => {
+        if (stopped || connections.get(url) !== conn || conn.dialSeq !== attempt) return;
+        void recordRelayError(url, "dial refused: guard failed");
+        scheduleReconnect(conn, url, current);
+      },
+    );
+  }
 
+  function dial(url: string, conn: Conn): void {
     const ws = new WebSocket(url);
     conn.ws = ws;
 
@@ -289,6 +392,19 @@ export function startRelayIngester(): { stop: () => Promise<void> } {
     });
 
     ws.addEventListener("message", (ev: MessageEvent) => {
+      // No maxPayload on the built-in WebSocket: an external relay's oversize
+      // frame is dropped unparsed and the socket closed. The WHATWG close()
+      // only takes 1000 or 3000–4999 (1009 Message Too Big would throw), so a
+      // private-use code carries the reason.
+      if (!isOwn(url) && frameSize(ev.data) > MAX_EXTERNAL_FRAME_BYTES) {
+        void recordRelayError(url, "frame over size cap");
+        try {
+          ws.close(FRAME_TOO_LARGE_CLOSE_CODE, "frame too large");
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
       try {
         const msg = JSON.parse(String(ev.data));
         if (isOwn(url) && handleOwnRelayControl(conn, ws, msg)) return;
@@ -317,18 +433,11 @@ export function startRelayIngester(): { stop: () => Promise<void> } {
     // fires only `error` — never `close` — when the connect itself is refused
     // (relay restarting, ECONNREFUSED), so a close-only reconnect gave up for
     // good the first time a retry landed while the relay was still down. The
-    // guard makes the pair idempotent when an established socket errors and
-    // then closes.
-    const scheduleReconnect = () => {
-      if (stopped || !connections.has(url) || conn.ws !== ws || conn.reconnectTimer) return;
-      conn.reconnectTimer = setTimeout(() => {
-        conn.reconnectTimer = null;
-        open(url);
-      }, conn.backoffMs);
-      conn.backoffMs = Math.min(conn.backoffMs * 2, RECONNECT_MAX_MS);
-    };
-    ws.addEventListener("close", scheduleReconnect);
-    ws.addEventListener("error", scheduleReconnect);
+    // guard in scheduleReconnect makes the pair idempotent when an established
+    // socket errors and then closes.
+    const reconnect = () => scheduleReconnect(conn, url, ws);
+    ws.addEventListener("close", reconnect);
+    ws.addEventListener("error", reconnect);
   }
 
   function sendGated(conn: Conn, ws: WebSocket, subId: string): void {

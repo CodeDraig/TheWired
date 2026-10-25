@@ -170,7 +170,8 @@ export const moderationRoutes: FastifyPluginAsync = async (server) => {
       const perm = await permissionService.check(params.spaceId, authPubkey, "MUTE_MEMBERS");
       if (!perm.allowed) return reply.status(403).send({ error: "Missing MUTE_MEMBERS permission", code: "FORBIDDEN" });
 
-      await moderationService.unmuteMember(params.muteId);
+      const removed = await moderationService.unmuteMember(params.spaceId, params.muteId);
+      if (!removed) return reply.status(404).send({ error: "Mute not found", code: "NOT_FOUND" });
       notifySpaceChanged(params.spaceId, "moderation");
       return { data: { success: true } };
     },

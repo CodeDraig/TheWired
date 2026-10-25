@@ -41,10 +41,26 @@ async fn build_group_metadata(
     Ok(Some((tags, content)))
 }
 
-/// Build the tags for a kind:39001 group admins event.
-async fn build_group_admins(db: &Db, group_id: &str) -> anyhow::Result<(Vec<Vec<String>>, String)> {
-    let admins = db.get_group_admins(group_id).await?;
+/// The leading tags of a 39001/39002 list event. SECURITY (audit 2026-10): a
+/// private group's admin and member lists are members-only. Carrying the
+/// group's `h` tag puts them under the same read predicate as the group's
+/// content (`access::is_visible_to`, the Pg/SQLite SQL gates, the broadcast
+/// filter): anonymous and non-member readers get nothing, members read them.
+/// Public groups keep the bare `d` tag so other NIP-29 clients see no change.
+/// 39000 is never gated — a non-member needs the name and the private/closed
+/// markers to know it must AUTH / request to join.
+fn list_tags(group_id: &str, is_private: bool) -> Vec<Vec<String>> {
     let mut tags = vec![vec!["d".to_string(), group_id.to_string()]];
+    if is_private {
+        tags.push(vec!["h".to_string(), group_id.to_string()]);
+    }
+    tags
+}
+
+/// Build the tags for a kind:39001 group admins event.
+async fn build_group_admins(db: &Db, group_id: &str, is_private: bool) -> anyhow::Result<(Vec<Vec<String>>, String)> {
+    let admins = db.get_group_admins(group_id).await?;
+    let mut tags = list_tags(group_id, is_private);
     for pubkey in &admins {
         tags.push(vec!["p".to_string(), pubkey.clone(), "admin".to_string()]);
     }
@@ -52,9 +68,9 @@ async fn build_group_admins(db: &Db, group_id: &str) -> anyhow::Result<(Vec<Vec<
 }
 
 /// Build the tags for a kind:39002 group members event.
-async fn build_group_members(db: &Db, group_id: &str) -> anyhow::Result<(Vec<Vec<String>>, String)> {
+async fn build_group_members(db: &Db, group_id: &str, is_private: bool) -> anyhow::Result<(Vec<Vec<String>>, String)> {
     let members = db.get_members(group_id).await?;
-    let mut tags = vec![vec!["d".to_string(), group_id.to_string()]];
+    let mut tags = list_tags(group_id, is_private);
     for pubkey in &members {
         tags.push(vec!["p".to_string(), pubkey.clone()]);
     }
@@ -102,22 +118,28 @@ pub async fn publish_group_metadata(
     broadcast_tx: &broadcast::Sender<Event>,
     group_id: &str,
 ) {
-    match build_group_metadata(db, group_id).await {
+    let is_private = match build_group_metadata(db, group_id).await {
         Ok(Some((tags, content))) => {
+            let is_private = tags.iter().any(|t| t.first().map(String::as_str) == Some("private"));
             if let Err(e) =
                 sign_store_broadcast(db, identity, broadcast_tx, 39000, tags, &content).await
             {
                 tracing::warn!(group_id, error = %e, "Failed to publish 39000 metadata");
             }
+            is_private
         }
         Ok(None) => {
             // Group no longer exists (e.g. just deleted) — nothing to publish.
             return;
         }
-        Err(e) => tracing::warn!(group_id, error = %e, "Failed to build 39000 metadata"),
-    }
+        Err(e) => {
+            tracing::warn!(group_id, error = %e, "Failed to build 39000 metadata");
+            // Unknown policy: fail closed and gate the lists.
+            true
+        }
+    };
 
-    match build_group_admins(db, group_id).await {
+    match build_group_admins(db, group_id, is_private).await {
         Ok((tags, content)) => {
             if let Err(e) =
                 sign_store_broadcast(db, identity, broadcast_tx, 39001, tags, &content).await
@@ -128,7 +150,7 @@ pub async fn publish_group_metadata(
         Err(e) => tracing::warn!(group_id, error = %e, "Failed to build 39001 admins"),
     }
 
-    match build_group_members(db, group_id).await {
+    match build_group_members(db, group_id, is_private).await {
         Ok((tags, content)) => {
             if let Err(e) =
                 sign_store_broadcast(db, identity, broadcast_tx, 39002, tags, &content).await

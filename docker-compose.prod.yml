@@ -292,7 +292,10 @@ services:
           level: info
     command: --bind 0.0.0.0
     ports:
-      - "7880:7880"       # signal (Caddy proxies this; not opened in the firewall)
+      # Signal: Caddy reaches livekit:7880 over the Docker network, so the host
+      # publication is loopback-only (local debugging) instead of relying on the
+      # firewall to keep the dev-key-less signaling port off the Internet.
+      - "127.0.0.1:7880:7880"
       - "7881:7881/tcp"   # ICE over TCP fallback
       - "7882:7882/udp"   # WebRTC media (muxed)
       - "3478:3478/udp"   # TURN relay

@@ -52,6 +52,7 @@ zeroize = "1"
 # `xdg-portal`, tauri-plugin-dialog enables `gtk3`, Cargo unifies the two and
 # rfd's build script refuses both at once on Linux.
 rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
+serde_yaml_ng = "0.10"
 
 # macOS: native keychain with Touch ID biometric access control
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -60,3 +61,6 @@ security-framework = { version = "3", features = ["OSX_10_15"] }
 # Windows/Linux: keyring fallback
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 keyring = { version = "3", features = ["windows-native", "sync-secret-service"] }
+
+[dev-dependencies]
+tempfile = "3"

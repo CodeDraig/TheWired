@@ -22,6 +22,7 @@ import { relayManager } from "./relayManager";
 import { subscriptionManager } from "./subscriptionManager";
 import { handlePotentialKick } from "./kickHandler";
 import { parseRelayList } from "./nip65";
+import { bunkerAuthUrlOrNull } from "./nip46AuthUrl";
 import { loadAndApplyDisabledRelays } from "./relayList";
 import { parseDMRelayList, clearDMRelayCache } from "./dmRelayList";
 import { ensureAppRelayInOwnDMList, createEoseSettler } from "./dmRelayListEnsure";
@@ -191,8 +192,10 @@ function closeSignerIfRemote(signer: NostrSigner | null): void {
   }
 }
 
-/** Open a bunker auth-challenge URL and nudge the user to approve it. */
-function handleBunkerAuthUrl(url: string): void {
+/** Open a bunker auth-challenge URL and nudge the user to approve it. The URL
+ *  is bunker-supplied: only an https page is ever opened (bunkerAuthUrlOrNull);
+ *  otherwise the notification alone tells the user to approve in the signer. */
+function handleBunkerAuthUrl(rawUrl: string): void {
   store.dispatch(
     addNotification({
       id: `bunker-auth-${Date.now()}`,
@@ -202,6 +205,11 @@ function handleBunkerAuthUrl(url: string): void {
       timestamp: Date.now(),
     }),
   );
+  const url = bunkerAuthUrlOrNull(rawUrl);
+  if (!url) {
+    console.warn("[nip46] ignoring non-https auth_url from bunker");
+    return;
+  }
   if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
     import("@tauri-apps/plugin-opener")
       .then((m) => m.openUrl(url))

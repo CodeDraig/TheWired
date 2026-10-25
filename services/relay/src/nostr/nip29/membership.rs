@@ -34,6 +34,15 @@ pub async fn handle_leave(db: &Db, event: &Event) -> anyhow::Result<Vec<String>>
         None => return Ok(vec![format!(r#"["OK","{}",false,"missing h tag"]"#, event.id)]),
     };
 
+    // The last admin cannot walk away from a group (audit 2026-10): it would
+    // be left unmanageable and undeletable. Delete it (9008) instead.
+    if crate::nostr::nip29::moderation::would_remove_last_admin(db, &group_id, std::slice::from_ref(&event.pubkey)).await? {
+        return Ok(vec![format!(
+            r#"["OK","{}",false,"restricted: the last admin cannot leave; delete the group instead"]"#,
+            event.id
+        )]);
+    }
+
     db.remove_member(&group_id, &event.pubkey).await?;
     tracing::info!("{} left group {}", event.pubkey, group_id);
     Ok(vec![format!(r#"["OK","{}",true,""]"#, event.id)])

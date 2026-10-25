@@ -17,7 +17,8 @@ import { suspensionService } from "./suspensionService.js";
 import { clearBlobAccessCache } from "./blobAccess.js";
 import { invalidateBlobScope } from "./blobReadAccess.js";
 import { isDenylisted, recordBlobOwner } from "./blobStore.js";
-import { canonicalAudioType } from "../lib/audioMime.js";
+import { fileTypeFromFile } from "file-type";
+import { audioTypeFromSniff, canonicalAudioType } from "../lib/audioMime.js";
 import { probeDurationSec } from "../lib/transcode.js";
 import { ensureCoverVariants, removeCoverVariants } from "../lib/coverVariants.js";
 
@@ -45,6 +46,22 @@ export class UploadRejectedError extends Error {
   }
 }
 
+/** Per-request limits the route resolved from the caller's upload quota. */
+export interface UploadLimits {
+  /** Bytes the caller may still upload today; the stream is cut when exceeded. */
+  quotaRemaining?: number;
+  /** Seconds until the quota resets — the 429's Retry-After. */
+  quotaRetryAfter?: number;
+}
+
+/** The daily byte quota (lib/uploadGuard.ts) ran out mid-stream. */
+export class UploadQuotaError extends UploadRejectedError {
+  constructor(readonly retryAfter: number) {
+    super("Daily upload quota exceeded", 429, "UPLOAD_QUOTA_EXCEEDED");
+    this.name = "UploadQuotaError";
+  }
+}
+
 async function ensureDir(dir: string) {
   await mkdir(dir, { recursive: true });
 }
@@ -61,9 +78,12 @@ export const musicService = {
     file: { filename: string; mimetype: string; file: NodeJS.ReadableStream },
     pubkey: string,
     clientDuration?: number,
+    limits: UploadLimits = {},
   ) {
-    const mimeType = canonicalAudioType(file.mimetype);
-    if (!mimeType) {
+    // The declared type is only a cheap pre-check (a non-audio Content-Type
+    // is refused before the body is read). The STORED type comes from the
+    // bytes below; the declared one is otherwise ignored.
+    if (!canonicalAudioType(file.mimetype)) {
       // Drain the part so the multipart parser can finish the request cleanly.
       file.file.resume();
       throw new UploadRejectedError(
@@ -91,6 +111,11 @@ export const musicService = {
         await unlink(tempPath).catch(() => {});
         throw new UploadRejectedError("File too large (max 100MB)", 413, "FILE_TOO_LARGE");
       }
+      if (limits.quotaRemaining !== undefined && size > limits.quotaRemaining) {
+        writeStream.destroy();
+        await unlink(tempPath).catch(() => {});
+        throw new UploadQuotaError(limits.quotaRetryAfter ?? 60);
+      }
       hash.update(chunk as Buffer);
       writeStream.write(chunk);
     }
@@ -101,6 +126,21 @@ export const musicService = {
 
     const sha256 = hash.digest("hex");
     const storagePath = join(BLOB_DIR, sha256);
+
+    // The bytes decide the type. ffprobe/ffmpeg run on this file, and
+    // libavformat would happily read a playlist or concat script as "audio"
+    // that opens further files and URLs — so nothing that is not a known
+    // audio container gets stored, probed or queued.
+    const sniffed = await fileTypeFromFile(tempPath).catch(() => undefined);
+    const mimeType = audioTypeFromSniff(sniffed?.mime);
+    if (!mimeType) {
+      await unlink(tempPath).catch(() => {});
+      throw new UploadRejectedError(
+        "File is not a supported audio container",
+        415,
+        "INVALID_AUDIO_CONTAINER",
+      );
+    }
 
     if (await isDenylisted(sha256)) {
       await unlink(tempPath).catch(() => {});
@@ -120,7 +160,7 @@ export const musicService = {
     // Duration: ffprobe ground truth when it can read the file (mobile clients
     // send none — expo's native multipart carries no probed length), else the
     // client's claim. Stored and returned in whole seconds (BIGINT column).
-    const duration = wholeSeconds((await probeDurationSec(storagePath)) ?? clientDuration);
+    const duration = wholeSeconds((await probeDurationSec(storagePath, mimeType)) ?? clientDuration);
 
     // Insert into blobs table (dedup-safe). Music owners are `neutral`: the
     // music gate decides access, and an existing public/scoped row is kept.
@@ -167,6 +207,7 @@ export const musicService = {
   async uploadCover(
     file: { filename: string; mimetype: string; file: NodeJS.ReadableStream },
     pubkey: string,
+    limits: UploadLimits = {},
   ) {
     if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) {
       file.file.resume();
@@ -194,6 +235,11 @@ export const musicService = {
         await unlink(tempPath).catch(() => {});
         throw new UploadRejectedError("Image too large (max 10MB)", 413, "FILE_TOO_LARGE");
       }
+      if (limits.quotaRemaining !== undefined && size > limits.quotaRemaining) {
+        writeStream.destroy();
+        await unlink(tempPath).catch(() => {});
+        throw new UploadQuotaError(limits.quotaRetryAfter ?? 60);
+      }
       hash.update(chunk as Buffer);
       writeStream.write(chunk);
     }
@@ -204,6 +250,14 @@ export const musicService = {
 
     const sha256 = hash.digest("hex");
     const storagePath = join(BLOB_DIR, sha256);
+
+    // Stored (and served) as the image the bytes are, not the one declared.
+    const sniffed = await fileTypeFromFile(tempPath).catch(() => undefined);
+    const imageType = sniffed && ALLOWED_IMAGE_TYPES.has(sniffed.mime) ? sniffed.mime : null;
+    if (!imageType) {
+      await unlink(tempPath).catch(() => {});
+      throw new UploadRejectedError("File is not a supported image", 415, "INVALID_IMAGE_CONTAINER");
+    }
 
     if (await isDenylisted(sha256)) {
       await unlink(tempPath).catch(() => {});
@@ -220,14 +274,14 @@ export const musicService = {
     const uploaded = Math.floor(Date.now() / 1000);
 
     // Insert into blobs table (covers now tracked in DB); a `neutral` owner, as above.
-    await db.insert(blobs).values({ sha256, size, type: file.mimetype, uploaded }).onConflictDoNothing();
+    await db.insert(blobs).values({ sha256, size, type: imageType, uploaded }).onConflictDoNothing();
     await recordBlobOwner(sha256, pubkey, { state: "neutral" });
 
     // Resized copies for `GET /<sha>?w=`; the original stays as uploaded. A
     // failed render doesn't fail the upload — sized requests fall back to it.
     await ensureCoverVariants(sha256, storagePath, BLOB_DIR);
 
-    return { url, sha256 };
+    return { url, sha256, size };
   },
 
   /**

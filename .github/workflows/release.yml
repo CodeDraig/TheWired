@@ -15,7 +15,7 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Determine tag and version
         id: meta
@@ -28,20 +28,22 @@ jobs:
             git tag "$TAG" 2>/dev/null || true
             git push origin "$TAG" 2>/dev/null || true
           fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Create draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          TAG="${{ steps.meta.outputs.tag }}"
+          set -euo pipefail
           # A manual run reuses the version in tauri.conf.json. If that tag is
           # already a PUBLISHED release, the upload steps below would --clobber
           # its assets with new builds — refuse instead of silently replacing
           # what users already downloaded. Bump the version (or delete the
           # draft) first.
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             if gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null | grep -qx false; then
               echo "::error::$TAG is already a published release; refusing to overwrite its assets"
               exit 1
@@ -79,22 +81,23 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: pnpm
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10)
         with:
+          toolchain: stable
           targets: ${{ matrix.rust_targets }}
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: client/src-tauri -> target
 
@@ -104,8 +107,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
+      # --frozen-lockfile: this job later holds the updater signing key and the
+      # Apple certificate, so the dependency tree must be exactly what was
+      # reviewed in pnpm-lock.yaml - never a fresh resolution at release time.
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Import Apple Developer certificate
         if: runner.os == 'macOS'
@@ -217,10 +223,12 @@ jobs:
         if: runner.os == 'macOS'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+          ARCH: ${{ matrix.arch_suffix }}
+          RUST_TARGET: ${{ matrix.rust_targets }}
         run: |
-          TAG="${{ needs.create-release.outputs.tag }}"
-          ARCH="${{ matrix.arch_suffix }}"
-          BUNDLE_DIR="client/src-tauri/target/${{ matrix.rust_targets }}/release/bundle"
+          set -euo pipefail
+          BUNDLE_DIR="client/src-tauri/target/${RUST_TARGET}/release/bundle"
 
           echo "=== Bundle contents ==="
           find "$BUNDLE_DIR" -type f 2>/dev/null
@@ -247,16 +255,17 @@ jobs:
           for f in "$UPLOAD_DIR"/*; do
             [ -f "$f" ] || continue
             echo "Uploading: $(basename "$f")"
-            gh release upload "$TAG" "$f" --clobber || true
+            gh release upload "$TAG" "$f" --clobber
           done
 
       - name: Upload Windows artifacts
         if: runner.os == 'Windows'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.create-release.outputs.tag }}
         shell: bash
         run: |
-          TAG="${{ needs.create-release.outputs.tag }}"
+          set -euo pipefail
           BUNDLE_DIR="client/src-tauri/target/release/bundle"
 
           echo "=== Bundle contents ==="
@@ -269,15 +278,16 @@ jobs:
             -name "*.nsis.zip" -o -name "*.sig" \
           \) -print0 | while IFS= read -r -d '' f; do
             echo "Uploading: $(basename "$f")"
-            gh release upload "$TAG" "$f" --clobber || true
+            gh release upload "$TAG" "$f" --clobber
           done
 
       - name: Upload Linux artifacts
         if: runner.os == 'Linux'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.create-release.outputs.tag }}
         run: |
-          TAG="${{ needs.create-release.outputs.tag }}"
+          set -euo pipefail
           BUNDLE_DIR="client/src-tauri/target/release/bundle"
 
           echo "=== Bundle contents ==="
@@ -289,21 +299,23 @@ jobs:
             -name "*.AppImage.tar.gz" -o -name "*.sig" \
           \) -print0 | while IFS= read -r -d '' f; do
             echo "Uploading: $(basename "$f")"
-            gh release upload "$TAG" "$f" --clobber || true
+            gh release upload "$TAG" "$f" --clobber
           done
 
   updater-json:
     needs: [create-release, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Generate and upload latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
-          VERSION="${{ needs.create-release.outputs.version }}"
-          TAG="${{ needs.create-release.outputs.tag }}"
+          set -euo pipefail
 
           # List all release assets
           echo "=== Release assets ==="
@@ -337,7 +349,7 @@ jobs:
             local name
             name=$(gh release view "$TAG" --json assets --jq ".assets[].name" | grep "$pattern" | head -1)
             if [ -n "$name" ]; then
-              echo "https://github.com/${{ github.repository }}/releases/download/${TAG}/${name}"
+              echo "https://github.com/${REPO}/releases/download/${TAG}/${name}"
             else
               echo ""
             fi
@@ -377,14 +389,17 @@ jobs:
           echo "=== Generated latest.json ==="
           cat latest.json
 
-          # Verify signatures are present
+          # Every platform entry must carry a signature. The desktop updater
+          # rejects an unsigned entry, so publishing a latest.json with a gap
+          # would silently break auto-update for that platform - fail instead.
           MISSING=""
           [ -z "$MAC_AARCH64_SIG" ] && MISSING="$MISSING darwin-aarch64"
           [ -z "$MAC_X64_SIG" ] && MISSING="$MISSING darwin-x86_64"
           [ -z "$WIN_SIG" ] && MISSING="$MISSING windows-x86_64"
           [ -z "$LINUX_SIG" ] && MISSING="$MISSING linux-x86_64"
           if [ -n "$MISSING" ]; then
-            echo "::warning::Missing signatures for:$MISSING"
+            echo "::error::Missing updater signatures for:$MISSING - not uploading latest.json"
+            exit 1
           fi
 
           gh release upload "$TAG" latest.json --clobber

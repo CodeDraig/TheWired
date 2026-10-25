@@ -1,4 +1,5 @@
 import { isIP } from "node:net";
+import { lookup } from "node:dns/promises";
 
 /**
  * SSRF guard for relay URLs the backend will DIAL for ingestion (Decentralized
@@ -8,10 +9,10 @@ import { isIP } from "node:net";
  * and non-ws(s) schemes. The same host rules gate a space's `hostRelay`
  * (`checkHostRelayUrl`), which every member's client dials.
  *
- * Note: this checks the URL's literal host. A DNS name that *resolves* to a
- * private IP is a residual (DNS-rebinding) vector — the manager should re-check
- * the resolved address at connect time. This guard blocks the obvious cases at
- * registration.
+ * Two layers: `checkRelayUrl` checks the URL's literal host at registration;
+ * `checkDialTarget` RESOLVES the host right before the manager connects and
+ * refuses when any address is private (a name that is re-pointed at 10.x or
+ * the metadata address after registration — DNS rebinding).
  */
 
 export interface RelayUrlCheck {
@@ -154,6 +155,36 @@ export function checkRelayUrl(raw: string, allowInsecure: boolean): RelayUrlChec
   const port = u.port ? `:${u.port}` : "";
   const path = u.pathname.replace(/\/+$/, "");
   return { ok: true, url: `${u.protocol}//${host}${port}${path}` };
+}
+
+/** `dns.lookup(host, { all: true })`-shaped resolver; injectable for tests. */
+export type AddressLookup = (host: string) => Promise<Array<{ address: string; family: number }>>;
+
+const defaultLookup: AddressLookup = (host) => lookup(host, { all: true, verbatim: true });
+
+/**
+ * Connect-time guard for a relay URL the manager is about to dial: the literal
+ * checks of `checkRelayUrl`, then the host is resolved and EVERY address must
+ * be public. A name that resolves to nothing, fails to resolve, or has one
+ * private/loopback/link-local/CGNAT/ULA/metadata address is refused — the
+ * socket would otherwise be opened to it (DNS rebinding). IP literals are
+ * decided without a lookup.
+ */
+export async function checkDialTarget(raw: string, resolve: AddressLookup = defaultLookup): Promise<RelayUrlCheck> {
+  const literal = checkRelayUrl(raw, true);
+  if (!literal.ok) return literal;
+  const host = new URL(literal.url!).hostname.replace(/^\[|\]$/g, "");
+  if (isIP(host)) return literal; // a literal passed isPrivateHost above
+  let addresses: Array<{ address: string }>;
+  try {
+    addresses = await resolve(host);
+  } catch {
+    return { ok: false, reason: "host did not resolve" };
+  }
+  if (addresses.length === 0) return { ok: false, reason: "host did not resolve" };
+  const unsafe = addresses.find((a) => isPrivateHost(a.address));
+  if (unsafe) return { ok: false, reason: `host resolves to a private address (${unsafe.address})` };
+  return literal;
 }
 
 /**

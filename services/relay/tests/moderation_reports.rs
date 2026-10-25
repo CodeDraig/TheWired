@@ -231,6 +231,35 @@ async fn a_suspended_account_cannot_write_but_may_delete_its_own_content() {
     assert_eq!(publish(&state, &tx, &mut conn, &after).await[2], true);
 }
 
+/// Security audit 2026-10: `hex::decode` is case-insensitive, so an event whose
+/// `pubkey` field is spelled in UPPERCASE carried a valid signature yet matched
+/// none of the relay's string comparisons — `relay.suspended_pubkeys` among
+/// them. A suspended account could keep publishing that way. NIP-01 hex is
+/// lowercase; anything else is now rejected as invalid.
+#[tokio::test]
+async fn a_suspended_account_cannot_evade_by_uppercasing_its_pubkey() {
+    let pool = match setup_test_pool().await { Ok(p) => p, Err(e) => { eprintln!("skip: {e}"); return; } };
+    let (state, tx) = make_app_state_with(pool.clone(), |_| {});
+    let mallory = TestIdentity::from_seed(2);
+    let mut conn = Conn::new(None);
+    suspend(&pool, &mallory.pubkey).await;
+
+    // Same key, pubkey spelled in uppercase; the schnorr signature is genuine.
+    let shouting = TestIdentity { pubkey: mallory.pubkey.to_ascii_uppercase(), ..mallory.clone() };
+    let evasion = sign_event(&shouting, 1, vec![], "still here", now());
+    let ok = publish(&state, &tx, &mut conn, &evasion).await;
+    assert_eq!(ok[2], false, "{ok}");
+    assert!(ok[3].as_str().unwrap().starts_with("invalid:"), "{ok}");
+    assert!(state.pool.get_event_by_id(&evasion.id).await.unwrap().is_none(), "must not be stored");
+
+    // Same for an uppercase signature on an otherwise normal event.
+    let mut upper_sig = sign_event(&mallory, 1, vec![], "sig case", now());
+    upper_sig.sig = upper_sig.sig.to_ascii_uppercase();
+    let ok = publish(&state, &tx, &mut conn, &upper_sig).await;
+    assert_eq!(ok[2], false, "{ok}");
+    assert!(ok[3].as_str().unwrap().starts_with("invalid:"), "{ok}");
+}
+
 #[tokio::test]
 async fn a_tombstoned_event_is_never_stored_again_until_restored() {
     let pool = match setup_test_pool().await { Ok(p) => p, Err(e) => { eprintln!("skip: {e}"); return; } };

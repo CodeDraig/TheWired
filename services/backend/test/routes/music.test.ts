@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
+import { wavBytes } from "../helpers/audio.js";
 import { createHash } from "crypto";
 import { existsSync } from "fs";
 import { join } from "path";
@@ -74,8 +75,8 @@ function buildMultipartPayload(
 
 /** Create a deterministic audio file buffer */
 function makeAudioFile(label: string): Buffer {
-  // Create a buffer that's big enough to be realistic but small enough for tests
-  return Buffer.from(`fake-audio-data-${label}-${"x".repeat(200)}`);
+  // A real (tiny) WAV: the upload sniffs the bytes and refuses non-audio.
+  return wavBytes(label);
 }
 
 /** Insert a fake relay event simulating a published track */

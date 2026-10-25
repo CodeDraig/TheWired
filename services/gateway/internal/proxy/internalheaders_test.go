@@ -60,3 +60,19 @@ func TestStripInternalHeaders_RemovesForgedClientIP(t *testing.T) {
 		t.Error("forged X-Client-Ip reached the handler")
 	}
 }
+
+// The gateway's own identity MAC is internal as well: a client that forges a
+// pubkey must not be able to ship a MAC alongside it.
+func TestStripInternalHeaders_RemovesForgedGatewayAuth(t *testing.T) {
+	present := false
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, present = r.Header["X-Gateway-Auth"]
+		w.WriteHeader(http.StatusOK)
+	})
+	req := httptest.NewRequest("GET", "http://localhost:9080/api/spaces", nil)
+	req.Header.Set("X-Gateway-Auth", "1700000000.deadbeef")
+	StripInternalHeaders(inner).ServeHTTP(httptest.NewRecorder(), req)
+	if present {
+		t.Error("forged X-Gateway-Auth reached the handler")
+	}
+}
