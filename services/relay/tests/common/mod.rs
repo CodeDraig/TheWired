@@ -26,7 +26,7 @@
 //! the default URL isn't reachable, so `cargo test` on a clean machine
 //! doesn't hard-fail.
 
-use secp256k1::{Keypair, Secp256k1, SecretKey};
+use secp256k1::{Keypair, SecretKey};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -353,13 +353,12 @@ pub struct TestIdentity {
 
 impl TestIdentity {
     pub fn from_seed(seed: u8) -> Self {
-        let secp = Secp256k1::new();
-        let secret = SecretKey::from_slice(&[seed; 32]).expect("valid sk");
-        let keypair = Keypair::from_secret_key(&secp, &secret);
+        let secret = SecretKey::from_secret_bytes([seed; 32]).expect("valid sk");
+        let keypair = Keypair::from_secret_key(&secret);
         let (xonly, _) = keypair.x_only_public_key();
         TestIdentity {
             keypair,
-            pubkey: hex::encode(xonly.serialize()),
+            pubkey: hex::encode(xonly.to_byte_array()),
         }
     }
 }
@@ -373,7 +372,6 @@ pub fn sign_event(
     content: &str,
     created_at: i64,
 ) -> Event {
-    let secp = Secp256k1::new();
     let tags_json = serde_json::to_value(&tags).expect("serialize tags");
     let canonical = serde_json::to_string(&serde_json::json!([
         0,
@@ -390,7 +388,7 @@ pub fn sign_event(
     let hash = hasher.finalize();
     let id = hex::encode(&hash);
 
-    let sig = secp.sign_schnorr_no_aux_rand(&hash, &identity.keypair);
+    let sig = secp256k1::schnorr::sign_no_aux_rand(&hash, &identity.keypair);
 
     Event {
         id,

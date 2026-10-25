@@ -91,11 +91,12 @@ fn is_valid_hex_key(s: &str) -> bool {
 /// even when the relay isn't running, so the UI can tell "is this MY relay?"
 /// for a space (by `relayPubkey`) independently of the changing tunnel URL.
 fn persisted_relay_pubkey() -> Option<String> {
-    use secp256k1::{Secp256k1, SecretKey};
+    use secp256k1::SecretKey;
     let hex_key = crate::keystore::keystore_get_secret(RELAY_IDENTITY_SECRET.to_string()).ok()??;
-    let sk = SecretKey::from_slice(&hex::decode(hex_key.trim()).ok()?).ok()?;
-    let (xonly, _) = sk.x_only_public_key(&Secp256k1::new());
-    Some(hex::encode(xonly.serialize()))
+    let bytes: [u8; 32] = hex::decode(hex_key.trim()).ok()?.try_into().ok()?;
+    let sk = SecretKey::from_secret_bytes(bytes).ok()?;
+    let (xonly, _) = sk.x_only_public_key();
+    Some(hex::encode(xonly.to_byte_array()))
 }
 
 /// The relay's persisted signing key. This is the *relay* identity (it signs
@@ -137,9 +138,9 @@ fn load_or_create_identity(dir: &Path) -> Result<String, String> {
         }
     }
     // 3. Generate fresh.
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let hex_key = hex::encode(bytes);
     crate::keystore::keystore_set_secret(RELAY_IDENTITY_SECRET.to_string(), hex_key.clone())
         .map_err(|e| format!("store relay identity: {e}"))?;

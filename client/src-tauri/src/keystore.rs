@@ -1,6 +1,6 @@
 use hex;
-use rand::rngs::OsRng;
-use secp256k1::{Secp256k1, SecretKey};
+use rand::TryRng;
+use secp256k1::{Keypair, SecretKey};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -481,8 +481,15 @@ fn remove_from_account_list(pubkey: &str) {
 // ─── Core logic ──────────────────────────────────────────────────────────
 
 fn parse_hex_secret_key(hex_str: &str) -> Result<SecretKey, String> {
-    let bytes = hex::decode(hex_str.trim()).map_err(|e| format!("Invalid hex: {e}"))?;
-    SecretKey::from_slice(&bytes).map_err(|e| format!("Invalid secret key: {e}"))
+    let bytes = Zeroizing::new(hex::decode(hex_str.trim()).map_err(|e| format!("Invalid hex: {e}"))?);
+    secret_key_from_bytes(&bytes)
+}
+
+fn secret_key_from_bytes(bytes: &[u8]) -> Result<SecretKey, String> {
+    let bytes = Zeroizing::new(
+        <[u8; 32]>::try_from(bytes).map_err(|_| "Invalid secret key: expected 32 bytes".to_string())?,
+    );
+    SecretKey::from_secret_bytes(*bytes).map_err(|e| format!("Invalid secret key: {e}"))
 }
 
 /// Verify the serialized NIP-01 event's pubkey (array index 1) matches `expected`.
@@ -505,9 +512,8 @@ fn assert_event_pubkey(serialized_event: &str, expected: &str) -> Result<(), Str
 }
 
 fn compute_pubkey(sk: &SecretKey) -> String {
-    let secp = Secp256k1::new();
-    let (xonly, _) = sk.x_only_public_key(&secp);
-    hex::encode(xonly.serialize())
+    let (xonly, _) = sk.x_only_public_key();
+    hex::encode(xonly.to_byte_array())
 }
 
 fn invalidate_cache() {
@@ -758,7 +764,7 @@ fn migrate_legacy_key() -> Option<String> {
     } else if let Ok(Some(data)) = platform::read_legacy_key(SERVICE_NAME, &legacy_account) {
         Zeroizing::new(String::from_utf8(data).ok()?)
     } else if let Some(sk) = read_legacy_fallback_key() {
-        Zeroizing::new(hex::encode(sk.secret_bytes()))
+        Zeroizing::new(hex::encode(sk.to_secret_bytes()))
     } else {
         return None;
     };
@@ -847,7 +853,7 @@ fn load_account_key(pubkey: &str) -> Result<SecretKey, String> {
         let map = cache.get_or_insert_with(HashMap::new);
         map.insert(pubkey.to_string(), sk);
         // Try to re-store in keychain; only trust it once it reads back.
-        let hex_str = Zeroizing::new(hex::encode(sk.secret_bytes()));
+        let hex_str = Zeroizing::new(hex::encode(sk.to_secret_bytes()));
         let stored = platform::store_key(SERVICE_NAME, &key_account, &marker_account, hex_str.as_bytes()).is_ok();
         let verified = stored && verify_if_droppable(pubkey, &key_account, &hex_str);
         settle_fallback(pubkey, &hex_str, verified);
@@ -899,9 +905,17 @@ pub fn keystore_get_public_key() -> Result<String, String> {
 /// Unlike keystore_get_public_key, this ALWAYS creates a new key.
 #[tauri::command]
 pub fn keystore_generate_key() -> Result<String, String> {
-    let secp = Secp256k1::new();
-    let (sk, _) = secp.generate_keypair(&mut OsRng);
-    let hex_str = Zeroizing::new(hex::encode(sk.secret_bytes()));
+    // Straight from the OS RNG; retry in the ~2^-128 case the bytes aren't a valid scalar.
+    let sk = loop {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut *bytes)
+            .map_err(|e| format!("OS RNG failed: {e}"))?;
+        if let Ok(sk) = SecretKey::from_secret_bytes(*bytes) {
+            break sk;
+        }
+    };
+    let hex_str = Zeroizing::new(hex::encode(sk.to_secret_bytes()));
     let pubkey = compute_pubkey(&sk);
 
     // Cache immediately
@@ -956,19 +970,15 @@ pub fn keystore_sign_event(serialized_event: String) -> Result<SignedEventResult
     // misattributed / invalid signature.
     assert_event_pubkey(&serialized_event, &compute_pubkey(&sk))?;
 
-    let mut hasher = Sha256::new();
-    hasher.update(serialized_event.as_bytes());
-    let id_bytes = hasher.finalize();
+    let id_bytes: [u8; 32] = Sha256::digest(serialized_event.as_bytes()).into();
     let event_id = hex::encode(id_bytes);
 
-    let secp = Secp256k1::new();
-    let msg = secp256k1::Message::from_digest_slice(&id_bytes).map_err(|e| e.to_string())?;
-    let keypair = secp256k1::Keypair::from_secret_key(&secp, &sk);
-    let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+    let keypair = Keypair::from_secret_key(&sk);
+    let sig = secp256k1::schnorr::sign_no_aux_rand(&id_bytes, &keypair);
 
     Ok(SignedEventResult {
         id: event_id,
-        sig: hex::encode(sig.as_ref()),
+        sig: hex::encode(sig.to_byte_array()),
     })
 }
 
@@ -998,7 +1008,7 @@ pub async fn keystore_get_secret_key(app: tauri::AppHandle) -> Result<String, St
 
     let sk = fresh_active_secret_key()?;
     log::warn!("secret key exported to the UI for {}", &compute_pubkey(&sk)[..12]);
-    Ok(hex::encode(sk.secret_bytes()))
+    Ok(hex::encode(sk.to_secret_bytes()))
 }
 
 /// Like `get_active_secret_key`, but prefers a fresh Data Protection keychain
@@ -1053,7 +1063,7 @@ pub fn keystore_mark_backed_up() -> Result<BackupStatus, String> {
     let active = get_active().clone().ok_or_else(|| "No active account".to_string())?;
     write_backup_ack(&active);
     let sk = load_account_key(&active)?;
-    let hex_str = Zeroizing::new(hex::encode(sk.secret_bytes()));
+    let hex_str = Zeroizing::new(hex::encode(sk.to_secret_bytes()));
     let key_account = get_key_account_for(&active);
     let verified = verify_if_droppable(&active, &key_account, &hex_str);
     settle_fallback(&active, &hex_str, verified);
@@ -1138,8 +1148,7 @@ pub fn keystore_has_key() -> Result<bool, String> {
 pub fn keystore_import_key(secret_hex: String) -> Result<String, String> {
     let secret_hex = Zeroizing::new(secret_hex);
     let secret_bytes = Zeroizing::new(hex::decode(&*secret_hex).map_err(|e| format!("Invalid hex: {e}"))?);
-    let sk =
-        SecretKey::from_slice(&secret_bytes).map_err(|e| format!("Invalid secret key: {e}"))?;
+    let sk = secret_key_from_bytes(&secret_bytes)?;
     let pubkey = compute_pubkey(&sk);
 
     let key_account = get_key_account_for(&pubkey);
