@@ -83,6 +83,11 @@ updates:
         patterns: ["sha2", "hmac", "hkdf", "chacha20", "secp256k1", "rand"]
       cargo-minor-patch:
         update-types: ["minor", "patch"]
+    # rfd stays on the version tauri-plugin-dialog uses, so the tree carries
+    # one copy; raise both together.
+    ignore:
+      - dependency-name: rfd
+        versions: [">= 0.17.0"]
     commit-message:
       prefix: chore(deps)
 

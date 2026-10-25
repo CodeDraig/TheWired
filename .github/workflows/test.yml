@@ -116,12 +116,15 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
 
       # generate_context! needs frontendDist to exist; the shell compiles
-      # against an empty one, the web build is not under test here.
+      # against an empty one, the web build is not under test here. The second
+      # check builds the release configuration (`tauri build` turns on
+      # custom-protocol), which compiles the `cfg(not(dev))` code paths.
       - name: Check and run NIP-44 tests
         working-directory: client/src-tauri
         run: |
           mkdir -p ../dist
           cargo check --locked --all-targets
+          cargo check --locked --features tauri/custom-protocol
           cargo test --locked --lib nip44::
 
   # ── Backend Tests (Vitest + PostgreSQL) ─────────
