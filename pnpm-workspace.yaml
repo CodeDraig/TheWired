@@ -3,3 +3,9 @@ packages:
   - "packages/*"
   - "services/backend"
   - "services/landing"
+
+# Resolve only versions published at least 3 days ago (minutes). Matches
+# the window Dependabot applies, so the lockfile never holds a version too new
+# for Dependabot to re-resolve, and a freshly compromised release has time to
+# be caught and yanked before it can land here.
+minimumReleaseAge: 4320
