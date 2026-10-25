@@ -101,13 +101,6 @@ updates:
     groups:
       go-minor-patch:
         update-types: ["minor", "patch"]
-    # go-redis 9.23 and btcec 2.5 raised their minimum to Go 1.26; drop these
-    # when the gateway's go directive, CI and the builder image move to 1.26.
-    ignore:
-      - dependency-name: github.com/redis/go-redis/v9
-        versions: [">= 9.23.0"]
-      - dependency-name: github.com/btcsuite/btcd/btcec/v2
-        versions: [">= 2.5.0"]
     commit-message:
       prefix: chore(deps)
 
