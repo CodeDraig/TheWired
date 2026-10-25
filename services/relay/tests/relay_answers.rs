@@ -104,6 +104,29 @@ async fn read_until(rx: &mut Rx, typ: &str, t: Duration) -> Option<serde_json::V
     }
 }
 
+/// Read until the first EVENT for `sub` arrives, then stop reading: the server
+/// is now streaming that REQ's backlog, and with nobody reading it blocks
+/// mid-stream without polling its broadcast receiver. A fixed sleep raced the
+/// server on a loaded machine (the live events went by before the REQ was
+/// even read, so nothing lagged).
+async fn wait_until_streaming(rx: &mut Rx, sub: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, rx.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                    if typ(&v) == "EVENT" && s(&v, 1) == sub {
+                        return;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!("no EVENT for {sub} before the stream ended or 30 s passed: {other:?}"),
+        }
+    }
+}
+
 /// Collect every text frame for `t` (quietly ignoring pings and the socket end).
 async fn collect_for(rx: &mut Rx, t: Duration) -> Vec<serde_json::Value> {
     let deadline = Instant::now() + t;
@@ -431,7 +454,7 @@ async fn lagged_receiver_gets_a_resync_notice_and_the_missed_events() {
     // block mid-stream, so A's broadcast receiver is not being polled.
     let (mut a_tx, mut a_rx, _) = connect(&url).await;
     send(&mut a_tx, r#"["REQ","feed",{"kinds":[1],"limit":500}]"#.to_string()).await;
-    sleep(Duration::from_millis(700)).await;
+    wait_until_streaming(&mut a_rx, "feed").await;
 
     // Meanwhile 12 live notes are broadcast — 8 more than the channel holds.
     let (mut b_tx, mut b_rx, _) = connect(&url).await;
@@ -473,7 +496,7 @@ async fn lag_resync_recovers_backdated_wraps_below_since() {
     assert!(read_until(&mut a_rx, "EOSE", Duration::from_secs(5)).await.is_some());
     // The backlog REQ blocks A's task mid-stream while nobody reads.
     send(&mut a_tx, r#"["REQ","feed",{"kinds":[1],"limit":500}]"#.to_string()).await;
-    sleep(Duration::from_millis(700)).await;
+    wait_until_streaming(&mut a_rx, "feed").await;
 
     let (mut b_tx, mut b_rx, _) = connect(&url).await;
     let mut want = HashSet::new();
@@ -512,7 +535,7 @@ async fn lagging_twice_within_the_cooldown_closes_1013() {
     // Lag #1: backlog stream blocked, 12 live notes go by.
     let (mut a_tx, mut a_rx, _) = connect(&url).await;
     send(&mut a_tx, r#"["REQ","feed",{"kinds":[1],"limit":500}]"#.to_string()).await;
-    sleep(Duration::from_millis(700)).await;
+    wait_until_streaming(&mut a_rx, "feed").await;
     for i in 0..12 {
         publish_ok(&mut b_tx, &mut b_rx, &note(&carol, &format!("live {i}"), now() + i)).await;
     }
@@ -521,7 +544,7 @@ async fn lagging_twice_within_the_cooldown_closes_1013() {
 
     // Lag #2 inside the 10 s cooldown: same recipe again.
     send(&mut a_tx, r#"["REQ","feed2",{"kinds":[1],"limit":500}]"#.to_string()).await;
-    sleep(Duration::from_millis(700)).await;
+    wait_until_streaming(&mut a_rx, "feed2").await;
     for i in 0..12 {
         publish_ok(&mut b_tx, &mut b_rx, &note(&carol, &format!("live again {i}"), now() + 100 + i)).await;
     }
